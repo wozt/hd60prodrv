@@ -1,0 +1,12 @@
+*.ko
+*.mod
+*.mod.c
+*.o
+.*.cmd
+.module-common.*
+Module.symvers
+modules.order
+build/
+snapshots/
+certs/*.priv
+vendor/

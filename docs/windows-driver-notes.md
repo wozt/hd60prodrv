@@ -1050,6 +1050,10 @@ concrete host-side direct-memory anchor:
 0x1402465ae: OnSetCustomDirectMemoryModeProperty
   writes context+0x8228
 
+CustomAnalogVideoDirectDMAProperty
+  registry/config load at 0x140231042 stores context+0x81e4
+  settings save path at 0x140262652 writes the context+0x81e4 value back
+
 0x140246630:
   direct-memory branch is active only when context+0x8228 != 0
 
@@ -1077,6 +1081,17 @@ Windows per-buffer status +0x38 -> linux_last_frame_extra
 Windows context+0x822c 16-byte blob -> linux_direct_memory_blob_words
 ```
 
+The additional delivery callsites at `0x140293d34`, `0x140294a7a`, and
+`0x14029560e` show the frame object shape passed into the same helper:
+
+```text
+frame+0x10 -> per-frame metadata/status pointer
+frame+0x20 -> frame buffer pointer
+frame+0x28 -> payload/stride-like value
+frame+0x2c -> auxiliary pointer/value
+frame+0x35 -> one-byte frame flag
+```
+
 With `synthetic_v4l2=1`, this metadata is populated from the deterministic
 black-frame producer. The point is not to claim hardware capture; it makes the
 future real DMA producer plug into the same state model as the Windows
@@ -1093,3 +1108,1116 @@ leaves `/dev/video0` registered with coherent diagnostic DMA buffers allocated.
 The module parameter `auto_init` is intentionally reported as not wired until
 the debugfs sequence is refactored into side-effect helpers that can safely run
 from `probe()`.
+
+The driver also exposes `capture_start_plan`, a read-only debugfs summary of
+the remaining real-capture work. It intentionally performs no hardware writes.
+It tracks:
+
+```text
+DirectDMA config state: context+0x81e4
+DirectMemory enable state: context+0x8228
+DirectMemory 16-byte blob: context+0x822c
+Firmware endpoint controls: hready, epint, channel_done
+Linux candidates: coherent descriptor DMA address and frame DMA address
+Missing pieces: shared-memory advertisement, SET_VIC_PARAMS mapping, frame ownership/ack protocol
+```
+
+Two Windows stream-start paths now look especially useful:
+
+```text
+0x140250d57:
+  context+0x8144 = (stream_info+0x30c << 16) | stream_info+0x310
+  context+0x8148 = stream_info+0x314
+  context+0x814c = stream_info+0x31c
+  context+0x8578 = 0x0000bb80
+  context+0x72c0 = 1
+
+0x14026edc6:
+  repeats the same stream-on state after updating stream_info+0x30c/+0x310/+0x314/+0x318
+```
+
+The Linux coherent descriptor buffer is now initialized with a candidate
+host-frame descriptor containing the frame DMA address, frame size, YUYV
+1920x1080 format, and these decoded Windows stream-on fields. It is still only
+a scaffold; the driver does not advertise the descriptor to the endpoint or
+enable bus mastering.
+
+## Firmware Endpoint Tables
+
+`ep.ko` contains readable `.rodata` byte tables even without an ARM
+disassembler:
+
+```text
+ep_cmds_size[24] = 0x0c
+ep_cmds_size[25] = 0x0c
+ep_cmds_size[26] = 0x10
+ep_cmds_size[27] = 0x10
+ep_cmds_size[28] = 0x10
+ep_cmds_size[29] = 0x14
+ep_cmds_size[30] = 0x2c
+ep_cmds_size[31] = 0x2c
+ep_cmds_size[32] = 0x2c
+ep_cmds_size[33] = 0x2c
+ep_cmds_size[34] = 0x2c
+
+ep_aic_size[6] = 0x08
+ep_aic_size[7] = 0x08
+ep_aic_size[42] = 0x14
+ep_aic_size[43] = 0x14
+```
+
+Linux exposes these as `firmware_endpoint_tables`. The next reverse step is to
+map endpoint command IDs 24..34 to the firmware strings seen in `command_store`:
+`BEGIN_FIRMWARE_DOWNLOAD`, `BEGIN_BASE_FIRMWARE_DOWNLOAD`, `SET_VIC_PARAMS`,
+`STOP_STREAMING`, and `GET_FIRMWARE_VERSION`.
+
+`scripts/arm-ko-disasm.py` uses Capstone/pyelftools from `.venv-re` to
+disassemble ARM relocatable firmware modules. Initial `ep.ko` results:
+
+```text
+command_store:
+  reads ep_command[0] as command ID
+  accepts only command IDs 0x18..0x22
+  copies the sysfs payload into ep_command using ep_cmds_size[cmd]
+  sets ep_command+0x28 = 1
+
+pcie_set_outbound:
+  exported for firmware DMA modules
+  selects one of five outbound address fields based on args
+  programs endpoint registers:
+    ep_regs+0x50 = 1
+    ep_regs+0x54 = selected outbound high/limit word
+    ep_regs+0x58 = selected outbound low/base word
+    ep_regs+0x74 = 0x90000000
+    ep_regs+0x7c = 0x91ffffff
+    ep_regs+0xd4 = 0x00f00000
+
+store_channel_done:
+  updates endpoint registers +0x40/+0x44/+0x48/+0x4c for channel state
+  accumulates pending interrupt bits in ep globals
+  writes pending IRQ bits to ep_regs+0x30 when ready
+```
+
+This ties the Linux BAR5 observations to firmware: BAR5 offsets `0x40..0x4c`
+are channel/status payloads, `0x30` is the firmware-side pending IRQ write, and
+`0x50/+0xd4` are part of outbound window programming. The next actionable
+piece is to map command IDs `0x18..0x22` to the firmware command strings.
+
+## Embedded Endpoint ISR Decode
+
+`yuan_demo_sdi/drivers/ep.ko` is an ARM relocatable kernel module. The local
+helper `scripts/arm-ko-disasm.py` uses Capstone and pyelftools and now annotates
+PC-relative literal-pool relocations, which makes the `sysfs_notify` targets
+visible in `pciep_isr`.
+
+Important endpoint-side findings:
+
+```text
+command_store accepts /sys/vpl_pciep/command IDs 0x18..0x22 only.
+command_show mirrors the same `ep_command` buffer using ep_cmds_size[cmd].
+pciep_isr handles additional firmware event IDs beyond command_store.
+```
+
+`pciep_isr` command `0x29` matches the firmware string:
+
+```text
+$$$ SET_VIC_PARAMS(fw %d), size(%dx%d), fps(%d)
+```
+
+The decoded payload offsets are:
+
+```text
+ep_command+0x04  flags/log gate; zero takes the SET_VIC printk path
+ep_command+0x05  fps
+ep_command+0x06  fw/mode; value 7 selects the epint_1080p path
+ep_command+0x08  width  (u16)
+ep_command+0x0a  height (u16)
+ep_command+0x22  interrupt-reduce enable
+```
+
+If width or height is zero, the ISR sets the firmware `no_signal` flag and logs
+`$$$ cmd(%d) => no signal`. Otherwise, it clears `no_signal` and stores mode `7`
+or fallback `5` in a global used by later notification routing.
+
+`pciep_isr` command `0x2a` is the next apparent stream-start notification step:
+it skips when `no_signal` is set, updates the interrupt-reduce flag from
+`ep_command+0x11`, notifies `audio_ctrl`, then notifies either `epint` or
+`epint_1080p` depending on the mode selected by command `0x29`.
+
+Useful endpoint tables extracted from `.rodata`:
+
+```text
+ep_ints_size[0x29]       = 0x28
+ep_ints_size[0x2a]       = 0x14
+ep_ints_1080p_size[0x29] = 0x28
+ep_ints_1080p_size[0x2a] = 0x14
+ep_cmds_size[0x18..0x22] = 0x0c/0x0c/0x10/0x10/0x10/0x14/0x2c...
+```
+
+Current 1080p60 candidate, not yet sent to hardware:
+
+```text
+cmd=0x29 payload_bytes=0x28 flags0=0 fps=60 fw_or_mode=7 width=1920 height=1080 interrupt_reduce=0
+then cmd=0x2a payload_bytes=0x14 to trigger audio_ctrl + epint_1080p notification
+```
+
+The remaining blocker for real capture is the host transport: we still need to
+find how the Windows host writes endpoint event `0x29/0x2a` or the backing
+`ep_command` memory through BAR0/BAR5 after the post-logo/A2 pipeline-ready
+state.
+
+Linux now exposes this transport hypothesis directly:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/endpoint_transport_plan
+```
+
+Current model:
+
+```text
+known transport family:
+  [0x800,0x60,selector,0x25800,0x00f00140]
+  copy payload to BAR0+0x60
+  [0x800,0x61,1]
+
+known selectors:
+  0x100 no-signal logo/status payload
+  0x200 HDCP logo/status payload
+  0x300 still logo/status payload
+
+candidate capture record:
+  0x2c-byte epint record with command 0x29 SET_VIC
+  followed by command 0x2a post-SET_VIC/audio/epint notification
+```
+
+The key distinction is that firmware `command_store` accepts IDs `0x18..0x22`,
+while `0x29/0x2a` are ISR/event IDs. That makes it more likely that capture
+start is delivered through an endpoint event/interrupt record path, not the
+plain `/sys/vpl_pciep/command` path. The safe next static target is any Windows
+path that copies a small `0x28` or `0x2c` record into the same BAR0 staging area,
+or a sibling of the logo `0x60/0x61` selector protocol.
+
+Linux also exposes the decoded Windows staged-payload uploader:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_payload_uploader
+```
+
+The main helper at `0x140277150` is more general than the three named logo
+siblings, but it still validates an image-like blob:
+
+```text
+requires magic 0x55aa55aa
+requires width <= 0x140 and height <= 0x0f0
+copies payload to context+0x108+0x60, which matches Linux BAR0+0x60
+prepare: [0x800,0x60,selector << 16,size,(height << 16) | width]
+commit:  [0x800,0x61,1]
+```
+
+The only direct callsite in the current objdump is `0x140244e10`. That caller
+copies 16-byte property/context blobs to `context+0x1a8d4`,
+`context+0x1a8e4`, and `context+0x1a8f4`, builds a `0x208`-byte payload via
+`0x14027596c`, reads the selector from `context+0x1c944`, and then calls
+`0x140277150`. This looks like a dynamic property/still-logo upload path, not
+the DMA stream-start path.
+
+That gives a useful negative result for capture bring-up: `0x60/0x61` is a
+confirmed host-to-firmware staging primitive, but this decoded helper is not
+the raw `0x2c` `SET_VIC` event transport. The next static target remains either
+a non-image caller of this helper, a sibling uploader without the
+`0x55aa55aa`/size checks, or a direct write path into the endpoint event memory
+behind `/sys/vpl_pciep/epint`.
+
+## Windows Stream State Flow
+
+Linux now exposes the decoded Windows stream-state flow:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_stream_state_flow
+```
+
+Three Windows paths now line up:
+
+```text
+0x140250cfe..0x140250d57
+  writes context+0x727c, +0x8144, +0x8148, +0x814c, +0x8578,
+  then context+0x72c0 = 1
+
+0x14026dec0
+  stream/status worker; iterates sibling/channel contexts, attaches
+  context+0x1f1a8/+0x1f1b0, updates chip 0x88 signal/video state, and repeats
+  the same stream-state write at 0x14026ed84..0x14026edc6
+
+0x140283462..0x14028358a
+  format/property path; fills stream_info+0x30c/+0x310/+0x314/+0x31c and
+  derived fields, then writes the same context stream state
+```
+
+For the local 1080p60 model this matches the Linux host descriptor scaffold:
+
+```text
+context+0x8144 = 0x07800438
+context+0x8148 = 0x0000003c
+context+0x814c = 0x00000000
+context+0x8578 = 0x0000bb80
+context+0x72c0 = 1
+```
+
+This is not yet DMA programming. It is Windows host context state plus signal
+conditioning, but it gives the next xref target: consumers of
+`context+0x72c0`/`context+0x8144` that advertise host buffers, arm endpoint
+capture, or feed real frame delivery.
+
+Linux also exposes the decoded consumers of those stream-state fields:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_stream_consumers
+```
+
+Current consumer map:
+
+```text
+0x14023eb70 family
+  KS-style getters/setters for +0x8144/+0x8148/+0x814c and derived format
+  values.
+
+0x14022e540
+  query path that returns context+0x72c0 streaming state to userspace.
+
+0x140218c98 and 0x14021a473
+  format builders consuming +0x8144/+0x8148/+0x814c/+0x727c, then calling
+  0x14021ee5c and 0x140228918.
+
+0x14027e7b0 / 0x14027f073 / 0x14027eb38
+  DirectMemory/frame-delivery path. These use stream-state fields for timing,
+  metadata, frame counters, and synthetic/no-signal frame delivery.
+
+reset paths
+  0x140250e82, 0x140253d5f, 0x14026e14c, and 0x1402835d8 clear the same
+  fields and reset context+0x72c0.
+```
+
+This explains the V4L2/DirectMemory metadata side, but it is still a negative
+result for real DMA: the buffer advertisement and endpoint ring programming
+must be in a different user of the stream context, likely below
+`0x14021ee5c`/`0x140228918` or a path touching `+0x81e4` and endpoint counters
+`+0x204c/+0x2050/+0x2058/+0x205c`.
+
+## Windows Buffer Queue
+
+Linux exposes the decoded Windows software frame-buffer queue:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_buffer_queue_info
+```
+
+The queue creation path at `0x14021e190` is called from the format builders
+after `0x14021ee5c`. It allocates a `0x140`-byte object with pool tag
+`0x48504a59`, links it into the eight-entry context queue
+`+0x6d58..+0x6d90`, and allocates:
+
+```text
+queue+0xf0 = 0x0c00-byte buffer
+queue+0xf8 = 0x0c00-byte buffer
+queue+0x108 = format-size-dependent video buffer
+```
+
+The format-dependent allocation accepts size constants `0x4380`, `0x4920`,
+`0x5a00`, `0x5fa0`, and `0x6540` from `format+0x08`. The frame helper around
+`0x14027e0db..0x14027e399` later uses `queue+0xd0` as a frame base and copies
+from planes at `+0x4000/+0x8000/+0xc000`, or from external stream buffers at
+`+0x2c8/+0x2d4`.
+
+This is closer to the capture path, but it is still host-side software storage.
+The missing producer side is now narrower: find who fills `queue+0xd0` or the
+external buffers, and where that path writes endpoint/outbound registers or
+shared-memory descriptors that the firmware can DMA into.
+
+## Windows Frame Producer Search
+
+Linux exposes the current producer/consumer split as:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_frame_producer_search
+```
+
+The latest static pass separated several useful negative results from the
+remaining true hardware path:
+
+```text
+0x140230000..0x140230046
+  zeroes context queue/table families:
+  +0x6b58, +0x6a98, +0x6cd8, +0x6d58, +0x6dd8, +0x6e58
+  This is initialization/reset, not a frame producer.
+
+0x14021e190 / 0x14021e480
+  create and destroy the 0x140-byte host queue objects linked into
+  context+0x6d58..+0x6d90.
+
+0x14027e311..0x14027e361
+  reads stream object +0x2c8 as source base and +0x2d4 as source size, then
+  copies that already-visible memory through helper 0x140297500.
+
+0x14027e3b0..0x14027e8xx
+  DirectMemory metadata/timing code using stream_info+0x58/+0x40/+0x48,
+  per-stream counters +0x9c/+0xdc/+0x15c/+0x19c, and context counters
+  +0x97f0/+0x98c0/+0x98c4.
+```
+
+So far, these paths consume or wrap memory that is already visible to the
+Windows host. They do not advertise a Linux host physical address to the
+firmware, program BAR5 outbound windows, enable bus mastering, or arm a DMA
+ring.
+
+The next static targets are write xrefs to stream object `+0x2c8/+0x2d4`,
+queue `+0xd0`, DirectDMA config `context+0x81e4`, and endpoint counter/status
+fields `+0x204c/+0x2050/+0x2058/+0x205c`.
+
+## Windows External Stream Buffer
+
+Linux exposes the decoded `stream object +0x2c8/+0x2d4` lifecycle:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_external_buffer_info
+```
+
+The live stream object allocator around `0x14027a2d6` allocates several large
+host buffers:
+
+```text
+stream+0x1f8/+0x200/+0x208/+0x210: 0x00655000-byte buffers
+stream+0x2a8/+0x2b0/+0x2b8/+0x2c0/+0x2c8: 0x001d4c00-byte buffers
+```
+
+The final allocation is stored at `stream+0x2c8` at `0x14027a372`. The cleanup
+path at `0x1402824e1` frees `stream+0x2c8` and clears it together with the
+neighboring `+0x2a8..+0x2c0` buffers. The runtime preparation path at
+`0x14028ac57` clears `stream+0x2c8` for `0x001d4c00` bytes before recomputing
+`stream+0x2d4` around `0x14028acef`.
+
+The many writes to `rbp+0x2c8/+0x2d4` in `0x14021f843..0x14022bb24` are mostly
+stack/local format templates, not the live stream object. Several of these
+templates use `+0x2d4 = 0x00100000`, which explains why the static search
+initially looked like a DMA ring size. It is still a software buffer template
+unless a later path advertises the address to the endpoint.
+
+This narrows the real missing producer: Windows has host memory buffers, and
+the delivery path consumes them. The remaining target is the call that tells
+firmware/endpoint hardware where those buffers are, likely through host
+physical address translation, BAR5 outbound-window programming, or a BAR0+0x60
+staged payload that carries host addresses rather than logo data.
+
+## Windows DMA Mapping Init
+
+Linux exposes the decoded PCI/resource/DMA initialization anchors:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_dma_mapping_info
+```
+
+The import table resolves the key indirect calls:
+
+```text
+0x1402a5068 -> KsDeviceGetBusData
+0x1402a5060 -> KsDeviceRegisterAdapterObject
+0x1402a5190 -> MmMapIoSpace
+0x1402a51f0 -> MmAllocateContiguousMemorySpecifyCache
+0x1402a51f8 -> MmFreeContiguousMemorySpecifyCache
+0x1402a5210 -> IoGetDmaAdapter
+0x1402a5230 -> MmGetPhysicalAddress
+```
+
+Around `0x14028d553`, Windows reads PCI/config data with `KsDeviceGetBusData`.
+Around `0x14028d8d1`, it maps translated PCI resources using `MmMapIoSpace`
+into sequential device slots; `device+0x108` still matches BAR0 on the Linux
+card, and the next mapped slot is likely BAR5.
+
+The first contiguous allocation at `0x14028d628` is only a 0x1000-byte probe:
+Windows allocates contiguous memory, calls `MmGetPhysicalAddress`, logs/records
+the physical address, then immediately frees it with
+`MmFreeContiguousMemorySpecifyCache`.
+
+The persistent DMA-relevant allocations are later:
+
+```text
+0x14028d83d:
+  IoGetDmaAdapter -> device+0x40
+  map-register count/result -> device+0x48
+
+0x14028e19c:
+  contiguous buffer -> device+0xd0
+  physical address  -> device+0xc8
+
+0x14028e2a2:
+  contiguous buffer -> device+0x140
+  physical address  -> device+0x138
+
+0x14028e4db / 0x14028e5c3:
+  per-channel contiguous buffers -> device+0x1190-family
+  physical addresses             -> device+0x190-family
+```
+
+Then `0x14028e2ee` calls `KsDeviceRegisterAdapterObject` with `device+0x40`,
+`0xfffffff8`, and `0x10`. This is the first clearly confirmed Windows path
+that owns physical-address-backed buffers. It is now a stronger real-DMA target
+than `stream+0x2c8`, which is just host delivery memory.
+
+The remaining missing edge is still explicit address advertisement: find the
+later xrefs that carry `device+0xc8`, `device+0x138`, or the `device+0x190`
+physical address family into BAR0/BAR5 or a firmware endpoint payload.
+
+## Firmware Userland Event Loop
+
+`video_capture_mgr` is a stripped ARM executable, but the Capstone helper can
+disassemble its `.text` and annotate `.rodata` strings and PLT calls.
+
+The main event loop opens `/sys/vpl_pciep/epint` with read/write access, reads a
+0x2c-byte record, polls forever, then uses `pread(fd, event, 0x2c, 0)` and
+dispatches on `event[0]`. Several handled paths call `pwrite(fd, event, 0x2c, 0)`
+after processing, which strongly suggests a 0x2c-byte event/ack ownership
+protocol between `ep.ko` and `video_capture_mgr`.
+
+Decoded userland branches:
+
+```text
+event 0x29  SET_VIC path; validates width/height > 0x7f, stores per-channel capture config, starts tinyvenc path
+event 0x2a  Set AIC audio params path
+event 0x60  LOGO BEGIN DOWNLOAD path; saves channel/logo type/firmware size/logo order, then acks
+event 0x61  LOGO END DOWNLOAD path; finalizes logo state, then acks
+event 0x6e  LOAD_FILES path; may transform payload bytes, then acks
+event 0x07  STOP_STREAMING path; runs echo '0' > /sys/vpl_pciep/hready and kills capture_app_infinite/capture_audio_8ch
+```
+
+The `SET_VIC` userland format string is richer than the ISR log:
+
+```text
+[Video_MGR][ch%d] SET_VIC fw(%d), fps(%d), resolution(%dx%d) interlace(%d), m(%d), color_info ..., input_frame_width(%d), input_frame_height(%d), bitstream_num(%d), ... is_nosg(%d)
+```
+
+This reinforces the current model: the Linux host must either reproduce the
+host-side event transport that makes firmware/userland see 0x29/0x2a records, or
+find the shared-memory region behind `/sys/vpl_pciep/epint` and advertise host
+buffers there. Directly toggling A3/version queries will not start capture.
+
+## Windows 0x88 Bridge Helpers
+
+The Windows helper at `0x1402777e4` builds a normal mailbox read packet:
+
+```text
+[0x800, 0x1a, chip, reg, 0]
+```
+
+It returns the low byte from `BAR0+0x10` after `MZ0380_SEND_COMMAND`.
+
+The paired helper at `0x1402851cc` builds a normal mailbox write packet:
+
+```text
+[0x800, 0x1b, chip, reg, value]
+```
+
+Stream-start and resolution-update paths use these helpers against chip `0x88`,
+especially registers `0x15`, `0x16`, and `0x18`. The helper at `0x14026edd8`
+also reads `0x88:40` and a resolution-dependent range around `0x88:8d..0x95`
+into an 8-byte buffer.
+
+The stream-update block at `0x14026ec85..0x14026ed36` does this:
+
+```text
+read 0x88:18
+read 0x88:16
+read 0x88:15
+base_phase = ((read15 & 0x70) << 4) | read16
+base_gain = read18
+adjusted_phase = base_phase + context->calibration_36c[index]
+adjusted_gain = base_gain + context->calibration_a20[index]
+write 0x88:15 = ((adjusted_phase >> 4) & 0x70) | (read15 & 0x0f)
+write 0x88:16 = adjusted_phase & 0xff
+write 0x88:18 = adjusted_gain & 0xff
+```
+
+Linux exposes the decoded plan and live source reads at:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_88_update_plan
+```
+
+The calibration property paths that feed `context+0x36c` and `context+0xa20`
+are now summarized at:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_calibration_info
+```
+
+Important decoded paths:
+
+```text
+0x14023f0a0: get phase calibration from stream_info[index]+0x36c
+             or alternate stream_info[index]+0x1e3c
+0x14023f120: set phase calibration, mark dirty flags, update 0x9c:80/81,
+             and when the endpoint bridge exists update 0x88:15/16
+0x14023f320: get gain calibration from stream_info[index]+0xa20
+             or alternate stream_info[index]+0x1ea4
+0x14023f3a0: set gain calibration, mark dirty flags, update 0x9c:84,
+             and when the endpoint bridge exists update 0x88:18
+0x1402518aa: reads stream_info[index]+0x36c during setup
+0x1402518b2: reads stream_info[index]+0xa20 during setup
+```
+
+The live Linux card currently reads `0x88:15`, `0x88:16`, and `0x88:18` as
+zero after the pipeline-ready init. Do not enable writes to these registers
+until the default calibration values are recovered from Windows initialization
+or from a trace.
+
+## Windows Bridge Attach
+
+Windows stores a parent/controller context at `context+0x1f1a8` and a channel
+index at `context+0x1f1b0`. This is used by the `0x88` register update helpers,
+but the pointer itself is not a host DMA buffer.
+
+Linux summarizes the decoded attach paths and live read-only `0x60` status
+probe at:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_bridge_attach_info
+```
+
+Important decoded paths:
+
+```text
+0x140254614: iterates sibling contexts from global table 0x14039f160 using
+             context+0x1f190; stores sibling+0x1f1a8=parent and
+             sibling+0x1f1b0=channel index
+0x14026dec0: stream/status worker repeats the same attach for active channels
+0x1402441a0: property/query path calls 0x14026edd8 through +0x1f1a8/+0x1f1b0
+0x140244210: property/query path calls 0x14026fa98 through +0x1f1a8/+0x1f1b0
+```
+
+After attaching, `0x140254614` selects `0x60:ff = (channel & 3) + 5`, reads
+`0x60:f0/f4/f5` and sometimes `0x60:f3/f2`, checks `0x60:5c`, and may toggle
+helper/GPIO lines `0x12` and `0x24` with long sleeps when the state resolves to
+`0x31` or `0x32`.
+
+## Windows 0x88 Capture Presets
+
+Linux documents the write-only plan, without applying it, at:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_capture_88_presets
+```
+
+The dispatcher around `0x140272a0f` selects chip `0x88` preset helpers based on
+`stream_info+0x2080`. Stream IDs seen in this path include `0x2400`, `0x2601`,
+`0x2611`, `0x260c`, and `0x270c`.
+
+Common entry work:
+
+```text
+if stream_info+0x2080 >= 0x2200:
+    write 0x88:35 = 0x05
+read-modify-write 0x88:02 = (old & 0xfa) | 0x02
+read-modify-write 0x88:f5 using mask table byte at 0x1402d5afc[index]
+```
+
+The first recovered `0x1402d5afc` mask bytes are:
+
+```text
+fe fd fb f7 f0 00 00 00
+```
+
+Two nearby preset helpers write the same fixed sequence, except register
+`0x39`:
+
+```text
+0x140272d98: 0x39 = 0x8c
+0x140272f1c: 0x39 = 0x88
+fixed registers: 0c=03 0d=10 20=60 26=02 2b=58 2d=30 2e=70
+                 30=48 31=bb 32=2e 33=90 2c=0a 27=2d 28=00 13=00
+final: read 0x88:14 and write old & 0x9f
+```
+
+There is also a special tail around `0x140272bc3` for a mode-byte-2 path and
+`0x2601`-family/`0x270c` stream IDs:
+
+```text
+16=40 15=13 16=0a 17=00 18=19 19=d0 1a=25 1c=06 1d=7a
+```
+
+Linux has an opt-in minimal applicator for the `0x2400` preset:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/apply_capture_88_preset_2400_min
+```
+
+It requires `allow_capture_88_writes=1` and deliberately skips the unknown
+`0x88:f5` mask-table write and the `0x15..0x1d` 1080p-like tail. On the local
+HD60 Pro test, every write returned mailbox completion `1`, but immediate
+`0x1a` reads of the same `0x88` registers still returned zero. Treat that as
+command acceptance only, not proof that the target register bank latched the
+values.
+
+Linux also exposes the post-preset dynamic `0x88` table decode without touching
+hardware:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_88_mask_tables
+```
+
+This covers Windows helpers `0x14027383c` and `0x1402739ac`. Both select chip
+`0x88` registers from table `0x1402d5984`, apply AND masks from `0x1402d59f4`,
+and the set helper ORs bytes from `0x1402d5af0`.
+
+Recovered first table bytes:
+
+```text
+regs:  fa fa fb fb 00 00 00 00 01 00 00 00 02 00 00 00
+masks: f8 8f f8 8f 00 ff ff ff ff ff ff 00 02 03 00 00
+or:    01 10 01 10 01 02 04 08 0f 00 00 00 fe fd fb f7
+```
+
+For stream IDs `0x2400`, `0x2611`, and `0x270c`, Windows can use four
+consecutive slots when the selector is >= 4. For `0x2601` and `0x260c`, it uses
+two slots with even indexing. For smaller selectors, the helper uses either the
+direct selector or `(selector & 1) * 2` depending on stream family.
+
+Related dynamic helpers:
+
+```text
+0x140272d20: writes count bytes from caller table to consecutive 0x88
+              registers starting at base dl
+0x1402737d4: writes 0x88:40 with a Windows channel/mode selector mapping
+0x1402734d8: encodes one byte into three consecutive 0x88 writes
+0x14026fa98: consumes an 8-byte channel state buffer and writes dynamic 0x88
+              windows around 0x56..0x80, gated by stream_info+0x2080
+```
+
+Two `0x140272d20` callsites feed literal `.rdata` tables that look like
+GUID/property data but are consumed as chip `0x88` payload bytes:
+
+```text
+0x14027282e: table 0x14033f770, base 0x15, count 9
+0x140272a74: table 0x14033f7a0, base 0x15, count 9
+
+first nine written bytes for both:
+88:15=e9 88:16=4b 88:17=81 88:18=6f 88:19=f6
+88:1a=9a 88:1b=cf 88:1c=43 88:1d=92
+```
+
+The missing input is the exact live channel/state selector passed into these
+helpers after the Linux init sequence. Until that is recovered, these dynamic
+updates should remain documentation rather than automatic writes.
+
+Linux now exposes a guarded read-only debugfs probe:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/endpoint_bridge_regs
+```
+
+This does not write configuration values to the `0x88` block, but it does issue
+mailbox read commands, so it remains behind `allow_mailbox_writes=1` and
+`allow_i2c_read_command1a=1`.
+
+## Candidate SET_VIC Event Record
+
+Linux now exposes the current 1080p60 `SET_VIC` record model without sending it:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/set_vic_event_record
+```
+
+Current 0x2c-byte candidate:
+
+```text
+offset 0x00: command 0x29
+offset 0x04: channel 0
+offset 0x05: fps 60
+offset 0x06: fw/mode 7
+offset 0x07: interlace 0
+offset 0x08: width 1920
+offset 0x0a: height 1080
+offset 0x18: input_frame_width model 1920
+offset 0x1a: input_frame_height model 1080
+offset 0x1c: bitstream_count model 1
+```
+
+The first offsets are confirmed both by `ep.ko:pciep_isr` and
+`video_capture_mgr`. The later input-frame/bitstream offsets come from the
+`video_capture_mgr` format-string argument order and should be treated as a
+model until a Windows host trace confirms them.
+
+## Persistent Physical Buffers
+
+The Windows PCI/DMA init block `0x14028d250..0x14028e9ee` creates physical
+address backed allocations that are more relevant to real capture than the
+later DirectMemory software buffers.
+
+Confirmed xrefs:
+
+```text
+0x14028e19c: allocates device+0xd0, size from device+0xe0
+0x14028e1b7: stores MmGetPhysicalAddress(device+0xd0) at device+0xc8
+0x14028e2a2: allocates device+0x140, size from device+0x148
+0x14028e2bd: stores MmGetPhysicalAddress(device+0x140) at device+0x138
+0x14028e4db: allocates per-channel buffers at device+0x1190 + index*8
+0x14028e522: stores per-channel physical addresses at device+0x190 + index*0x10
+0x14028e52f: stores per-channel size/metadata at device+0x198 + index*0x10
+0x14028e81c: cleanup path for device+0xd0/device+0xc8/device+0xe0
+0x14028e8a6: cleanup path for device+0x140/device+0x148
+0x14028e8f3: cleanup path for device+0x1190/device+0x190/device+0x198 families
+```
+
+Later `0x1190` consumers are host-side frame buffer selection/copy paths:
+
+```text
+0x14027b977: selects a device+0x1190-family host pointer by channel/slot
+0x14027fb79: selects a device+0x1190-family host pointer by modulo frame slot
+0x14028026f: reads these buffers and interleaves/copies byte/word planes
+```
+
+So `device+0x1190` is useful for modeling the Windows frame memory layout, but
+these consumers still do not show the initial endpoint outbound-window or DMA
+advertisement step.
+
+Linux now mirrors this layout with extra coherent allocations when
+`prepare_dma_buffers=1`, exposed through:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/dma_info
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_physical_buffer_xrefs
+```
+
+These addresses are not advertised to hardware yet. The missing piece remains
+the Windows path that consumes `device+0xc8`, `device+0x138`, or the
+`device+0x190` physical-address family and passes them to BAR0/BAR5, a DMA
+adapter callback, or the firmware endpoint event transport.
+
+Important correction: calls through `0x1402a52d0` are not evidence of a DMA
+adapter callback. The import table ends earlier, and the qword at
+`0x1402a52d0` points at `0x1402974c0`, which is just `jmp rax`. Treat this as
+Windows CFG/guard indirect-call dispatch noise unless the surrounding target
+is independently recovered.
+
+## BAR Mapping Xrefs
+
+The mapped resource model is now:
+
+```text
+device+0x108: first mapped memory resource, matching Linux BAR0
+device+0x110: second mapped memory resource, matching Linux BAR5
+```
+
+Relevant Windows xrefs:
+
+```text
+0x140278c0c: preinit pattern, BAR5+0xdc=2 then BAR0+0x30=0 and BAR0+0=0x400
+0x140278c8e: writes BAR5+0x30 and BAR5+0x38 from device payload-window fields
+0x1402843b8: repeats the BAR5+0xdc/BAR0+0x30/BAR0+0 sequence in worker context
+0x14028444a: reads BAR0+0x40/+0x44/+0x48/+0x4c interrupt payload bytes
+0x140288303: clears BAR0+0x50/+0x54/+0x58/+0x5c after a stream state gate
+```
+
+The early `0x14021d8ac`-style `+0x108/+0x110` references are offset
+collisions on queue/format objects, not the device BAR slots. Linux exposes
+the BAR xref model through:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_bar_mapping_xrefs
+```
+
+## Worker Event Path
+
+The path around `0x14028adf0` creates a Windows worker callback at
+`0x140284380`. This is now decoded as an endpoint-event consumer:
+
+```text
+0x14028adf0: stores callback 0x140284380 and starts a worker object
+0x14028ae74: stops the worker and marks device+0x7699
+0x140284523: worker loop exits when device+0x7698 becomes nonzero
+0x1402843b8: reads BAR0+0x30, acks via BAR5+0xdc/BAR0+0x30/BAR0+0
+0x14028444a: reads BAR0+0x40/+0x44/+0x48 and queues a 24-bit token
+0x1402844c5: reads BAR0+0x4c when high payload bits are present
+0x14028eccd: sibling drain path reads BAR0+0x40-family and clears BAR0+0x50
+```
+
+The queue target is `device+0x29b0 + slot*0x40`, using guarded helper
+`0x1402a51b0` while holding/using the lock-like object at `device+0x69b8`.
+The timer-like sibling at `0x14028294b` uses the same helper for software event
+tokens, so this helper is queue insertion/collection logic, not DMA
+programming.
+
+This is useful because it ties BAR0+0x40..0x4c to endpoint event payloads and
+the firmware `pciep_isr/store_channel_done` model. It is still a consumer path:
+the missing capture-start piece is earlier, where Windows advertises host frame
+buffers and causes the endpoint to start producing these events.
+
+Linux exposes this through:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_worker_event_path
+```
+
+`device+0x29b0` is now modeled separately:
+
+```text
+0x14028e731: initializes 0x100 queue entries, stride 0x40, callback 0x14028ee50
+0x14028444a: queues BAR0+0x40/+0x44/+0x48 low payload tokens
+0x1402844c5: queues BAR0+0x4c high payload tokens
+0x14028ed61/0x14028ed9b/0x14028edd5: sibling event-drain insertion paths
+```
+
+This appears to be a 256-slot endpoint-event collection. The frame delivery
+path at `0x140293c39` locks `device+0x1d108` and calls
+`0x14027eb38/0x14027e3b0/0x14027d698`, so the event queue is not itself the
+frame buffer or physical DMA ring. The useful next static target is callback
+`0x14028ee50` and the handoff from this event queue to `device+0x1d108` stream
+objects.
+
+Linux exposes this through:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_event_queue_xrefs
+```
+
+The queue callback `0x14028ee50` is now decoded as the bridge between endpoint
+events and the Windows stream/frame software objects:
+
+```text
+0x14028ee50:
+  rdx = device context
+  r8  = event/token mask
+  r9  = callback payload/context
+  locks device+0x69b8
+  builds temporary arrays of list heads, frame pointers, metadata pointers,
+  flags, and output slots from the 0x29b0 queue objects
+  calls stream_object+0x10 via CFG dispatch 0x1402a52d0
+  writes callback-returned slot values back into queue/list objects
+  signals wait/event objects at slot+0x100
+```
+
+This gives a plausible software path:
+
+```text
+BAR0+0x40..0x4c endpoint payload
+  -> device+0x29b0 queue slot
+  -> 0x14028ee50 callback bridge
+  -> stream_object+0x10 function pointer
+  -> device+0x1d108 frame delivery lists
+  -> DirectMemory frame helpers
+```
+
+The stream object is allocated at `0x1402381dd` with size `0x24f0` and stored at
+`device+0x1d110`; `device+0x1d108` and `device+0x1d100` are lock/list-head
+objects initialized during device setup. This is still not the hardware DMA
+programming point: the remaining critical target is the writer of
+`stream_object+0x10`, because that function pointer is the handoff that consumes
+the callback arrays and likely maps endpoint events into real frame objects.
+
+Linux exposes this through:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_event_callback_bridge
+```
+
+The writer of `stream_object+0x10` remains the critical missing link. The
+current decoded state is:
+
+```text
+0x14028f4c9:
+  0x14028ee50 loads stream_object+0x10 and calls it through CFG dispatch
+  0x1402a52d0 after preparing endpoint event arrays
+
+0x1402381c5..0x1402381f6:
+  allocates a 0x24f0-byte stream object, stores it at device+0x1d110,
+  zeroes it, and then initializes stream fields
+
+0x14022d0c8:
+  bounded string formatter around 0x140295898; not the callback installer
+
+0x14024a768 sampled call family:
+  reads video/I2C timing registers and computes format timing; not the direct
+  stream+0x10 writer in the currently decoded slice
+```
+
+There is no simple direct immediate store to `[stream+0x10]` in the sampled
+disassembly. The current working model is that this callback is installed
+indirectly through a helper or nested table during stream object/property
+construction. The next static targets are the tail of the stream constructor,
+all callees receiving `r14` or `r14+0x1ea4`, and the selected globals/tables
+around `0x140340ac0..0x140340ad8` and `.rdata 0x1402a0c00/0x1402a0c30`.
+
+The global selector branch immediately before stream allocation is now partially
+excluded as a callback source. The selected backing tables at
+`0x14033ec50`, `0x14033ed10`, and `0x14033edd0` decode as KS/audio-format
+descriptor data: they contain `auds`, GUIDs, sizes, and format timing/range
+values, not executable function pointers. The property handler family around
+`0x14023e760..0x140241220` repeatedly recovers the device context through
+`0x1402a50a8/0x1402a50a0` and reads/writes stream/device fields such as
+`+0x72c0`, `+0x73b0`, `+0x8140`, `+0x8158..+0x8170`, `+0x1ea4`, `+0x1f0c`,
+and `+0x1fdc`; those handlers are format/routing state and I2C tuning helpers,
+not the stream callback installer.
+
+Linux exposes this through:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_stream_callback_search
+```
+
+## DirectMemory Counter Fields
+
+The `stream_info+0x204c/+0x2050/+0x2054/+0x2058/+0x205c` family is now decoded
+as a software cadence/drop/reset gate around DirectMemory frame delivery:
+
+```text
+0x140253d59: stores fps/2 into stream_info+0x2050 during format/reset
+0x140253f7c: repeats the +0x2050 update after stream/pipeline changes
+0x14027b374: clears external-buffer state and +0x2054/+0x205c when idle
+0x14027db98: clears +0x205c in DirectMemory timing path
+0x14027ef02: clears +0x2058 in an alternate timing path
+0x14027f1f7: decrements +0x2050 during DirectMemory frame delivery
+0x140289447: teardown clears qword families at +0x2050 and +0x2058
+```
+
+This is another useful negative result: these fields are not PCI BAR registers
+and do not appear to be the firmware `channel_done` ownership protocol. Linux
+exposes this through:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_frame_counter_info
+```
+
+The DirectMemory drain path is now separated from the missing PCI endpoint DMA
+programming path:
+
+```text
+0x140293c39:
+  locks device+0x1d108
+  pops frame/list objects
+  resets frame metadata at frame+0x10
+  dispatches by stream/frame type to 0x14027eb38, 0x14027e3b0, or 0x14027d698
+
+0x14027eb38:
+  consumes device+0x1d110 stream fields
+  reads software source data from device+0xd0 + offsets such as
+  0x0/0x2000/0x4000/0x6000
+  copies blocks into the delivered frame buffer with 0x140001820
+  updates timestamps/payload metadata
+
+0x140294c09 / 0x140294e0d:
+  load object->+0xc0->+0x10
+  map frame type to a slot 0..0x1e
+  call 0x14028fa04 state updater
+```
+
+This looks like software frame delivery or no-signal/format fallback from
+Windows contiguous memory, not the physical host-frame advertisement to the PCI
+endpoint. There are no decoded BAR0/BAR5 writes or physical address publications
+inside this drain path. Linux exposes this through:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_directmemory_drain_path
+```
+
+## Windows Contiguous Buffer Layout
+
+The `0x14028d250` initialization block now gives a clearer host-buffer layout
+than the earlier DirectMemory drain path:
+
+```text
+control buffer:
+  device+0xe0 size
+  device+0xd0 virtual address
+  device+0xc8 physical address
+
+status buffer:
+  device+0x148 size
+  device+0x140 virtual address
+  device+0x138 physical address
+
+channel buffers:
+  device+0x1190 + slot*8     virtual address
+  device+0x190  + slot*0x10  physical address
+  device+0x198  + slot*0x10  size/metadata
+  device+0x2590 + group*0x80 + slot*4 software state
+  device+0x2990 + group*4    cleanup size table
+```
+
+The allocation stores happen at `0x14028e19c/0x14028e1b7`,
+`0x14028e2a2/0x14028e2bd`, and `0x14028e4db/0x14028e510/0x14028e52f`,
+with fallback paths at `0x14028e20c`, `0x14028e3f2`, and
+`0x14028e5c3/0x14028e5f5/0x14028e611`. Cleanup mirrors those fields around
+`0x14028e81c..0x14028ebc1`.
+
+This is the closest current match to Windows host physical buffers, but it is
+still not the endpoint advertisement. This constructor prepares physical
+addresses; it does not write them to BAR0/BAR5 or to an identified firmware
+event record. Linux exposes the current mirror state through:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_contiguous_buffer_layout
+```
+
+## DMA Publish Search
+
+Two offset families have to stay separated:
+
+```text
+device context, r14 in 0x14028d250:
+  +0xc8/+0xd0/+0xe0 and +0x138/+0x140/+0x148 are real contiguous DMA
+  physical/virtual/size fields.
+
+stream/queue config object, allocated at 0x14021e190:
+  +0xc0/+0xc8/+0xd0 copy host object pointers into a 0x140-byte queue/config
+  object inserted into device+0x6d58..+0x6d90.
+```
+
+The `0x14021e190` family is therefore a useful false positive: it explains why
+`+0xd0` appears in DirectMemory software-copy paths, but it is not the missing
+PCI endpoint address publication. The driver now exposes this distinction in:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_dma_publish_search
+```
+
+## Firmware PCIe Outbound Registers
+
+`yuan_demo_sdi/drivers/ep.ko` is an ARM32 relocatable module with symbols. The
+host does not currently have an ARM disassembler installed, but `readelf` plus
+the raw `.text` bytes identifies `pcie_set_outbound` at `.text+0x5a8`, size
+`0xa0`.
+
+Manual ARM immediate decoding of the function shows writes to the endpoint
+channel window:
+
+```text
+selected_channel+0x50 = 0x00000001
+selected_channel+0x74 = 0x90000000
+selected_channel+0x7c = 0x91ffffff
+selected_channel+0x54 = caller arg0
+selected_channel+0x58 = caller arg1
+selected_channel+0xd4 = 0x0f000000
+```
+
+That is now the strongest firmware-side hint for the missing outbound/DMA
+advertisement path. Linux exposes BAR5 readback and the decoded constants in:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/firmware_pcie_outbound_regs
+```
+
+`vpl_dmac.ko` imports `pcie_set_outbound`. Relocations show the two direct
+callers:
+
+```text
+VPL_DMAC_StartTail: .rel.text offset 0x00000c94 -> pcie_set_outbound
+VPL_DMAC_ISRTail:   .rel.text offset 0x00000f70 -> pcie_set_outbound
+```
+
+The raw ARM code around those calls copies a DMAC tail profile into the MMR
+window, ORs a start/control bit into MMR `+0x08`, and then calls
+`pcie_set_outbound(profile+0x38, profile+0x39, profile+0x3a)` when the
+profile gate around `+0x3b` allows it. This strongly suggests the real host
+DMA advertisement is produced by the firmware DMAC profile path, not by Windows
+directly writing BAR5 outbound registers. Linux exposes this through:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/firmware_dmac_outbound_path
+```

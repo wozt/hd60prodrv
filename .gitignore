@@ -4,10 +4,12 @@
 *.o
 .*.cmd
 .module-common.*
+.gitignore
 Module.symvers
 modules.order
 build/
 snapshots/
 certs/*.priv
 vendor/
-.certs/
+certs/MOK.der
+certs/MOK.pem

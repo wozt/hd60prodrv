@@ -142,38 +142,12 @@ run_quiet post_logo_selector_shadow_probe 10 "$DBG/post_logo_selector_shadow_pro
 run_quiet post_logo_cmd1d_a2 10 "$DBG/post_logo_cmd1d_a2"
 run_require_grep post_logo_challenge_a2 10 "$DBG/post_logo_challenge_a2" '^pipeline_ready: 1$'
 
-run_show mst3367_probe 10 "$DBG/mst3367_probe"
-run_show mst3367_bank_reset 10 "$DBG/mst3367_bank_reset"
+# Physical MST3367 at 0x98 (7-bit 0x4C) — initialized by FPGA ARM before driver.
+# Expect: reg[0x55]=0x7D (CDR locked), reg[0x56]=0xFE, reg[0x5E]=0x9A.
+# DO NOT run mst3367_hw_init here — GPIO8 pulse would reset the physical chip
+# and force the FPGA ARM to reinitialise it (takes 60+ s, blocks capture).
+# The FPGA ARM already has the chip in the correct state.
 run_show mst3367_phys_test 10 "$DBG/mst3367_phys_test"
-
-# Write 256-byte EDID (base + CEA 861 + HDMI VSDB) to chip 0x66.
-# hw_init will then pulse GPIO8 LOW→HIGH to hardware-reset the MST3367,
-# causing it to reload its internal EDID RAM from chip 0x66, and then
-# pulse GPIO9 (HPD) so the source reads the correct EDID.
-# No separate hpd_pulse or sleep is needed — hw_init handles the full
-# GPIO8-reset + EDID-reload + HPD-pulse sequence internally.
-run_show edid_load 30 "$DBG/edid_load"
-
-# Verify the EEPROM write actually stuck: read back key bytes from chip 0x66
-# via cmd 0x1a (I2C_READ8, which returns data at BAR0[0x010], unlike cmd 0x20).
-# If byte 0x01 reads 0xFF the EDID is in the chip; if 0x00 writes are failing.
-run_show edid_verify 15 "$DBG/edid_verify"
-
-# hw_init sequence:
-#   GPIO8=0 (MST3367 HW reset)  → msleep(50)
-#   GPIO8=1 (release + EDID reload from chip 0x66) → msleep(300)
-#   GPIO9=1→0→1 (HPD pulse: source reads new EDID)  → msleep(300)
-#   Full register init of MST3367 (bank0/1/2 CDR/EQ/PLL)
-run_show mst3367_hw_init 20 "$DBG/mst3367_hw_init"
-
-# Assert MST3367's own HPD output (bank0[0xb7]=0x02).  hw_init's
-# TMDS_HOT_PLUG(3) call clears this to 0x00 at the end of init.
-run_quiet mst3367_hpd_on 5 "$DBG/mst3367_hpd_on"
-
-# Poll immediately after hw_init + hpd_on, before bar5_dma_program and
-# cmd02_dma_setup, to observe whether the chip reaches full lock (0x3C).
-run_show mst3367_poll 35 "$DBG/mst3367_poll"
-run_show mst3367_signal 10 "$DBG/mst3367_signal"
 
 run_show gpio_read 5 "$DBG/gpio_read"
 
@@ -183,6 +157,10 @@ run_show bar5_dma_program 10 "$DBG/bar5_dma_program"
 
 run_show capture_info 10 "$DBG/capture_info"
 run_show health 10 "$DBG/health"
+
+# Confirm physical CDR is still locked right before starting capture.
+# If reg[0x55] is NOT 0x7D here, the chip was reset and is not ready.
+run_show mst3367_phys_test 10 "$DBG/mst3367_phys_test"
 
 # Full end-to-end stream test: sends cmds 0x29+0x2a+0x02+0x06 and polls 5 s
 # for DMA frame IRQs, then peeks at the frame buffer.

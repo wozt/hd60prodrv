@@ -73,7 +73,8 @@ post_logo_pipeline_started()
 	fi
 
 	grep -q '^0x004 0x0000001b ' "$out" &&
-		grep -q '^0x02c 0x00000001 ' "$out"
+		grep -q '^0x02c 0x00000001 ' "$out" &&
+		grep -q '^0x00c 0x00000018 ' "$out"
 }
 
 if ! ./scripts/install-logo-payloads-root.sh >"$TMPDIR/install-logo-payloads.txt" 2>&1; then
@@ -96,6 +97,11 @@ if ! ./scripts/load-safe.sh ./hd60prodrv.ko \
 	request_irq_vector=1 \
 	enable_v4l2=1 \
 	prepare_dma_buffers=1 \
+	allow_dma_capture=1 \
+	force_32bit_dma=1 \
+	allow_capture_88_writes=1 \
+	synthetic_v4l2=0 \
+	enable_busmaster=1 \
 	mailbox_bar=0 >"$TMPDIR/load-safe.txt" 2>&1; then
 	echo "== load-safe FAILED =="
 	cat "$TMPDIR/load-safe.txt"
@@ -136,8 +142,52 @@ run_quiet post_logo_selector_shadow_probe 10 "$DBG/post_logo_selector_shadow_pro
 run_quiet post_logo_cmd1d_a2 10 "$DBG/post_logo_cmd1d_a2"
 run_require_grep post_logo_challenge_a2 10 "$DBG/post_logo_challenge_a2" '^pipeline_ready: 1$'
 
+run_show mst3367_probe 10 "$DBG/mst3367_probe"
+run_show mst3367_bank_reset 10 "$DBG/mst3367_bank_reset"
+run_show mst3367_phys_test 10 "$DBG/mst3367_phys_test"
+
+# Write 256-byte EDID (base + CEA 861 + HDMI VSDB) to chip 0x66.
+# hw_init will then pulse GPIO8 LOW→HIGH to hardware-reset the MST3367,
+# causing it to reload its internal EDID RAM from chip 0x66, and then
+# pulse GPIO9 (HPD) so the source reads the correct EDID.
+# No separate hpd_pulse or sleep is needed — hw_init handles the full
+# GPIO8-reset + EDID-reload + HPD-pulse sequence internally.
+run_show edid_load 30 "$DBG/edid_load"
+
+# Verify the EEPROM write actually stuck: read back key bytes from chip 0x66
+# via cmd 0x1a (I2C_READ8, which returns data at BAR0[0x010], unlike cmd 0x20).
+# If byte 0x01 reads 0xFF the EDID is in the chip; if 0x00 writes are failing.
+run_show edid_verify 15 "$DBG/edid_verify"
+
+# hw_init sequence:
+#   GPIO8=0 (MST3367 HW reset)  → msleep(50)
+#   GPIO8=1 (release + EDID reload from chip 0x66) → msleep(300)
+#   GPIO9=1→0→1 (HPD pulse: source reads new EDID)  → msleep(300)
+#   Full register init of MST3367 (bank0/1/2 CDR/EQ/PLL)
+run_show mst3367_hw_init 20 "$DBG/mst3367_hw_init"
+
+# Assert MST3367's own HPD output (bank0[0xb7]=0x02).  hw_init's
+# TMDS_HOT_PLUG(3) call clears this to 0x00 at the end of init.
+run_quiet mst3367_hpd_on 5 "$DBG/mst3367_hpd_on"
+
+# Poll immediately after hw_init + hpd_on, before bar5_dma_program and
+# cmd02_dma_setup, to observe whether the chip reaches full lock (0x3C).
+run_show mst3367_poll 35 "$DBG/mst3367_poll"
+run_show mst3367_signal 10 "$DBG/mst3367_signal"
+
+run_show gpio_read 5 "$DBG/gpio_read"
+
+run_quiet bar5_dma_program 10 "$DBG/bar5_dma_program"
+run_show mst3367_signal 10 "$DBG/mst3367_signal"
 run_show capture_info 10 "$DBG/capture_info"
 run_show endpoint_info 10 "$DBG/endpoint_info"
 run_show direct_memory_info 10 "$DBG/direct_memory_info"
 run_show capture_start_plan 10 "$DBG/capture_start_plan"
 run_show health 10 "$DBG/health"
+
+echo
+echo "=== Hardware ready. Run VLC to start capture: ==="
+echo "    vlc v4l2:///dev/video1"
+echo "=== Or use ffmpeg: ffmpeg -f v4l2 -i /dev/video1 -vframes 1 /tmp/frame.jpg ==="
+echo "=== send_set_vic node also available for manual test: ==="
+echo "    cat $DBG/send_set_vic"

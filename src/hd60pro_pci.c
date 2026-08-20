@@ -348,8 +348,10 @@ struct hd60pro_dev {
 	int irq;
 	struct mutex mailbox_lock;
 	u32 last_irq_status;
+	u32 cum_irq_status;    /* OR of all status words seen since last clear */
 	u32 irq_count;
 	u32 mailbox_irq_count;
+	u32 non_mbox_irq_count; /* IRQs with bits other than BIT(11) set */
 	struct dentry *debugfs_dir;
 	/* DMA/MMIO frame capture (allow_dma_capture=1) */
 	spinlock_t irq_lock;
@@ -426,9 +428,12 @@ static irqreturn_t hd60pro_irq(int irq, void *data)
 		return IRQ_NONE;
 
 	hd->last_irq_status = status;
+	hd->cum_irq_status |= status;
 	hd->irq_count++;
 	if (status & HD60PRO_IRQ_MBOX_COMPLETE)
 		hd->mailbox_irq_count++;
+	if (status & ~HD60PRO_IRQ_MBOX_COMPLETE)
+		hd->non_mbox_irq_count++;
 
 	/*
 	 * IRQ ack sequence from LXV4L2D_MZ0380.ko decompilation:
@@ -2495,6 +2500,73 @@ static int hd60pro_gpio_read_show(struct seq_file *s, void *unused)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(hd60pro_gpio_read);
+
+/*
+ * gpio_pipeline_assert: assert GPIO8=HIGH (FPGA pixel-capture enable) using
+ * cmd 0x17 (GPIO_SET), WITHOUT the prior GPIO8=LOW pulse that hw_init does.
+ *
+ * gpio17_generic_sequence leaves GPIO8=0 (reset state).  Normally hw_init
+ * asserts GPIO8=HIGH afterwards: {0x800, 0x17, BIT(8), BIT(8)}.  When hw_init
+ * is skipped (to avoid disturbing the FPGA ARM's MST3367 initialisation), GPIO8
+ * stays LOW, which disables the FPGA pixel-capture pipeline.
+ *
+ * This node sends the same GPIO8=HIGH packet as hw_init, without any GPIO8=LOW
+ * pulse first.  Run it once before stream_start_test.
+ */
+static int hd60pro_gpio_pipeline_assert_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	u32 comp;
+	int ret;
+
+	if (!allow_mailbox_writes || !allow_gpio17_sequence) {
+		seq_puts(s, "gpio_pipeline_assert: blocked (need allow_mailbox_writes=1 allow_gpio17_sequence=1)\n");
+		return 0;
+	}
+	if (!base) {
+		seq_puts(s, "gpio_pipeline_assert: no mailbox base\n");
+		return 0;
+	}
+
+	seq_puts(s, "gpio_pipeline_assert: setting GPIO8=HIGH (FPGA pixel-capture enable)\n");
+
+	/* GPIO8=HIGH via cmd 0x17 (same packet hw_init uses to release reset) */
+	{
+		u32 pkt[4] = {
+			HD60PRO_MBOX_DOORBELL,
+			HD60PRO_MBOX_CMD_GPIO_SET,  /* 0x17 */
+			BIT(8),                     /* mask: GPIO8 */
+			BIT(8),                     /* value: HIGH  */
+		};
+
+		mutex_lock(&hd->mailbox_lock);
+		ret = hd60pro_mailbox_send_locked(hd, pkt, ARRAY_SIZE(pkt),
+						  HD60PRO_MBOX_TIMEOUT_US, &comp);
+		mutex_unlock(&hd->mailbox_lock);
+		seq_printf(s, "  GPIO8=HIGH: ret=%d comp=0x%08x\n", ret, comp);
+	}
+
+	/* GPIO1=HIGH — was set in the working run (after hw_init); set it here too */
+	{
+		u32 pkt[4] = {
+			HD60PRO_MBOX_DOORBELL,
+			HD60PRO_MBOX_CMD_GPIO_SET,  /* 0x17 */
+			BIT(1),                     /* mask: GPIO1 */
+			BIT(1),                     /* value: HIGH  */
+		};
+
+		mutex_lock(&hd->mailbox_lock);
+		ret = hd60pro_mailbox_send_locked(hd, pkt, ARRAY_SIZE(pkt),
+						  HD60PRO_MBOX_TIMEOUT_US, &comp);
+		mutex_unlock(&hd->mailbox_lock);
+		seq_printf(s, "  GPIO1=HIGH: ret=%d comp=0x%08x\n", ret, comp);
+	}
+
+	seq_puts(s, "gpio_pipeline_assert: done; run gpio_read to verify\n");
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_gpio_pipeline_assert);
 
 /*
  * mst3367_hw_init: full MST3367_HwInitialize() sequence from LXV4L2D_MZ0380.ko.
@@ -8809,7 +8881,7 @@ static int hd60pro_firmware_pcie_outbound_regs_show(struct seq_file *s,
 	seq_puts(s, "  write selected_channel+0x7c = 0x91ffffff (instruction bytes 6e 24 e0 e3, mvn-immediate form)\n");
 	seq_puts(s, "  write selected_channel+0x54 = caller arg0 low word\n");
 	seq_puts(s, "  write selected_channel+0x58 = caller arg1 low word\n");
-	seq_puts(s, "  write selected_channel+0xd4 = 0x0f000000 (instruction bytes 0f 26 a0 e3)\n");
+	seq_puts(s, "  write selected_channel+0xd4 = 0x00f00000 (instruction bytes 0f 26 a0 e3 = MOV r2, #(0x0f ROR 12) = 0x00f00000)\n");
 	seq_puts(s, "linux_bar5_current:\n");
 	seq_printf(s, "  bar5_050: 0x%08x\n", reg50);
 	seq_printf(s, "  bar5_054: 0x%08x\n", reg54);
@@ -8882,8 +8954,11 @@ static int hd60pro_bar5_dma_program_show(struct seq_file *s, void *unused)
 	iowrite32(frame_low,  hd->bar5 + 0x054);
 	iowrite32(frame_high, hd->bar5 + 0x058);
 	iowrite32(0x00000001, hd->bar5 + 0x050);
-	/* pcie_set_outbound also writes +0xd4 = 0x0f000000 */
-	iowrite32(0x0f000000, hd->bar5 + 0x0d4);
+	/* pcie_set_outbound also writes +0xd4 = 0x00f00000
+	 * ARM instruction "0f 26 a0 e3" = MOV r2, #(0x0f ROR 12) = 0x00f00000
+	 * (prior value 0x0f000000 was wrong — off by factor-of-16 typo)
+	 */
+	iowrite32(0x00f00000, hd->bar5 + 0x0d4);
 
 	seq_puts(s, "bar5_dma_program: written, reading after...\n");
 	r050 = ioread32(hd->bar5 + 0x050);
@@ -10964,25 +11039,19 @@ static int hd60pro_stream_start_test_show(struct seq_file *s, void *unused)
 
 	msleep(100);
 
-	/* ── cmd 0x06 STREAM_START ───────────────────────────────────────── */
-	{
-		const u32 start[] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_STREAM_START,
-			0xffffffff,
-		};
-		mutex_lock(&hd->mailbox_lock);
-		iowrite32(0, base + HD60PRO_REG_MBOX_COMPLETE);
-		ret = hd60pro_mailbox_send_async_locked(hd, start, ARRAY_SIZE(start),
-							15000, &completion, &irq_delta);
-		mutex_unlock(&hd->mailbox_lock);
-		seq_printf(s, "cmd_0x06: ret=%d irq_delta=%u completion=0x%08x\n",
-			   ret, irq_delta, completion);
-		if (ret == -ENODEV) {
-			seq_puts(s, "stream_start_test: device dead after cmd 0x06\n");
-			return 0;
-		}
-	}
+	/*
+	 * NOTE: cmd 0x06 is NOT sent here.
+	 *
+	 * The firmware_commands_seen list from the ARM endpoint only contains:
+	 *   BEGIN_FIRMWARE_DOWNLOAD, BEGIN_BASE_FIRMWARE_DOWNLOAD,
+	 *   SET_VIC_PARAMS (0x29), STOP_STREAMING, GET_FIRMWARE_VERSION.
+	 * There is no START_STREAMING command.  The Windows driver likely starts
+	 * capture automatically after SET_VIC_PARAMS + POST_SET_VIC + DMA setup.
+	 * Sending an unknown cmd 0x06 may have been cancelling the capture.
+	 */
+	seq_puts(s, "stream_start_test: 3 cmds sent (0x29+0x2a+0x02); skipping cmd 0x06\n");
+	seq_printf(s, "  bar0_02c_after_cmd02=0x%08x (expect last buf addr)\n",
+		   ioread32(base + HD60PRO_REG_MBOX_COMPLETE));
 
 	/*
 	 * Enable dma_capture_active so the IRQ handler recognises bit-0 frame
@@ -10992,21 +11061,31 @@ static int hd60pro_stream_start_test_show(struct seq_file *s, void *unused)
 	hd->dma_capture_active = true;
 	iowrite32(0, base + HD60PRO_REG_DMA_ACK_BASE);
 
-	seq_puts(s, "stream_start_test: all 4 cmds sent; polling 5s for DMA frame IRQs\n");
-	seq_printf(s, "irq_count_before_poll=%u mailbox_irq_before=%u\n",
-		   hd->irq_count, hd->mailbox_irq_count);
+	/* Reset cumulative IRQ status so we see only what fires during poll */
+	hd->cum_irq_status = 0;
+	hd->non_mbox_irq_count = 0;
 
-	/* ── poll 5 s ────────────────────────────────────────────────────── */
-	for (poll = 0; poll < 50; poll++) {
+	seq_puts(s, "stream_start_test: polling 30s for DMA frame IRQs\n");
+	seq_printf(s, "irq_count_before_poll=%u mailbox_irq_before=%u non_mbox_before=%u\n",
+		   hd->irq_count, hd->mailbox_irq_count, hd->non_mbox_irq_count);
+	seq_puts(s, "note: bar0_030 shows 0 in poll (cleared by ISR); use last_irq_status/cum_irq_status\n");
+
+	/* ── poll 30 s ───────────────────────────────────────────────────── */
+	for (poll = 0; poll < 300; poll++) {
 		msleep(100);
-		/* Print progress every second */
-		if (poll % 10 == 9) {
-			seq_printf(s, "  t=%us irq_count=%u mailbox_irq=%u dma_frame_count=%u bar0_030=0x%08x bar0_044=0x%08x\n",
+		/* Print progress every 5 seconds */
+		if (poll % 50 == 49) {
+			seq_printf(s, "  t=%us irq=%u mbox_irq=%u non_mbox_irq=%u dma_frames=%u last_status=0x%08x cum_status=0x%08x bar5_054=0x%08x\n",
 				   (poll + 1) / 10,
 				   hd->irq_count, hd->mailbox_irq_count,
+				   hd->non_mbox_irq_count,
 				   hd->dma_frame_count,
-				   ioread32(base + 0x030),
-				   ioread32(base + 0x044));
+				   hd->last_irq_status,
+				   hd->cum_irq_status,
+				   ioread32(hd->bar5 + 0x054));
+			/* Early exit if frames arrived */
+			if (hd->dma_frame_count > 0 && poll > 10)
+				break;
 		}
 	}
 
@@ -11014,12 +11093,18 @@ static int hd60pro_stream_start_test_show(struct seq_file *s, void *unused)
 
 	/* ── final report ────────────────────────────────────────────────── */
 	irq_after = hd->irq_count;
-	seq_printf(s, "irq_count_after=%u mailbox_irq_after=%u dma_frame_count=%u\n",
-		   irq_after, hd->mailbox_irq_count, hd->dma_frame_count);
-	seq_printf(s, "total_irqs_during_poll=%u  non_mailbox_irqs=%u\n",
-		   irq_after - irq_before,
-		   (irq_after - irq_before) - (hd->mailbox_irq_count -
-			(irq_before - frame_irq_before)));
+	seq_printf(s, "irq_count_after=%u mailbox_irq_after=%u non_mbox_irq=%u dma_frame_count=%u\n",
+		   irq_after, hd->mailbox_irq_count, hd->non_mbox_irq_count,
+		   hd->dma_frame_count);
+	seq_printf(s, "cum_irq_status_during_poll=0x%08x  last_irq_status=0x%08x\n",
+		   hd->cum_irq_status, hd->last_irq_status);
+	/*
+	 * Interpretation:
+	 *   cum_irq_status=0x00000800 → only mailbox completions (BIT(11)), no frames
+	 *   cum_irq_status=0x00000c00 → BIT(11) + BIT(10): ARM frame-ready + mbox
+	 *   cum_irq_status=0x00000801 → BIT(11) + BIT(0): mbox + DMA done (GOOD!)
+	 *   If non_mbox_irq>0 but dma_frame_count=0: wrong bit (check cum_irq_status)
+	 */
 
 	seq_printf(s, "bar5_054_after=0x%08x  bar5_050_after=0x%08x\n",
 		   ioread32(hd->bar5 + 0x054),
@@ -11030,30 +11115,84 @@ static int hd60pro_stream_start_test_show(struct seq_file *s, void *unused)
 		   ioread32(base + 0x050));
 
 	/* ── frame buffer peek ───────────────────────────────────────────── */
-	fbuf = (const u8 *)hd->dma_frame_cpu[0];
+	/*
+	 * Check ALL 4 DMA frame buffers for any non-zero data.
+	 * Firmware writes a 4KB header (HD60PRO_DMA_HDR_SIZE = 0x1000) at the
+	 * start of each buffer, followed by pixel data.  A non-zero hit at
+	 * +0x1000 in any buffer confirms DMA is working even if IRQs are wrong.
+	 * The ARM may DMA to any of the 4 buffers (buf[0..3] from cmd 0x02).
+	 */
 	{
-		bool any_nonzero = false;
+		unsigned int b;
+		bool any_buf_hit = false;
 
-		for (i = 0; i < 256; i++) {
-			if (fbuf[i])
-				any_nonzero = true;
+		for (b = 0; b < HD60PRO_DMA_BUF_COUNT; b++) {
+			bool any_hdr  = false;
+			bool any_data = false;
+
+			if (!hd->dma_frame_cpu[b])
+				continue;
+
+			fbuf = (const u8 *)hd->dma_frame_cpu[b];
+			for (i = 0; i < 256; i++) {
+				if (fbuf[i])
+					any_hdr = true;
+			}
+			for (i = HD60PRO_DMA_HDR_SIZE;
+			     i < HD60PRO_DMA_HDR_SIZE + 256; i++) {
+				if (fbuf[i])
+					any_data = true;
+			}
+
+			if (any_hdr || any_data)
+				any_buf_hit = true;
+
+			seq_printf(s, "buf[%u] dma=0x%08x hdr[0..255]=%s data[0x1000..0x10ff]=%s\n",
+				   b,
+				   (u32)(hd->dma_frame_dma[b] & 0xffffffff),
+				   any_hdr  ? "NON-ZERO" : "zero",
+				   any_data ? "NON-ZERO" : "zero");
 		}
-		seq_printf(s, "frame_buffer[0..255]: %s\n",
-			   any_nonzero ? "NON-ZERO (DMA working!)" : "all zero (no DMA)");
-		for (i = 0; i < 256; i += 16) {
-			seq_printf(s, "  %04x: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
-				   i,
-				   fbuf[i+0], fbuf[i+1], fbuf[i+2], fbuf[i+3],
-				   fbuf[i+4], fbuf[i+5], fbuf[i+6], fbuf[i+7],
-				   fbuf[i+8], fbuf[i+9], fbuf[i+10], fbuf[i+11],
-				   fbuf[i+12], fbuf[i+13], fbuf[i+14], fbuf[i+15]);
+
+		/* Dump buf[0] header in detail */
+		if (hd->dma_frame_cpu[0]) {
+			fbuf = (const u8 *)hd->dma_frame_cpu[0];
+			seq_puts(s, "buf[0] header dump:\n");
+			for (i = 0; i < 64; i += 16) {
+				seq_printf(s, "  %04x: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
+					   i,
+					   fbuf[i+0], fbuf[i+1], fbuf[i+2], fbuf[i+3],
+					   fbuf[i+4], fbuf[i+5], fbuf[i+6], fbuf[i+7],
+					   fbuf[i+8], fbuf[i+9], fbuf[i+10], fbuf[i+11],
+					   fbuf[i+12], fbuf[i+13], fbuf[i+14], fbuf[i+15]);
+			}
+			seq_puts(s, "buf[0] pixel data dump (offset 0x1000):\n");
+			for (i = HD60PRO_DMA_HDR_SIZE;
+			     i < HD60PRO_DMA_HDR_SIZE + 64; i += 16) {
+				seq_printf(s, "  %04x: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
+					   i,
+					   fbuf[i+0], fbuf[i+1], fbuf[i+2], fbuf[i+3],
+					   fbuf[i+4], fbuf[i+5], fbuf[i+6], fbuf[i+7],
+					   fbuf[i+8], fbuf[i+9], fbuf[i+10], fbuf[i+11],
+					   fbuf[i+12], fbuf[i+13], fbuf[i+14], fbuf[i+15]);
+			}
 		}
+
+		if (any_buf_hit)
+			seq_puts(s, "result: DMA data found in at least one frame buffer!\n");
+		else
+			seq_puts(s, "result: all frame buffers are zero (DMA never wrote to host RAM)\n");
 	}
 
 	if (hd->dma_frame_count > 0)
-		seq_puts(s, "result: DMA frames received! Start VLC: vlc v4l2:///dev/video1\n");
+		seq_puts(s, "result: DMA frames received! Start VLC: vlc v4l2:///dev/video0\n");
+	else if (hd->non_mbox_irq_count > 0)
+		seq_printf(s, "result: non-mailbox IRQs arrived (non_mbox=%u cum=0x%08x) but dma_frame_count=0\n"
+			   "  → check cum_irq_status: if BIT(10)=0x400, ARM sends frame-notify but wrong bit checked\n"
+			   "  → if all frame buffers zero: DMA not reaching host RAM (check bar5_054 vs dma_frame_dma[0])\n",
+			   hd->non_mbox_irq_count, hd->cum_irq_status);
 	else
-		seq_puts(s, "result: no DMA frames; see bar5_054 / bar0_030 above for clues\n");
+		seq_puts(s, "result: no non-mailbox IRQs at all; DMAC may not be sending frames to host\n");
 
 	return 0;
 }
@@ -11364,6 +11503,8 @@ static void hd60pro_debugfs_init(struct hd60pro_dev *hd)
 			    &hd60pro_mst3367_hpd_on_fops);
 	debugfs_create_file("gpio_read", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_gpio_read_fops);
+	debugfs_create_file("gpio_pipeline_assert", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_gpio_pipeline_assert_fops);
 	debugfs_create_file("logo_upload_plan", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_logo_upload_plan_fops);
 	debugfs_create_file("logo_upload_selector100", 0400, hd->debugfs_dir,

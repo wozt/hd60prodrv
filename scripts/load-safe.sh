@@ -24,6 +24,13 @@ else
 	echo "warning: modinfo not available; cannot verify module vermagic before insmod" >&2
 fi
 
+SIGN_KEY="$(dirname -- "$0")/../certs/MOK.priv"
+SIGN_CERT="$(dirname -- "$0")/../certs/MOK.pem"
+SIGN_FILE="$(find /usr/lib -name sign-file 2>/dev/null | sort -V | tail -1)"
+if [ -f "$SIGN_KEY" ] && [ -f "$SIGN_CERT" ] && [ -n "$SIGN_FILE" ]; then
+	"$SIGN_FILE" sha256 "$SIGN_KEY" "$SIGN_CERT" "$MODULE"
+fi
+
 if command -v modprobe >/dev/null 2>&1; then
 	sudo modprobe videodev
 	sudo modprobe videobuf2-common

@@ -151,6 +151,12 @@ run_show mst3367_phys_test 10 "$DBG/mst3367_phys_test"
 
 run_show gpio_read 5 "$DBG/gpio_read"
 
+# Assert GPIO8=HIGH (FPGA pixel-capture pipeline enable).
+# gpio17_generic_sequence leaves GPIO8=0; hw_init normally sets it back to 1.
+# Since we skip hw_init (it resets MST3367), assert GPIO8 directly via cmd 0x17.
+run_show gpio_pipeline_assert 5 "$DBG/gpio_pipeline_assert"
+run_show gpio_read 5 "$DBG/gpio_read"
+
 # Show BAR5 DMA window config (was run_quiet; now visible so we can see if
 # BAR5+0x054 sticks or is read-only from the host side).
 run_show bar5_dma_program 10 "$DBG/bar5_dma_program"
@@ -165,7 +171,7 @@ run_show mst3367_phys_test 10 "$DBG/mst3367_phys_test"
 # Full end-to-end stream test: sends cmds 0x29+0x2a+0x02+0x06 and polls 5 s
 # for DMA frame IRQs, then peeks at the frame buffer.
 # This tells us whether the firmware/DMA path is alive WITHOUT needing VLC.
-run_show stream_start_test 120 "$DBG/stream_start_test"
+run_show stream_start_test 180 "$DBG/stream_start_test"
 
 echo
 echo "=== After stream_start_test: check dmesg for start_streaming logs ==="

@@ -8,6 +8,7 @@
  */
 
 #include <linux/debugfs.h>
+#include <linux/unaligned.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
 #include <linux/io.h>
@@ -50,6 +51,15 @@
 #define HD60PRO_REG_IRQ_ACK_SIDEBAND	0x0dc
 #define HD60PRO_REG_IRQ_ACK_DOORBELL	0x400
 #define HD60PRO_IRQ_MBOX_COMPLETE	BIT(11)
+#define HD60PRO_IRQ_DMA_FRAME		BIT(0)
+/* BAR0 DMA frame registers (from LXV4L2D_MZ0380.ko decompilation) */
+#define HD60PRO_REG_DMA_FIELD_FLAGS	0x040
+#define HD60PRO_REG_DMA_BUF_IDX	0x044
+#define HD60PRO_REG_DMA_ACK_BASE	0x050  /* [0x050 + buf_idx*4] = ack byte */
+#define HD60PRO_DMA_BUF_COUNT		4
+#define HD60PRO_DMA_HDR_SIZE		0x1000 /* 4KB header; firmware writes payload_bytes at [0] */
+#define HD60PRO_MBOX_CMD_STREAM_START	0x06
+#define HD60PRO_MBOX_CMD_STREAM_STOP	0x07
 #define HD60PRO_MBOX_DOORBELL		0x800
 #define HD60PRO_MBOX_CMD_PREINIT	0x01
 #define HD60PRO_MBOX_CMD_FW_STATUS	0x0a
@@ -58,6 +68,17 @@
 #define HD60PRO_MBOX_CMD_I2C_READ8	0x1a
 #define HD60PRO_MBOX_CMD_PIPELINE_READ	HD60PRO_MBOX_CMD_I2C_READ8
 #define HD60PRO_MBOX_CMD_PIPELINE_WRITE	0x1b
+/*
+ * Raw I2C bus access (cmd 0x20): discovered via binary analysis of i2c_write_bytes()
+ * at Windows driver file offset 0x274b74.  Packet format (3 dwords):
+ *   [0] = 0x800 (doorbell)
+ *   [1] = 0x20  (command)
+ *   [2] = (count<<16) | (write_flag<<8) | i2c_addr_8bit
+ *       write_flag=1 for write, 0 for read
+ * Data bytes for a write are expected in subsequent mailbox registers (BAR0[0x08..])
+ * starting after the setup packet.  A read returns data in BAR0[0x08..].
+ */
+#define HD60PRO_MBOX_CMD_I2C_RAW	0x20
 #define HD60PRO_MBOX_CMD_SELECTOR_READ	0x1e
 #define HD60PRO_MBOX_CMD_I2C_WRITE_EXT	0x1d
 #define HD60PRO_MBOX_CMD_LOGO_PREPARE	0x60
@@ -264,6 +285,24 @@ static bool synthetic_v4l2 = true;
 module_param(synthetic_v4l2, bool, 0444);
 MODULE_PARM_DESC(synthetic_v4l2, "Complete V4L2 buffers with black YUYV frames until real capture DMA is decoded");
 
+static bool allow_dma_capture;
+module_param(allow_dma_capture, bool, 0444);
+MODULE_PARM_DESC(allow_dma_capture, "Enable real DMA/MMIO frame capture: send stream-start cmd 0x06 and deliver frames from BAR0 on IRQ");
+
+static bool force_32bit_dma;
+module_param(force_32bit_dma, bool, 0444);
+MODULE_PARM_DESC(force_32bit_dma, "Force 32-bit DMA mask for frame buffer allocation (use if card cannot reach >4GB addresses)");
+
+/*
+ * BAR0 byte offset where frame buffer 0 starts. The card has 4 ping-pong
+ * frame regions separated by HD60PRO_FRAME_STRIDE bytes each. The correct
+ * value must be determined from hardware observation once streaming starts.
+ * Start with 0 and adjust if frames look wrong or are absent.
+ */
+static unsigned long dma_bar0_frame_offset;
+module_param(dma_bar0_frame_offset, ulong, 0444);
+MODULE_PARM_DESC(dma_bar0_frame_offset, "BAR0 byte offset of frame buffer 0 for DMA capture (tune from hardware observation)");
+
 static int mailbox_bar = HD60PRO_BAR0;
 module_param(mailbox_bar, int, 0444);
 MODULE_PARM_DESC(mailbox_bar, "BAR used for Windows-style mailbox commands; Windows mapping analysis points at BAR0");
@@ -289,9 +328,10 @@ struct hd60pro_dev {
 	void *dma_desc_cpu;
 	dma_addr_t dma_desc_dma;
 	size_t dma_desc_size;
-	void *dma_frame_cpu;
-	dma_addr_t dma_frame_dma;
-	size_t dma_frame_size;
+	void *dma_frame_cpu[HD60PRO_DMA_BUF_COUNT];
+	dma_addr_t dma_frame_dma[HD60PRO_DMA_BUF_COUNT];
+	size_t dma_frame_size;  /* per-buffer pixel payload size */
+	size_t dma_frame_total_size; /* total contiguous alloc = BUF_COUNT * (frame+hdr) */
 	void *win_dma_control_cpu;
 	dma_addr_t win_dma_control_dma;
 	size_t win_dma_control_size;
@@ -311,6 +351,12 @@ struct hd60pro_dev {
 	u32 irq_count;
 	u32 mailbox_irq_count;
 	struct dentry *debugfs_dir;
+	/* DMA/MMIO frame capture (allow_dma_capture=1) */
+	spinlock_t irq_lock;
+	u32 pending_frame_status;
+	u32 dma_frame_count;
+	struct tasklet_struct frame_tasklet;
+	bool dma_capture_active;
 };
 
 static struct dentry *hd60pro_debugfs_root;
@@ -385,15 +431,26 @@ static irqreturn_t hd60pro_irq(int irq, void *data)
 		hd->mailbox_irq_count++;
 
 	/*
-	 * The Windows driver IRQ path reads BAR0+0x30, writes BAR5+0xdc = 2,
-	 * writes BAR0+0x30 = 0, then rings BAR0+0x00 with 0x400. We keep the
-	 * acknowledged sideband write because device+0x110 maps to BAR5 here,
-	 * and acknowledge the observed BAR5 status as a conservative fallback.
+	 * IRQ ack sequence from LXV4L2D_MZ0380.ko decompilation:
+	 *   1. write BAR5+0xdc = 2  (sideband ack)
+	 *   2. write BAR0+0x30 = 0  (clear status)
+	 *   3. write BAR0+0x00 = 0x400 (doorbell ack)
 	 */
 	iowrite32(2, hd->bar5 + HD60PRO_REG_IRQ_ACK_SIDEBAND);
 	iowrite32(0, base + HD60PRO_REG_IRQ_STATUS);
 	iowrite32(HD60PRO_REG_IRQ_ACK_DOORBELL,
 		  base + HD60PRO_REG_DOORBELL);
+
+	/*
+	 * Bit 0 = DMA frame ready. Pass status to tasklet for processing.
+	 * The tasklet reads BAR0[0x44] for buffer index and handles delivery.
+	 */
+	if ((status & HD60PRO_IRQ_DMA_FRAME) && hd->dma_capture_active) {
+		spin_lock(&hd->irq_lock);
+		hd->pending_frame_status |= status;
+		spin_unlock(&hd->irq_lock);
+		tasklet_schedule(&hd->frame_tasklet);
+	}
 
 	dev_dbg_ratelimited(&hd->pdev->dev, "irq status=0x%08x\n", status);
 	return IRQ_HANDLED;
@@ -1048,6 +1105,2009 @@ static int hd60pro_i2c1a_c0_dc_db_show(struct seq_file *s, void *unused)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(hd60pro_i2c1a_c0_dc_db);
+
+/*
+ * hdmi_probe: read HDMI chip 0xc0 status registers via cmd 0x1a without
+ * the GPIO17 guard. Used to check live HDMI signal detection state.
+ * Registers: 0xdc/0xdb (init check), 0x00-0x01 (chip ID), and a scan.
+ */
+static int hd60pro_hdmi_probe_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	unsigned int reg;
+	u8 row[16];
+	u8 nonzero_found = 0;
+
+	seq_puts(s, "hdmi_probe: full chip 0xc0 register scan (0x00-0xff) via cmd 0x1a\n");
+	seq_puts(s, "note: reads go through firmware ARM I2C; no guard on mailbox state\n");
+	seq_puts(s, "note: if BAR0[0x010] is always 0 the result may be in a different register\n");
+
+	if (!allow_mailbox_writes || !allow_i2c_read_command1a) {
+		seq_puts(s, "blocked; reload with allow_mailbox_writes=1 allow_i2c_read_command1a=1\n");
+		return 0;
+	}
+	if (!base) {
+		seq_puts(s, "no mailbox base\n");
+		return 0;
+	}
+
+	mutex_lock(&hd->mailbox_lock);
+	for (reg = 0; reg < 256; reg++) {
+		u32 packet[5] = {
+			HD60PRO_MBOX_DOORBELL,
+			HD60PRO_MBOX_CMD_I2C_READ8,
+			0xc0,
+			reg,
+			0xdeadbeef, /* sentinel: if bar0_010 != 0xdeadbeef, firmware wrote result */
+		};
+		u32 completion = 0;
+		int ret;
+
+		ret = hd60pro_mailbox_send_locked(hd, packet, ARRAY_SIZE(packet),
+						  HD60PRO_MBOX_TIMEOUT_US,
+						  &completion);
+		row[reg & 0xf] = ioread32(base + 0x010) & 0xff;
+		if (ret || hd60pro_mailbox_dead(base)) {
+			seq_printf(s, "read error at reg 0x%02x: ret=%d\n", reg, ret);
+			break;
+		}
+		if (row[reg & 0xf])
+			nonzero_found = 1;
+		if ((reg & 0xf) == 0xf) {
+			seq_printf(s, "[%02x] %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
+				   reg - 15,
+				   row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7],
+				   row[8], row[9], row[10], row[11], row[12], row[13], row[14], row[15]);
+		}
+	}
+	mutex_unlock(&hd->mailbox_lock);
+
+	/* Also show sentinel test result for first read */
+	seq_printf(s, "sentinel_test: packet[4]=0xdeadbeef; if bar0_010=0x00000000 the firmware wrote 0 (or firmware updates bar0_010 with result)\n");
+	seq_printf(s, "nonzero_found: %d\n", nonzero_found);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_hdmi_probe);
+
+/*
+ * mst3367_signal: fast HDMI signal-lock check.
+ *
+ * From MST3367_HDMI_MODE_DETECT() decompile:
+ *   if ((chip0xc0[0x55] & 0x3C) != 0x3C) → no signal
+ *   chip0xc0[0x55]: sync lock flags; bits[5:2] must all be 1
+ *   chip0xc0[0x57],[0x58]: H-total (pixel clock counts)
+ *   chip0xc0[0x59],[0x5a],[0x5b],[0x5c]: V-total / V-active
+ *   chip0xc0[0x6a],[0x6b]: pixel clock (kHz upper/lower)
+ *   chip0xc0[0x5f]: VIC code bits[6:1]
+ *
+ * Bank-0 and bank-2 registers of the MST3367 via dev-channel 0x9c.
+ * Bank-switching (cmd 0x1b with word[3]=0x00) is used to access bank2 PLL
+ * status registers.  We restore bank0 at the end.
+ */
+static int hd60pro_mst3367_signal_show(struct seq_file *s, void *unused)
+{
+	/* bank0 registers */
+	static const u8 b0regs[] = {
+		0x51,			/* TMDS EQ termination (expect 0x81) */
+		0x54,			/* signal path: bit4=0 means HDMI path */
+		0x55,			/* sync lock: need bits[5:2]=0x3c */
+		0x56,			/* TMDS sub-lock bits (per-channel detail) */
+		0x57, 0x58,		/* H-total */
+		0x59, 0x5a, 0x5b, 0x5c,/* V-total / V-active */
+		0x5e,			/* TMDS clock detection status */
+		0x5f,			/* VIC code */
+		0x6a, 0x6b,		/* pixel clock */
+		0xac,			/* bit7=HDMI audio PLL, bit3=input sel */
+		0xb7,			/* HPD control bit1 */
+		0xce,			/* PLL/CDR config (expect bit7 set after HDMI_INIT) */
+		0xcf,			/* CDR ctrl (expect bit1 set, bit7=0 default) */
+		0xd0,			/* CDR freq range (expect bits[1:0]=0x01) */
+		/* diagnostic: verify hw_init writes made it to chip */
+		0x41,			/* input path control (expect 0x6F) */
+		0x64,			/* TMDS ch mux/sel (expect 0x02) */
+		0x65,			/* TMDS ch mux/sel (expect 0xFF) */
+		0x66,			/* TMDS ch mux/sel (expect 0x00) */
+		0x67,			/* TMDS ch mux/sel (expect 0x02) */
+		0xb0,			/* EQ/bias (expect 0x14) */
+		0xb4,			/* bias ctrl (expect 0x54 after read-back) */
+	};
+	/* bank1 CDR/EQ per-channel registers — verify hw_init writes */
+	static const u8 b1regs[] = {
+		0x0f,			/* CDR ctrl (expect 0x02) */
+		0x16,			/* CDR timing (expect 0x30) */
+		0x17,			/* lane0 EQ bias (expect 0x00 or 0x02) */
+		0x18,			/* lane1 EQ bias */
+		0x19,			/* lane2 EQ bias */
+		0x1a,			/* CDR freq config (expect 0x50) */
+		0x24,			/* CDR ctrl (expect 0x40) */
+		0x25,			/* CDR ctrl2 (expect 0x00) */
+		0x2a,			/* CDR BW bits[2:0] (expect |0x07) */
+		0x30,			/* CDR arm/start (expect 0x80) */
+		0x31,			/* CDR config (expect 0x00) */
+		0x32,			/* CDR config (expect 0x00) */
+	};
+	/* bank2 PLL status registers */
+	static const u8 b2regs[] = {
+		0x00,			/* PLL status / chip ID */
+		0x01,			/* PLL ctrl: expect (val&0xf)|0x60 */
+		0x02,			/* PLL ctrl2: expect 0xf5|0x80 = 0xf5 */
+		0x03,			/* CDR config */
+		0x04,			/* CDR enable: expect bit0=1 */
+		0x05,			/* CDR config2 */
+		0x06,			/* CDR config3: expect 0x08 */
+		0x07,			/* reset control: expect 0x04 after HDMI_RESET */
+		0x08,			/* clock config: expect 0x03 */
+		0x09,			/* PLL lock / divider: expect |0x20 */
+	};
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	u8 b0[ARRAY_SIZE(b0regs)] = { 0 };
+	u8 b1[ARRAY_SIZE(b1regs)] = { 0 };
+	u8 b2[ARRAY_SIZE(b2regs)] = { 0 };
+	unsigned int i;
+	int ret = 0;
+
+	seq_puts(s, "mst3367_signal: MST3367 HDMI signal-lock registers via dev-channel 0x9c\n");
+
+	if (!allow_mailbox_writes || !allow_i2c_read_command1a) {
+		seq_puts(s, "blocked; reload with allow_mailbox_writes=1 allow_i2c_read_command1a=1\n");
+		return 0;
+	}
+	if (!base) {
+		seq_puts(s, "no mailbox base\n");
+		return 0;
+	}
+
+	mutex_lock(&hd->mailbox_lock);
+
+	/* Ensure bank0 is selected */
+	{
+		u32 bsel0[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_PIPELINE_WRITE,
+				 0x9cu, 0x00u, 0x00u };
+		ret = hd60pro_mailbox_send_locked(hd, bsel0, ARRAY_SIZE(bsel0),
+						  HD60PRO_MBOX_TIMEOUT_US, NULL);
+	}
+
+	/* Read bank0 registers */
+	for (i = 0; i < ARRAY_SIZE(b0regs) && !ret; i++) {
+		u32 pkt[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8,
+			       0x9cu, b0regs[i], 0u };
+		ret = hd60pro_mailbox_send_locked(hd, pkt, ARRAY_SIZE(pkt),
+						  HD60PRO_MBOX_TIMEOUT_US, NULL);
+		b0[i] = ioread32(base + 0x010) & 0xff;
+	}
+
+	/* Switch to bank1 and read CDR/EQ per-channel registers */
+	if (!ret) {
+		u32 bsel1[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_PIPELINE_WRITE,
+				 0x9cu, 0x00u, 0x01u };
+		ret = hd60pro_mailbox_send_locked(hd, bsel1, ARRAY_SIZE(bsel1),
+						  HD60PRO_MBOX_TIMEOUT_US, NULL);
+	}
+	for (i = 0; i < ARRAY_SIZE(b1regs) && !ret; i++) {
+		u32 pkt[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8,
+			       0x9cu, b1regs[i], 0u };
+		ret = hd60pro_mailbox_send_locked(hd, pkt, ARRAY_SIZE(pkt),
+						  HD60PRO_MBOX_TIMEOUT_US, NULL);
+		b1[i] = ioread32(base + 0x010) & 0xff;
+	}
+
+	/* Switch to bank2 and read PLL status */
+	if (!ret) {
+		u32 bsel2[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_PIPELINE_WRITE,
+				 0x9cu, 0x00u, 0x02u };
+		ret = hd60pro_mailbox_send_locked(hd, bsel2, ARRAY_SIZE(bsel2),
+						  HD60PRO_MBOX_TIMEOUT_US, NULL);
+	}
+	for (i = 0; i < ARRAY_SIZE(b2regs) && !ret; i++) {
+		u32 pkt[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8,
+			       0x9cu, b2regs[i], 0u };
+		ret = hd60pro_mailbox_send_locked(hd, pkt, ARRAY_SIZE(pkt),
+						  HD60PRO_MBOX_TIMEOUT_US, NULL);
+		b2[i] = ioread32(base + 0x010) & 0xff;
+	}
+
+	/* Restore bank0 */
+	{
+		u32 bsel0[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_PIPELINE_WRITE,
+				 0x9cu, 0x00u, 0x00u };
+		hd60pro_mailbox_send_locked(hd, bsel0, ARRAY_SIZE(bsel0),
+					    HD60PRO_MBOX_TIMEOUT_US, NULL);
+	}
+
+	mutex_unlock(&hd->mailbox_lock);
+
+	/*
+	 * b0: [0]=0x51 [1]=0x54 [2]=0x55 [3]=0x56 [4]=0x57 [5]=0x58
+	 *     [6]=0x59 [7]=0x5a [8]=0x5b [9]=0x5c [10]=0x5e [11]=0x5f
+	 *     [12]=0x6a [13]=0x6b [14]=0xac [15]=0xb7 [16]=0xce [17]=0xcf [18]=0xd0
+	 *     [19]=0x41 [20]=0x64 [21]=0x65 [22]=0x66 [23]=0x67 [24]=0xb0 [25]=0xb4
+	 * b1: [0]=0x0f [1]=0x16 [2]=0x17 [3]=0x18 [4]=0x19 [5]=0x1a
+	 *     [6]=0x24 [7]=0x25 [8]=0x2a [9]=0x30 [10]=0x31 [11]=0x32
+	 */
+	seq_printf(s, "bank0[0x51]=0x%02x  (TMDS EQ term; expect 0x81)\n", b0[0]);
+	seq_printf(s, "bank0[0x54]=0x%02x  (bit4=0→HDMI path)\n", b0[1]);
+	seq_printf(s, "bank0[0x55]=0x%02x  lock_bits[5:2]=0x%x  %s\n",
+		   b0[2], (b0[2] >> 2) & 0xf,
+		   ((b0[2] & 0x3c) == 0x3c) ? "LOCKED" : "NO SIGNAL");
+	seq_printf(s, "bank0[0x56]=0x%02x  (TMDS sub-lock detail)\n", b0[3]);
+	seq_printf(s, "bank0[0x5E]=0x%02x  (TMDS clock detection)\n", b0[10]);
+	seq_printf(s, "H_total=0x%02x%02x  V_total=0x%02x%02x%02x  V_active=0x%02x\n",
+		   b0[4], b0[5], b0[6] & 0x3f, b0[7], b0[8], b0[9] & 0xff);
+	{
+		u8 vic = (b0[11] >> 1) & 0x3f;
+		seq_printf(s, "VIC=0x%02x (%u)  pixel_clock=0x%02x%02x\n",
+			   vic, vic, b0[12], b0[13]);
+	}
+	seq_printf(s, "bank0[0xAC]=0x%02x  bank0[0xB7]=0x%02x\n", b0[14], b0[15]);
+	seq_printf(s, "bank0[0xCE]=0x%02x  bank0[0xCF]=0x%02x  bank0[0xD0]=0x%02x  (CDR; D0[1:0] expect 0x01)\n",
+		   b0[16], b0[17], b0[18]);
+	seq_printf(s, "bank0[0x41]=0x%02x (expect 0x6F)  bank0[0x64..67]=0x%02x 0x%02x 0x%02x 0x%02x (expect 02 FF 00 02)\n",
+		   b0[19], b0[20], b0[21], b0[22], b0[23]);
+	seq_printf(s, "bank0[0xB0]=0x%02x (expect 0x14)  bank0[0xB4]=0x%02x (expect 0x54)\n",
+		   b0[24], b0[25]);
+	/* bank1 CDR/EQ per-channel registers (all should be non-default after hw_init) */
+	seq_printf(s, "bank1[0x0F]=0x%02x (exp 0x02)  bank1[0x16]=0x%02x (exp 0x30)\n",
+		   b1[0], b1[1]);
+	seq_printf(s, "bank1[0x17]=0x%02x  bank1[0x18]=0x%02x  bank1[0x19]=0x%02x  bank1[0x1A]=0x%02x (exp 0x50)\n",
+		   b1[2], b1[3], b1[4], b1[5]);
+	seq_printf(s, "bank1[0x24]=0x%02x (exp 0x40)  bank1[0x25]=0x%02x (exp 0x00)  bank1[0x2A]=0x%02x (exp bits[2:0]=7)\n",
+		   b1[6], b1[7], b1[8]);
+	seq_printf(s, "bank1[0x30]=0x%02x (exp 0x80)  bank1[0x31]=0x%02x (exp 0x00)  bank1[0x32]=0x%02x (exp 0x00)\n",
+		   b1[9], b1[10], b1[11]);
+	/* b2: [0]=0x00 [1]=0x01 [2]=0x02 [3]=0x03 [4]=0x04 [5]=0x05
+	 *     [6]=0x06 [7]=0x07 [8]=0x08 [9]=0x09 */
+	seq_printf(s, "bank2[0x00]=0x%02x  (PLL status/chip-ID)\n", b2[0]);
+	seq_printf(s, "bank2[0x01]=0x%02x  bank2[0x02]=0x%02x\n", b2[1], b2[2]);
+	seq_printf(s, "bank2[0x03]=0x%02x  bank2[0x04]=0x%02x  (CDR enable: expect bit0=1)\n",
+		   b2[3], b2[4]);
+	seq_printf(s, "bank2[0x05]=0x%02x  bank2[0x06]=0x%02x  (CDR config: [06] expect 0x08)\n",
+		   b2[5], b2[6]);
+	seq_printf(s, "bank2[0x07]=0x%02x  bank2[0x08]=0x%02x  bank2[0x09]=0x%02x\n",
+		   b2[7], b2[8], b2[9]);
+	seq_printf(s, "result: %d\n", ret);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_mst3367_signal);
+
+/*
+ * mst3367_bank_reset: write chip 0xc0 reg 0x0f = 0x00 via cmd 0x20 (I2C_RAW)
+ * to restore the MST3367 to bank 0.
+ *
+ * A previous cmd 0x1b write to chip 0xc0 may have left the bank register in a
+ * non-zero state, causing all subsequent cmd 0x1a reads to return 0x00 (reading
+ * a wrong bank where status registers don't exist).  This node resets it.
+ *
+ * After the reset it reads reg 0x55 and reg 0x00 via cmd 0x1a to confirm bank 0
+ * is active again.
+ */
+static int hd60pro_mst3367_bank_reset_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	u32 comp = 0;
+	u8 v55, v00;
+	int ret;
+
+	seq_puts(s, "mst3367_bank_reset: writing chip 0xc0 reg 0x0f = 0x00 via cmd 0x20\n");
+
+	if (!allow_mailbox_writes || !allow_i2c_read_command1a) {
+		seq_puts(s, "blocked; reload with allow_mailbox_writes=1 allow_i2c_read_command1a=1\n");
+		return 0;
+	}
+	if (!base) {
+		seq_puts(s, "no mailbox base\n");
+		return 0;
+	}
+
+	mutex_lock(&hd->mailbox_lock);
+
+	/* Write chip 0xc0: [0x0f, 0x00] = select bank 0 */
+	{
+		u32 pkt[4] = {
+			HD60PRO_MBOX_DOORBELL,
+			HD60PRO_MBOX_CMD_I2C_RAW,
+			(2u << 16) | (1u << 8) | 0xc0u,
+			0x0000000fu,	/* LE: byte[0]=0x0f (bank reg), byte[1]=0x00 (bank 0) */
+		};
+		comp = 0;
+		ret = hd60pro_mailbox_send_locked(hd, pkt, ARRAY_SIZE(pkt),
+						  HD60PRO_MBOX_TIMEOUT_US, &comp);
+		seq_printf(s, "bank_reset write ret=%d comp=0x%08x\n", ret, comp);
+	}
+
+	if (ret) {
+		mutex_unlock(&hd->mailbox_lock);
+		return 0;
+	}
+
+	/* Read reg 0x00 to confirm bank 0 is active (should be non-zero if chip is alive) */
+	{
+		u32 rpkt[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8,
+				0xc0, 0x00, 0 };
+		comp = 0;
+		ret = hd60pro_mailbox_send_locked(hd, rpkt, ARRAY_SIZE(rpkt),
+						  HD60PRO_MBOX_TIMEOUT_US, &comp);
+		v00 = ioread32(base + 0x010) & 0xff;
+		seq_printf(s, "after_reset reg[0x00]=0x%02x ret=%d\n", v00, ret);
+	}
+
+	/* Read reg 0x55 to check HDMI lock status */
+	{
+		u32 rpkt[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8,
+				0xc0, 0x55, 0 };
+		comp = 0;
+		ret = hd60pro_mailbox_send_locked(hd, rpkt, ARRAY_SIZE(rpkt),
+						  HD60PRO_MBOX_TIMEOUT_US, &comp);
+		v55 = ioread32(base + 0x010) & 0xff;
+		seq_printf(s, "after_reset reg[0x55]=0x%02x lock_bits[5:2]=0x%x %s ret=%d\n",
+			   v55, (v55 >> 2) & 0xf,
+			   ((v55 & 0x3c) == 0x3c) ? "LOCKED" : "no lock",
+			   ret);
+	}
+
+	mutex_unlock(&hd->mailbox_lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_mst3367_bank_reset);
+
+/*
+ * i2c_scan: scan I2C bus via cmd 0x1a for all 8-bit write addresses 0x02..0xfe
+ * (7-bit addresses 0x01..0x7f), reading register 0x00 from each.  Prints the
+ * result register (BAR0[0x010]) for each address.  A non-zero result OR a
+ * zero result where the firmware echoes the address in BAR0[0x008] indicates
+ * the device acknowledged the read.
+ */
+static int hd60pro_i2c_scan_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	unsigned int addr8;
+	int ret;
+
+	seq_puts(s, "i2c_scan: cmd 0x1a scan of 8-bit write addrs 0x02..0xfe reg 0x00\n");
+	seq_puts(s, "format: addr8(7bit) 008_echo 00c_echo 010_result\n");
+
+	if (!allow_mailbox_writes || !allow_i2c_read_command1a) {
+		seq_puts(s, "blocked\n");
+		return 0;
+	}
+	if (!base) {
+		seq_puts(s, "no mailbox base\n");
+		return 0;
+	}
+
+	mutex_lock(&hd->mailbox_lock);
+	for (addr8 = 0x02; addr8 <= 0xfe; addr8 += 2) {
+		u32 pkt[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8,
+			       (u8)addr8, 0x00, 0 };
+		u32 comp = 0;
+		u32 r008, r010;
+
+		ret = hd60pro_mailbox_send_locked(hd, pkt, ARRAY_SIZE(pkt),
+						  HD60PRO_MBOX_TIMEOUT_US, &comp);
+		r008 = ioread32(base + 0x008);
+		r010 = ioread32(base + 0x010);
+		/* Print anything non-trivial: non-zero result or dead mailbox */
+		if (r010 != 0 || ret)
+			seq_printf(s, "  addr 0x%02x(7b:0x%02x) 008=0x%08x result=0x%08x ret=%d\n",
+				   addr8, addr8 >> 1, r008, r010, ret);
+	}
+	mutex_unlock(&hd->mailbox_lock);
+
+	seq_puts(s, "scan done (only non-zero results shown)\n");
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_i2c_scan);
+
+/*
+ * mst3367_probe: wide register dump of MST3367 (chip 0xc0) via read-only cmd 0x1a.
+ * NOTE: cmd 0x1b bank-switch writes to chip 0xc0 cause all subsequent reads to
+ * return 0x00 (possibly resets the chip or changes routing), so only reads are
+ * performed here.
+ */
+static int hd60pro_mst3367_probe_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	static const u8 regs[] = {
+		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+		0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+		0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57,
+		0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f,
+		0x60, 0x6a, 0x6b,
+		0x80, 0x81, 0x82, 0x83,
+		0xac, 0xce, 0xcf,
+		0xdb, 0xdc,
+	};
+	unsigned int i;
+	int ret = 0;
+
+	seq_puts(s, "mst3367_probe: read-only wide dump chip 0xc0 via cmd 0x1a (no bank switch writes)\n");
+
+	if (!allow_mailbox_writes || !allow_i2c_read_command1a) {
+		seq_puts(s, "blocked; reload with allow_mailbox_writes=1 allow_i2c_read_command1a=1\n");
+		return 0;
+	}
+	if (!base) {
+		seq_puts(s, "no mailbox base\n");
+		return 0;
+	}
+
+	mutex_lock(&hd->mailbox_lock);
+	for (i = 0; i < ARRAY_SIZE(regs) && !ret; i++) {
+		u32 pkt[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8,
+			       0xc0, regs[i], 0 };
+		u32 comp = 0;
+
+		ret = hd60pro_mailbox_send_locked(hd, pkt, ARRAY_SIZE(pkt),
+						  HD60PRO_MBOX_TIMEOUT_US, &comp);
+		seq_printf(s, "  reg[0x%02x] comp=0x%08x 008=0x%08x 00c=0x%08x 010=0x%08x 014=0x%08x ret=%d\n",
+			   regs[i], comp,
+			   ioread32(base + 0x008), ioread32(base + 0x00c),
+			   ioread32(base + 0x010), ioread32(base + 0x014), ret);
+	}
+	mutex_unlock(&hd->mailbox_lock);
+
+	seq_printf(s, "result: %d\n", ret);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_mst3367_probe);
+
+/*
+ * mst3367_poll: poll MST3367 reg[0x55] every 500ms for up to 30s until HDMI
+ * lock bits[5:2] == 0x3c.  The HDMI source (e.g. Switch 2) may take 1-3s to
+ * respond to HPD and begin outputting video; this gives it time.
+ */
+static int hd60pro_mst3367_poll_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	unsigned int attempt;
+	u8 val = 0;
+	int ret = 0;
+
+	seq_puts(s, "mst3367_poll: polling reg[0x55] every 500ms for up to 20s\n");
+
+	if (!allow_mailbox_writes || !allow_i2c_read_command1a) {
+		seq_puts(s, "blocked; reload with allow_mailbox_writes=1 allow_i2c_read_command1a=1\n");
+		return 0;
+	}
+	if (!base) {
+		seq_puts(s, "no mailbox base\n");
+		return 0;
+	}
+
+	for (attempt = 0; attempt < 40; attempt++) {
+		/*
+		 * Use device-channel 0x9c (MST3367_GetRegister path from
+		 * LXV4L2D_MZ0380.ko) rather than raw I2C addr 0xC0.
+		 */
+		u32 packet[5] = {
+			HD60PRO_MBOX_DOORBELL,
+			HD60PRO_MBOX_CMD_I2C_READ8,
+			0x9c,
+			0x55,
+			0,
+		};
+		u32 completion = 0;
+
+		mutex_lock(&hd->mailbox_lock);
+		ret = hd60pro_mailbox_send_locked(hd, packet, ARRAY_SIZE(packet),
+						  HD60PRO_MBOX_TIMEOUT_US,
+						  &completion);
+		val = ioread32(base + 0x010) & 0xff;
+		mutex_unlock(&hd->mailbox_lock);
+
+		seq_printf(s, "attempt %2u: reg[0x55]=0x%02x lock_bits[5:2]=0x%x %s ret=%d\n",
+			   attempt, val, (val >> 2) & 0xf,
+			   ((val & 0x3c) == 0x3c) ? "LOCKED" : "waiting",
+			   ret);
+
+		if ((val & 0x3c) == 0x3c)
+			break;
+		if (ret)
+			break;
+
+		msleep(500);
+	}
+
+	if ((val & 0x3c) == 0x3c) {
+		/* Read full status on lock */
+		static const u8 extra[] = { 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5f, 0x6a, 0x6b };
+		u8 evals[ARRAY_SIZE(extra)] = { 0 };
+		unsigned int ei;
+
+		mutex_lock(&hd->mailbox_lock);
+		for (ei = 0; ei < ARRAY_SIZE(extra) && !ret; ei++) {
+			u32 pkt[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8,
+				       0x9c, extra[ei], 0 };
+			u32 comp = 0;
+
+			ret = hd60pro_mailbox_send_locked(hd, pkt, ARRAY_SIZE(pkt),
+							  HD60PRO_MBOX_TIMEOUT_US, &comp);
+			evals[ei] = ioread32(base + 0x010) & 0xff;
+		}
+		mutex_unlock(&hd->mailbox_lock);
+
+		seq_printf(s, "LOCKED: H_total=0x%02x%02x  V_total=0x%02x%02x%02x  V_active=0x%02x\n",
+			   evals[0], evals[1], evals[2] & 0x3f, evals[3], evals[4], evals[5] & 0xff);
+		{
+			u8 vic = (evals[6] >> 1) & 0x3f;
+
+			seq_printf(s, "LOCKED: VIC=%u  pclk_upper=0x%02x pclk_lower=0x%02x\n",
+				   vic, evals[7], evals[8]);
+		}
+		seq_puts(s, "result: locked\n");
+	} else {
+		seq_printf(s, "result: no lock after 20s (final reg[0x55]=0x%02x)\n", val);
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_mst3367_poll);
+
+/*
+ * edid_load: write a 128-byte 1920x1080@60Hz EDID to HDMI chip at I2C address
+ * 0x66 via mailbox cmd 0x1b.
+ *
+ * Source: Windows driver UpdateEDID() calls i2c_write_bytes(dev, 0x66, buf, 16)
+ * for 16 iterations to write all 256 bytes. The EDID chip is at I2C addr 0x66
+ * (separate from the HDMI register bank at 0xc0). No MCU polling is done here
+ * (Windows driver polls MCU at 0x55 for 'Q'/0x10/0x30 → 0x31 sequence which
+ * we cannot replicate without the MCU I2C path).
+ *
+ * After writing, the HDMI source must see a HPD (hot-plug detect) pulse to
+ * re-read the EDID. Re-connecting the HDMI cable triggers this. GPIO 9 in the
+ * Windows init performs HPD toggle (high/50ms/low/50ms/high/50ms) but we do
+ * not have that wired yet.
+ *
+ * Without EDID the source outputs nothing → firmware WaitVIC() never returns
+ * → no DMA frames → no bit-0 IRQs.
+ */
+static int hd60pro_edid_load_show(struct seq_file *s, void *unused)
+{
+	/*
+	 * 256-byte EDID: 128 bytes base block + 128 bytes CEA 861 extension.
+	 *
+	 * Base block (bytes 0-127):
+	 *   EDID 1.3, digital input, 1920x1080@60Hz DTD, 1 extension block.
+	 *   Byte 0x7E = 0x01 (one CEA 861 extension follows).
+	 *   Checksum at [127] computed at runtime.
+	 *
+	 * CEA 861 Extension (bytes 128-255):
+	 *   Version 3.  Data block collection at bytes 132-142:
+	 *     Video Data Block (tag=2, len=4): VIC 16 native (1080p60),
+	 *       VIC 4 (720p60), VIC 5 (1080i60), VIC 2 (480p60).
+	 *     HDMI VSDB (tag=3, len=5): LLC OUI 0x000C03, SPA 0.0.0.0.
+	 *     Presence of HDMI VSDB is required for the source to enable
+	 *     HDMI mode (vs DVI) and to enable TMDS data outputs.
+	 *   DTD at byte 143: 1920x1080@60Hz (same parameters as base block).
+	 *   Checksum at [255] computed at runtime.
+	 *
+	 * Without the CEA extension / HDMI VSDB, the Switch 2 may run in DVI
+	 * mode or may refuse to output any TMDS data signal, which explains
+	 * why TMDS clock arrives at the MST3367 (reg[0x5E]=0x10) but the data
+	 * CDR never locks (reg[0x56]=0x00).
+	 */
+	/* Base EDID header bytes [0..126]; byte [127] = checksum (computed) */
+	static const u8 edid_base[127] = {
+		/* 0x00: header */
+		0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
+		/* 0x08: manufacturer "ELG" (0x1166), product 0x0001 */
+		0x11, 0x66, 0x01, 0x00,
+		/* 0x0C: serial number */
+		0x00, 0x00, 0x00, 0x00,
+		/* 0x10: week 1, year 2022 (2022-1990=32) */
+		0x01, 0x20,
+		/* 0x12: EDID 1.3 */
+		0x01, 0x03,
+		/* 0x14: digital input */
+		0x80,
+		/* 0x15: 52 cm H, 29 cm V */
+		0x34, 0x1D,
+		/* 0x17: gamma 2.2 */
+		0x78,
+		/* 0x18: feature support */
+		0x00,
+		/* 0x19: chromaticity (10 bytes, unspecified) */
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		/* 0x23: established timings */
+		0x00, 0x00, 0x00,
+		/* 0x26: standard timings — 1920x1080 16:9 60Hz, rest unused */
+		0xD1, 0xC0,
+		0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+		0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+		/* 0x36: descriptor 1 — DTD 1920x1080@60Hz */
+		0x02, 0x3A, 0x80, 0x18, 0x71, 0x38, 0x2D, 0x40,
+		0x58, 0x2C, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x1E,
+		/* 0x48: descriptor 2 — monitor name "HD60 Pro" */
+		0x00, 0x00, 0x00, 0xFC, 0x00,
+		'H', 'D', '6', '0', ' ', 'P', 'r', 'o', '\n',
+		' ', ' ', ' ', ' ',
+		/* 0x5A: descriptor 3 — unused */
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00,
+		/* 0x6C: descriptor 4 — unused */
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00,
+		/* 0x7E: 1 extension block follows (CEA 861) */
+		0x01,
+	};
+	/* CEA 861 Extension header bytes [0..126]; byte [127] = checksum */
+	static const u8 cea_base[127] = {
+		/* 0x00: CEA 861 extension tag */
+		0x02,
+		/* 0x01: version 3 */
+		0x03,
+		/* 0x02: d = 0x0F (first DTD at byte 15, DBC ends at byte 14) */
+		0x0F,
+		/* 0x03: 0x00 — no underscan, no basic audio, 0 native CEA formats */
+		0x00,
+		/* 0x04-0x08: Video Data Block (tag=2, len=4) */
+		0x44,
+		0x90,   /* VIC 16 | native flag (0x10|0x80) = 0x90: 1080p60 native */
+		0x04,   /* VIC 4: 720p60 */
+		0x05,   /* VIC 5: 1080i60 */
+		0x02,   /* VIC 2: 480p60 */
+		/* 0x09-0x0E: HDMI VSDB (tag=3, len=5) */
+		0x65,   /* (3<<5)|5 = 0x65: VSDB tag, length 5 */
+		0x03,   /* HDMI LLC OUI byte 0 (LSB): 0x03 */
+		0x0C,   /* HDMI LLC OUI byte 1:       0x0C */
+		0x00,   /* HDMI LLC OUI byte 2 (MSB): 0x00 → OUI = 0x000C03 */
+		0x00,   /* Source Physical Address byte 0 */
+		0x00,   /* Source Physical Address byte 1 */
+		/* 0x0F-0x20: DTD 1920x1080@60Hz (18 bytes) */
+		0x02, 0x3A, 0x80, 0x18, 0x71, 0x38, 0x2D, 0x40,
+		0x58, 0x2C, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x1E,
+		/* 0x21-0x7E: padding (94 bytes) */
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00,
+	};
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	u8 edid[256];
+	u32 sum0 = 0, sum1 = 0;
+	int i, ret = 0;
+
+	if (!allow_mailbox_writes) {
+		seq_puts(s, "blocked: reload with allow_mailbox_writes=1\n");
+		return 0;
+	}
+	if (!base) {
+		seq_puts(s, "no mailbox base\n");
+		return 0;
+	}
+
+	/* Build 256-byte EDID: base block [0..127] + CEA extension [128..255] */
+	memcpy(edid, edid_base, 127);
+	for (i = 0; i < 127; i++)
+		sum0 += edid[i];
+	edid[127] = (256 - (sum0 & 0xFF)) & 0xFF;  /* base checksum */
+
+	memcpy(edid + 128, cea_base, 127);
+	for (i = 128; i < 255; i++)
+		sum1 += edid[i];
+	edid[255] = (256 - (sum1 & 0xFF)) & 0xFF;  /* CEA extension checksum */
+
+	/*
+	 * cmd 0x20 raw I2C write — discovered by binary analysis of i2c_write_bytes()
+	 * at Windows driver file offset 0x274b74.
+	 *
+	 * Protocol: 256 bytes in 16 chunks of 16 bytes each (matching Windows
+	 * UpdateEDID 16-byte chunks: 16 iterations × 16 bytes = 256 bytes total).
+	 * Packet: {0x800, 0x20, (16<<16)|(1<<8)|0x66, data[0..3], data[4..7],
+	 *          data[8..11], data[12..15]}  = 7 dwords.
+	 *
+	 * Note: cmd 0x1b (pipeline write) returned zeros — it does not reach
+	 * chip 0x66.  cmd 0x20 (I2C_RAW) is the correct path.
+	 */
+	seq_puts(s, "edid_load: writing 256-byte EDID (base+CEA861) to chip 0x66 via cmd 0x20\n");
+	seq_printf(s, "base_checksum: 0x%02x  cea_checksum: 0x%02x\n",
+		   edid[127], edid[255]);
+
+	mutex_lock(&hd->mailbox_lock);
+	/*
+	 * Write 256 bytes in 32 chunks of 8 bytes = 32 × cmd 0x20.
+	 *
+	 * EEPROM I2C write protocol requires an address byte as the FIRST
+	 * byte of the payload:
+	 *   [START][0x66|W][page_offset][data0]..[data7][STOP]
+	 *
+	 * So each cmd 0x20 write sends 9 bytes:
+	 *   byte[0]    = page_offset (0x00, 0x08, 0x10, … 0xF8)
+	 *   bytes[1..8] = 8 EDID bytes
+	 *
+	 * We use 8-byte chunks because many 24C02-family EEPROMs have an
+	 * 8-byte page size — writing more than 8 bytes per transaction causes
+	 * the address to wrap within the page, corrupting all bytes after
+	 * the page boundary.  8-byte chunks are safe for any page size ≥ 8.
+	 *
+	 * A 6ms inter-chunk delay is added to satisfy the EEPROM's write-cycle
+	 * time (tWC = 5ms typical for 24C02).  The firmware may not do ACK
+	 * polling, so we enforce the delay from the host side.
+	 */
+	for (i = 0; i < 256 && !ret; i += 8) {
+		/*
+		 * 6-dword packet: 3 header dwords + 3 data dwords (9 bytes LE).
+		 *   cbuf[0]     = EEPROM page offset = i
+		 *   cbuf[1..8]  = edid[i..i+7]
+		 * LE packing:
+		 *   packet[3] = {cbuf[3], cbuf[2], cbuf[1], cbuf[0]}
+		 *   packet[4] = {cbuf[7], cbuf[6], cbuf[5], cbuf[4]}
+		 *   packet[5] = cbuf[8] (last byte, 3 padding bytes ignored)
+		 */
+		u32 packet[6];
+		u8 cbuf[9];
+		u32 completion = 0;
+
+		cbuf[0] = (u8)i;               /* EEPROM page offset */
+		memcpy(cbuf + 1, edid + i, 8); /* 8 EDID bytes */
+
+		packet[0] = HD60PRO_MBOX_DOORBELL;
+		packet[1] = HD60PRO_MBOX_CMD_I2C_RAW;
+		packet[2] = (9u << 16) | (1u << 8) | 0x66u; /* 9 bytes, write */
+		packet[3] = get_unaligned_le32(cbuf + 0);
+		packet[4] = get_unaligned_le32(cbuf + 4);
+		packet[5] = cbuf[8];
+
+		ret = hd60pro_mailbox_send_locked(hd, packet, ARRAY_SIZE(packet),
+						  HD60PRO_MBOX_TIMEOUT_US,
+						  &completion);
+		if (ret) {
+			seq_printf(s, "write error at chunk 0x%02x: ret=%d\n", i, ret);
+			break;
+		}
+		if (hd60pro_mailbox_dead(base)) {
+			seq_puts(s, "aborted: mailbox dead\n");
+			ret = -ENODEV;
+			break;
+		}
+		/* tWC: give EEPROM time to commit (5ms typ for 24C02) */
+		mutex_unlock(&hd->mailbox_lock);
+		msleep(6);
+		mutex_lock(&hd->mailbox_lock);
+	}
+	if (!ret)
+		seq_printf(s, "write: 256 bytes sent in 32×9-byte chunks (offset+8data), ok\n");
+
+	/*
+	 * Readback: try to read first 16 bytes back from chip 0x66.
+	 * Protocol uncertain — try direct read (no pointer-set), then dump
+	 * the full BAR0[0x000..0x050] raw so we can locate where the result lands.
+	 *
+	 * Two attempts:
+	 *   A) Pure read without pointer-set (auto-current-address)
+	 *   B) Pointer-set {0x00} then read (standard EEPROM protocol)
+	 */
+	if (!ret) {
+		u32 rpacket[3] = {
+			HD60PRO_MBOX_DOORBELL,
+			HD60PRO_MBOX_CMD_I2C_RAW,
+			(16u << 16) | (0u << 8) | 0x66u,  /* read 16 bytes */
+		};
+		/*
+		 * Pointer-set: write exactly 1 byte (0x00) to set EEPROM read
+		 * pointer to offset 0.  The EEPROM interprets a bare 1-byte
+		 * write as a "set pointer" command, not a data write.
+		 */
+		u32 set0_pkt[4] = {
+			HD60PRO_MBOX_DOORBELL,
+			HD60PRO_MBOX_CMD_I2C_RAW,
+			(1u << 16) | (1u << 8) | 0x66u,  /* write 1 byte to 0x66 */
+			0x00000000u,                       /* byte = 0x00 = offset 0 */
+		};
+		u32 j;
+
+		/* Attempt A: read without pointer-set */
+		ret = hd60pro_mailbox_send_locked(hd, rpacket, ARRAY_SIZE(rpacket),
+						  HD60PRO_MBOX_TIMEOUT_US, NULL);
+		seq_puts(s, "readback_A (no ptr-set, read 16): BAR0 dump 0x000-0x050:\n");
+		for (j = 0; j <= 0x050; j += 4) {
+			u32 dw = ioread32(base + j);
+
+			if (dw)
+				seq_printf(s, "  BAR0[0x%03x]=0x%08x\n", j, dw);
+		}
+
+		/* Attempt B: write ptr=0x00, then read 16 bytes */
+		ret = hd60pro_mailbox_send_locked(hd, set0_pkt, ARRAY_SIZE(set0_pkt),
+						  HD60PRO_MBOX_TIMEOUT_US, NULL);
+		if (!ret)
+			ret = hd60pro_mailbox_send_locked(hd, rpacket, ARRAY_SIZE(rpacket),
+							  HD60PRO_MBOX_TIMEOUT_US, NULL);
+		seq_puts(s, "readback_B (ptr=0x00, read 16): BAR0 dump 0x000-0x050:\n");
+		for (j = 0; j <= 0x050; j += 4) {
+			u32 dw = ioread32(base + j);
+
+			if (dw)
+				seq_printf(s, "  BAR0[0x%03x]=0x%08x\n", j, dw);
+		}
+
+		/* Compare BAR0[0x010..0x04f] against expected EDID bytes 0-63 */
+		seq_puts(s, "edid_vs_bar0_010: (checking if read data is at BAR0+0x010)\n");
+		for (j = 0; j < 16; j++) {
+			u8 got = ioread32(base + 0x010 + j * 4) & 0xFF;
+
+			seq_printf(s, "  bar0[0x%03x]=0x%02x vs edid[%u]=0x%02x %s\n",
+				   0x010 + j * 4, got, j, edid[j],
+				   got == edid[j] ? "OK" : "MISMATCH");
+		}
+	}
+	mutex_unlock(&hd->mailbox_lock);
+
+	if (!ret)
+		seq_puts(s, "result: OK\nnote: source should re-read EDID after HPD pulse\n");
+	else
+		seq_printf(s, "result: FAILED ret=%d\n", ret);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_edid_load);
+
+/*
+ * edid_verify: read back up to 24 bytes from chip 0x66 via cmd 0x1a
+ * (I2C_READ8, the same command used for MST3367 register reads).
+ *
+ * cmd 0x1a issues:  [START][0x66|W][byte_offset][RESTART][0x66|R][byte][STOP]
+ * which is a standard EEPROM random-read.  The returned byte lands in
+ * BAR0[0x010] — unlike cmd 0x20 reads which never appear in BAR0.
+ *
+ * This verifies whether edid_load actually wrote to the EEPROM:
+ *   Expected at offset 0x01: 0xFF  (EDID header byte 1)
+ *   Expected at offset 0x07: 0x00  (EDID header byte 7)
+ *   Expected at offset 0x12: 0x01  (EDID version = 1.3)
+ *   Expected at offset 0x13: 0x03  (EDID revision = 3)
+ *   Expected at offset 0x7E: 0x01  (1 CEA extension block)
+ *   Expected at offset 0x80: 0x02  (CEA 861 extension tag)
+ *
+ * If writes are silently failing (WP pin held HIGH or wrong protocol),
+ * all bytes read back as 0x00 or as stale factory data.
+ */
+static int hd60pro_edid_verify_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	/* spot-check offsets and their expected values */
+	static const struct { u8 off; u8 exp; const char *desc; } checks[] = {
+		{ 0x00, 0x00, "EDID hdr[0]" },
+		{ 0x01, 0xFF, "EDID hdr[1]" },
+		{ 0x02, 0xFF, "EDID hdr[2]" },
+		{ 0x06, 0xFF, "EDID hdr[6]" },
+		{ 0x07, 0x00, "EDID hdr[7]" },
+		{ 0x08, 0x11, "manuf ID hi (ELG)" },
+		{ 0x09, 0x66, "manuf ID lo" },
+		{ 0x12, 0x01, "EDID version" },
+		{ 0x13, 0x03, "EDID revision" },
+		{ 0x7E, 0x01, "ext count" },
+		{ 0x80, 0x02, "CEA tag" },
+		{ 0x81, 0x03, "CEA revision" },
+	};
+	int i, pass = 0, fail = 0;
+	int ret = 0;
+
+	seq_puts(s, "edid_verify: read-back chip 0x66 via cmd 0x1a (I2C_READ8)\n");
+
+	if (!allow_mailbox_writes || !allow_i2c_read_command1a) {
+		seq_puts(s, "blocked: need allow_mailbox_writes=1 allow_i2c_read_command1a=1\n");
+		return 0;
+	}
+	if (!base) {
+		seq_puts(s, "no mailbox base\n");
+		return 0;
+	}
+
+	mutex_lock(&hd->mailbox_lock);
+	for (i = 0; i < (int)ARRAY_SIZE(checks); i++) {
+		u32 pkt[5] = {
+			HD60PRO_MBOX_DOORBELL,
+			HD60PRO_MBOX_CMD_I2C_READ8,
+			0x66u,              /* chip 0x66 (EEPROM) */
+			checks[i].off,      /* byte offset = EEPROM address */
+			0u
+		};
+		u32 comp = 0;
+		u8 got;
+
+		ret = hd60pro_mailbox_send_locked(hd, pkt, ARRAY_SIZE(pkt),
+						  HD60PRO_MBOX_TIMEOUT_US, &comp);
+		if (ret) {
+			seq_printf(s, "  off=0x%02x MAILBOX_ERROR ret=%d\n",
+				   checks[i].off, ret);
+			break;
+		}
+		if (!comp) {
+			seq_printf(s, "  off=0x%02x DEAD_MAILBOX comp=0\n", checks[i].off);
+			break;
+		}
+		got = (u8)(ioread32(base + 0x010) & 0xFF);
+		if (got == checks[i].exp) {
+			seq_printf(s, "  off=0x%02x got=0x%02x exp=0x%02x OK  (%s)\n",
+				   checks[i].off, got, checks[i].exp, checks[i].desc);
+			pass++;
+		} else {
+			seq_printf(s, "  off=0x%02x got=0x%02x exp=0x%02x FAIL(%s)\n",
+				   checks[i].off, got, checks[i].exp, checks[i].desc);
+			fail++;
+		}
+	}
+	mutex_unlock(&hd->mailbox_lock);
+
+	if (!ret)
+		seq_printf(s, "result: %d/%d pass  %s\n",
+			   pass, pass + fail,
+			   fail == 0 ? "EDID OK in chip 0x66" : "EEPROM write problem");
+	else
+		seq_printf(s, "result: FAILED at ret=%d\n", ret);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_edid_verify);
+
+/*
+ * mst3367_phys_test: verify cmd 0x20 (I2C_RAW) can reach the physical MST3367
+ * at I2C addr 0xC0 by writing a non-zero value and reading it back via cmd 0x1a.
+ *
+ * If the physical chip is accessible, write reg[0x51]=0x81 via cmd 0x20 and
+ * read back via cmd 0x1a addr=0xC0.  Compare with shadow read from 0x9c.
+ *
+ * cmd 0x20 write format for 2-byte I2C write [reg_addr][reg_val]:
+ *   packet[2] = (2<<16)|(1<<8)|0xC0   → 2 bytes, write, addr=0xC0
+ *   packet[3] = reg_addr | (reg_val<<8) (little-endian)
+ *
+ * This test answers: does cmd 0x20 reach the PHYSICAL chip at 0xC0, or only the
+ * shadow at 0x9C?  If cmd 0x20 to 0xC0 writes succeed (readback via cmd 0x1a to
+ * 0xC0 shows non-zero), we can use cmd 0x20 to send the full HDMI_INIT sequence
+ * directly to the physical MST3367 and get CDR to lock.
+ *
+ * Also reads the chip at 0x98 (found by i2c_scan returning non-zero at reg 0x00)
+ * for key CDR registers to identify whether 0x98 is a second HDMI RX chip.
+ */
+static int hd60pro_mst3367_phys_test_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	int ret = 0;
+	u32 comp, r;
+
+	seq_puts(s, "mst3367_phys_test: cmd 0x20 write + cmd 0x1a read-back at addr 0xC0 and 0x98\n");
+
+	if (!allow_mailbox_writes) {
+		seq_puts(s, "blocked: need allow_mailbox_writes=1\n");
+		return 0;
+	}
+	if (!base) {
+		seq_puts(s, "no mailbox base\n");
+		return 0;
+	}
+
+	mutex_lock(&hd->mailbox_lock);
+
+	/* --- Probe addr 0xC0 (standard MST3367 I2C address): read key regs before write --- */
+	{
+		static const u8 probe_regs[] = { 0x00, 0x51, 0x55, 0x5E, 0xAC, 0xCE };
+		unsigned int i;
+
+		seq_puts(s, "=== addr 0xC0 (physical MST3367 if at 7-bit 0x60) before write ===\n");
+		for (i = 0; i < ARRAY_SIZE(probe_regs); i++) {
+			u32 pkt[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8,
+				       0xC0u, probe_regs[i], 0 };
+			comp = 0;
+			ret = hd60pro_mailbox_send_locked(hd, pkt, ARRAY_SIZE(pkt),
+							  HD60PRO_MBOX_TIMEOUT_US, &comp);
+			r = ioread32(base + 0x010) & 0xFF;
+			seq_printf(s, "  reg[0x%02x]=0x%02x comp=%d 008=0x%08x\n",
+				   probe_regs[i], r, comp, ioread32(base + 0x008));
+			if (ret) { seq_printf(s, "  error ret=%d\n", ret); break; }
+		}
+	}
+
+	/*
+	 * Test: write reg[0x51]=0x81 via cmd 0x20 (I2C_RAW) to addr 0xC0.
+	 * MST3367 reg[0x51] default after power-on = 0x00 (from mst3367_probe).
+	 * Our hw_init (cmd 0x1b to 0x9c shadow) writes reg[0x51]=0x81.
+	 * If cmd 0x20 to 0xC0 reaches physical chip, readback via cmd 0x1a to 0xC0
+	 * should return 0x81 instead of 0x00.
+	 */
+	if (!ret) {
+		u32 wpkt[4] = {
+			HD60PRO_MBOX_DOORBELL,
+			HD60PRO_MBOX_CMD_I2C_RAW,
+			(2u << 16) | (1u << 8) | 0xC0u,  /* 2 bytes, write to 0xC0 */
+			0x51u | (0x81u << 8)               /* [0x51][0x81] little-endian */
+		};
+		comp = 0;
+		ret = hd60pro_mailbox_send_locked(hd, wpkt, ARRAY_SIZE(wpkt),
+						  HD60PRO_MBOX_TIMEOUT_US, &comp);
+		seq_printf(s, "write reg[0x51]=0x81 via cmd 0x20 to 0xC0: ret=%d comp=%d\n",
+			   ret, comp);
+	}
+
+	/* Read back reg[0x51] from addr 0xC0 */
+	if (!ret) {
+		u32 rpkt[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8,
+				0xC0u, 0x51u, 0 };
+		comp = 0;
+		ret = hd60pro_mailbox_send_locked(hd, rpkt, ARRAY_SIZE(rpkt),
+						  HD60PRO_MBOX_TIMEOUT_US, &comp);
+		r = ioread32(base + 0x010) & 0xFF;
+		seq_printf(s, "readback reg[0x51] from 0xC0 via cmd 0x1a: got=0x%02x comp=%d\n", r, comp);
+		if (r == 0x81)
+			seq_puts(s, "  → MATCH: cmd 0x20 reaches physical chip at 0xC0!\n");
+		else if (r == 0x00)
+			seq_puts(s, "  → ZERO: cmd 0x20 does NOT reach physical 0xC0, or chip not there\n");
+		else
+			seq_printf(s, "  → 0x%02x (unexpected)\n", r);
+	}
+
+	/* --- Probe addr 0x98 (7-bit 0x4C, the chip that returned non-zero in i2c_scan) --- */
+	if (!ret) {
+		static const u8 probe98[] = { 0x00, 0x51, 0x55, 0x56, 0x5E, 0xAC, 0xCE };
+		unsigned int i;
+
+		seq_puts(s, "\n=== addr 0x98 (7-bit 0x4C, found in i2c_scan) ===\n");
+		for (i = 0; i < ARRAY_SIZE(probe98); i++) {
+			u32 pkt[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8,
+				       0x98u, probe98[i], 0 };
+			comp = 0;
+			ret = hd60pro_mailbox_send_locked(hd, pkt, ARRAY_SIZE(pkt),
+							  HD60PRO_MBOX_TIMEOUT_US, &comp);
+			r = ioread32(base + 0x010) & 0xFF;
+			seq_printf(s, "  reg[0x%02x]=0x%02x comp=%d\n", probe98[i], r, comp);
+			if (ret) { seq_printf(s, "  error ret=%d\n", ret); break; }
+		}
+	}
+
+	mutex_unlock(&hd->mailbox_lock);
+	seq_printf(s, "result: ret=%d\n", ret);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_mst3367_phys_test);
+
+/*
+ * hpd_pulse: toggle GPIO 9 (HPD) high->50ms->low->50ms->high->50ms so that
+ * an HDMI source re-reads the EDID after edid_load has written it.
+ *
+ * From MZ0380_SetGpioValue decompilation: uses cmd 0x15 (HD60PRO_MBOX_CMD_GPIO_ALT_SET),
+ * NOT cmd 0x17 (which is SetGpioDirection, not SetGpioValue).
+ * Packet: {0x800, 0x15, mask=BIT(9), value=BIT(9) or 0}
+ */
+static int hd60pro_hpd_pulse_show(struct seq_file *s, void *unused)
+{
+	static const struct { u8 value; } steps[] = { {1}, {0}, {1} };
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	unsigned int i;
+	int ret = 0;
+
+	seq_puts(s, "hpd_pulse: GPIO 9 value high->50ms->low->50ms->high->50ms via cmd 0x15 (SetGpioValue)\n");
+	seq_puts(s, "note: cmd 0x17=SetGpioDirection (wrong), cmd 0x15=SetGpioValue (correct per decompilation)\n");
+	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
+
+	if (!allow_gpio17_sequence) {
+		seq_puts(s, "blocked; reload with allow_gpio17_sequence=1 allow_mailbox_writes=1\n");
+		return 0;
+	}
+
+	if (!allow_mailbox_writes) {
+		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
+		return 0;
+	}
+
+	if (!base) {
+		seq_puts(s, "selected mailbox BAR is not mapped\n");
+		return 0;
+	}
+
+	mutex_lock(&hd->mailbox_lock);
+	for (i = 0; i < ARRAY_SIZE(steps) && !ret; i++) {
+		u32 mask = BIT(9);
+		u32 value = steps[i].value ? mask : 0;
+		/* Use cmd 0x15 (SetGpioValue) not 0x17 (SetGpioDirection) */
+		u32 packet[4] = {
+			HD60PRO_MBOX_DOORBELL,
+			HD60PRO_MBOX_CMD_GPIO_ALT_SET,  /* 0x15 = SetGpioValue */
+			mask,
+			value,
+		};
+		u32 completion = 0;
+
+		ret = hd60pro_mailbox_send_locked(hd, packet, ARRAY_SIZE(packet),
+						  HD60PRO_MBOX_TIMEOUT_US,
+						  &completion);
+		seq_printf(s, "step%u gpio9=%u cmd=0x15 result=%d completion=0x%08x\n",
+			   i, steps[i].value, ret, completion);
+		if (ret)
+			break;
+		mutex_unlock(&hd->mailbox_lock);
+		msleep(50);
+		mutex_lock(&hd->mailbox_lock);
+	}
+	mutex_unlock(&hd->mailbox_lock);
+
+	if (!ret)
+		seq_puts(s, "result: OK\nnote: source should now re-read EDID and output 1080p60\n");
+	else
+		seq_printf(s, "result: FAILED ret=%d\n", ret);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_hpd_pulse);
+
+/*
+ * mst3367_hdmi_init: implement MST3367_HDMI_INIT() from LXV4L2D_MZ0380.ko
+ * decompilation.  Configures the MST3367 chip (I2C 0xC0) for HDMI reception.
+ *
+ * The chip has multiple register banks selected via bank register 0x0F.
+ * Bank 0 = default, bank 2 = PLL/clock config, bank 0x80 = signal routing.
+ *
+ * This must be called before HPD pulse so that when the HDMI source responds
+ * to HPD and starts sending TMDS data, the MST3367 PLL is configured to lock
+ * onto the HDMI clock (reg[0x55] bits[5:2] == 0x3C).
+ *
+ * Register writes from MST3367_HDMI_INIT decompilation at 0x00121920:
+ *   bank2[0x01]: bits[6:5] = 0b11 (HDMI PLL divider)
+ *   bank2[0x04]: bit 0 = 1 (enable HDMI clock)
+ *   bank2[0x06]: = 0x08 (PLL pre-divider)
+ *   bank2[0x09]: bit 5 = 1 (HDMI PLL loop filter)
+ *   bank0[0x54]: bit 4 = 0 (disable ADC, enable HDMI path)
+ *   bank0[0xAC]: bit 7 = 1 (HDMI audio PLL enable)
+ *   bank0[0x00]: toggle bit 7 (MST3367 soft reset pulse)
+ *   bank0[0xCE]: bit 7 = 1 (HDMI output enable)
+ *   bank0[0xCF]: bits[2:1] = 0b10 (HDMI source select)
+ *   bank0x80[0xD0]: bits[1:0] = 0b01 (HDMI input port 0)
+ *   bank0x80[0xCF]: bit 7 = 1 (HDMI routing enable)
+ */
+static int hd60pro_mst3367_hdmi_init_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	int ret = 0;
+	u8 val;
+
+	seq_puts(s, "mst3367_hdmi_init: configure MST3367 (0xC0) for HDMI via MST3367_HDMI_INIT\n");
+
+	if (!allow_mailbox_writes || !allow_i2c_read_command1a) {
+		seq_puts(s, "blocked; reload with allow_mailbox_writes=1 allow_i2c_read_command1a=1\n");
+		return 0;
+	}
+	if (!base) {
+		seq_puts(s, "no mailbox base\n");
+		return 0;
+	}
+
+#define MST3367_BANK_SEL(bank) \
+	do { \
+		u32 _p[4] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_RAW, \
+			      (2u << 16) | (1u << 8) | 0xc0u, \
+			      (u32)(((bank) << 8) | 0x0fu) }; \
+		ret = hd60pro_mailbox_send_locked(hd, _p, ARRAY_SIZE(_p), \
+						  HD60PRO_MBOX_TIMEOUT_US, NULL); \
+	} while (0)
+
+#define MST3367_WRITE(reg, val_byte) \
+	do { \
+		u32 _p[4] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_RAW, \
+			      (2u << 16) | (1u << 8) | 0xc0u, \
+			      (u32)(((val_byte) << 8) | (reg)) }; \
+		ret = hd60pro_mailbox_send_locked(hd, _p, ARRAY_SIZE(_p), \
+						  HD60PRO_MBOX_TIMEOUT_US, NULL); \
+	} while (0)
+
+#define MST3367_READ(reg, out_val) \
+	do { \
+		u32 _p[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8, \
+			      0xc0u, (reg), 0 }; \
+		ret = hd60pro_mailbox_send_locked(hd, _p, ARRAY_SIZE(_p), \
+						  HD60PRO_MBOX_TIMEOUT_US, NULL); \
+		(out_val) = ioread32(base + 0x010) & 0xff; \
+	} while (0)
+
+	mutex_lock(&hd->mailbox_lock);
+
+	/* === Bank 2: HDMI PLL/clock configuration === */
+	MST3367_BANK_SEL(2);
+	seq_printf(s, "bank_sel(2) ret=%d\n", ret);
+	if (ret) goto out_unlock;
+
+	MST3367_READ(0x01, val);
+	seq_printf(s, "bank2[0x01] read=0x%02x\n", val);
+	MST3367_WRITE(0x01, (val & 0x0f) | 0x60);
+	seq_printf(s, "bank2[0x01] write=0x%02x ret=%d\n", (val & 0x0f) | 0x60, ret);
+	if (ret) goto bank0_restore;
+
+	MST3367_READ(0x04, val);
+	seq_printf(s, "bank2[0x04] read=0x%02x\n", val);
+	MST3367_WRITE(0x04, (val & 0xfe) | 0x01);
+	seq_printf(s, "bank2[0x04] write=0x%02x ret=%d\n", (val & 0xfe) | 0x01, ret);
+	if (ret) goto bank0_restore;
+
+	MST3367_WRITE(0x06, 0x08);
+	seq_printf(s, "bank2[0x06] write=0x08 ret=%d\n", ret);
+	if (ret) goto bank0_restore;
+
+	MST3367_READ(0x09, val);
+	seq_printf(s, "bank2[0x09] read=0x%02x\n", val);
+	MST3367_WRITE(0x09, (val & 0xdf) | 0x20);
+	seq_printf(s, "bank2[0x09] write=0x%02x ret=%d\n", (val & 0xdf) | 0x20, ret);
+
+bank0_restore:
+	MST3367_BANK_SEL(0);
+	seq_printf(s, "bank_sel(0) restore ret=%d\n", ret);
+	if (ret) goto out_unlock;
+
+	/* === Bank 0: HDMI signal path === */
+	MST3367_READ(0x54, val);
+	seq_printf(s, "bank0[0x54] read=0x%02x\n", val);
+	MST3367_WRITE(0x54, val & 0xef);
+	seq_printf(s, "bank0[0x54] write=0x%02x (clr bit4 ADC) ret=%d\n", val & 0xef, ret);
+	if (ret) goto out_unlock;
+
+	MST3367_READ(0xac, val);
+	seq_printf(s, "bank0[0xAC] read=0x%02x\n", val);
+	MST3367_WRITE(0xac, val | 0x80);
+	seq_printf(s, "bank0[0xAC] write=0x%02x (set bit7 HDMI audio PLL) ret=%d\n", val | 0x80, ret);
+	if (ret) goto out_unlock;
+
+	/* Soft reset: toggle bit 7 of reg 0x00 */
+	MST3367_READ(0x00, val);
+	seq_printf(s, "bank0[0x00] read=0x%02x\n", val);
+	MST3367_WRITE(0x00, val | 0x80);
+	seq_printf(s, "bank0[0x00] write=0x%02x (set reset) ret=%d\n", val | 0x80, ret);
+	if (ret) goto out_unlock;
+	MST3367_WRITE(0x00, val & 0x7f);
+	seq_printf(s, "bank0[0x00] write=0x%02x (clr reset) ret=%d\n", val & 0x7f, ret);
+	if (ret) goto out_unlock;
+
+	MST3367_READ(0xce, val);
+	seq_printf(s, "bank0[0xCE] read=0x%02x\n", val);
+	MST3367_WRITE(0xce, val | 0x80);
+	seq_printf(s, "bank0[0xCE] write=0x%02x (set bit7 output en) ret=%d\n", val | 0x80, ret);
+	if (ret) goto out_unlock;
+
+	MST3367_READ(0xcf, val);
+	seq_printf(s, "bank0[0xCF] read=0x%02x\n", val);
+	MST3367_WRITE(0xcf, (val & 0xf8) | 0x02);
+	seq_printf(s, "bank0[0xCF] write=0x%02x (bits[2:1]=0b10 HDMI src) ret=%d\n",
+		   (val & 0xf8) | 0x02, ret);
+	if (ret) goto out_unlock;
+
+	/* === Bank 0x80: HDMI routing (else-branch: single-port fixed routing) === */
+	MST3367_BANK_SEL(0x80);
+	seq_printf(s, "bank_sel(0x80) ret=%d\n", ret);
+	if (ret) goto bank0_final;
+
+	MST3367_READ(0xd0, val);
+	seq_printf(s, "bank0x80[0xD0] read=0x%02x\n", val);
+	MST3367_WRITE(0xd0, (val & 0xfc) | 0x01);
+	seq_printf(s, "bank0x80[0xD0] write=0x%02x (bits[1:0]=0b01) ret=%d\n",
+		   (val & 0xfc) | 0x01, ret);
+
+	MST3367_READ(0xcf, val);
+	seq_printf(s, "bank0x80[0xCF] read=0x%02x\n", val);
+	MST3367_WRITE(0xcf, (val & 0x7f) | 0x80);
+	seq_printf(s, "bank0x80[0xCF] write=0x%02x (bit7=1) ret=%d\n",
+		   (val & 0x7f) | 0x80, ret);
+
+bank0_final:
+	MST3367_BANK_SEL(0);
+	seq_printf(s, "bank_sel(0) final ret=%d\n", ret);
+
+out_unlock:
+	mutex_unlock(&hd->mailbox_lock);
+
+#undef MST3367_BANK_SEL
+#undef MST3367_WRITE
+#undef MST3367_READ
+
+	/* Verify: read reg[0xAC] and reg[0x55] after init */
+	{
+		u8 vac = 0, v55 = 0;
+		u32 p1[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8, 0xc0, 0xac, 0 };
+		u32 p2[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8, 0xc0, 0x55, 0 };
+
+		mutex_lock(&hd->mailbox_lock);
+		hd60pro_mailbox_send_locked(hd, p1, ARRAY_SIZE(p1), HD60PRO_MBOX_TIMEOUT_US, NULL);
+		vac = ioread32(base + 0x010) & 0xff;
+		hd60pro_mailbox_send_locked(hd, p2, ARRAY_SIZE(p2), HD60PRO_MBOX_TIMEOUT_US, NULL);
+		v55 = ioread32(base + 0x010) & 0xff;
+		mutex_unlock(&hd->mailbox_lock);
+
+		seq_printf(s, "verify: reg[0xAC]=0x%02x (bit7=%u HDMI_audio_PLL)\n",
+			   vac, (vac >> 7) & 1);
+		seq_printf(s, "verify: reg[0x55]=0x%02x lock_bits[5:2]=0x%x %s\n",
+			   v55, (v55 >> 2) & 0xf,
+			   ((v55 & 0x3c) == 0x3c) ? "LOCKED" : "no lock yet");
+	}
+
+	seq_printf(s, "result: %d\n", ret);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_mst3367_hdmi_init);
+
+/*
+ * gpio_read: read GPIO value via cmd 0x14 (MZ0380_GetGpioValue).
+ * Reads GPIO9 (HPD line) state to verify the HPD pin is actually high.
+ *
+ * Cmd 0x14 packet: [0x800, 0x14, BIT(gpio_num), 0]
+ * Firmware returns GPIO value bit in BAR0[0x00c] >> gpio_num & 1.
+ */
+static int hd60pro_gpio_read_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	static const unsigned int gpios[] = { 0, 1, 6, 8, 9, 10, 11 };
+	unsigned int i;
+	int ret = 0;
+
+	seq_puts(s, "gpio_read: read GPIO values via cmd 0x14\n");
+	seq_puts(s, "note: GPIO9 = HPD output (high = source sees display connected)\n");
+
+	if (!allow_gpio17_sequence || !allow_mailbox_writes) {
+		seq_puts(s, "blocked; reload with allow_gpio17_sequence=1 allow_mailbox_writes=1\n");
+		return 0;
+	}
+	if (!base) {
+		seq_puts(s, "no mailbox base\n");
+		return 0;
+	}
+
+	mutex_lock(&hd->mailbox_lock);
+	for (i = 0; i < ARRAY_SIZE(gpios); i++) {
+		unsigned int gpio = gpios[i];
+		u32 packet[4] = {
+			HD60PRO_MBOX_DOORBELL,
+			0x14,  /* MZ0380_GetGpioValue cmd */
+			BIT(gpio),
+			0,
+		};
+		u32 comp = 0;
+		u32 gpio_reg;
+		u8 bit_val;
+
+		ret = hd60pro_mailbox_send_locked(hd, packet, ARRAY_SIZE(packet),
+						  HD60PRO_MBOX_TIMEOUT_US, &comp);
+		gpio_reg = ioread32(base + 0x00c);
+		bit_val = (gpio_reg >> gpio) & 1;
+		seq_printf(s, "gpio%2u: reg=0x%08x bit=%u comp=0x%08x ret=%d\n",
+			   gpio, gpio_reg, bit_val, comp, ret);
+		if (ret)
+			break;
+	}
+	mutex_unlock(&hd->mailbox_lock);
+
+	seq_printf(s, "result: %d\n", ret);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_gpio_read);
+
+/*
+ * mst3367_hw_init: full MST3367_HwInitialize() sequence from LXV4L2D_MZ0380.ko.
+ *
+ * MST3367_HwInitialize (ARM64 VMA 0x121948) initialises the MST3367 chip from
+ * scratch.  MST3367_HDMI_INIT (which mst3367_hdmi_init implements) is only a
+ * partial reconfiguration that assumes HwInitialize already ran.  The chip
+ * starts completely uninitialized (all registers 0x00), so only the full
+ * sequence makes it lock onto HDMI.
+ *
+ * Derived from disassembly of LXV4L2D_MZ0380.ko at file offset 0x21948:
+ *   - GPIO8 = LOW  (de-assert MST3367 reset for 0x12ab:0380 device)
+ *   - Bank 0: input clock, TMDS control, HPD, HDCP, misc regs
+ *   - Bank 1: TMDS clock/sync detector config
+ *   - Bank 2: TMDS PLL config and HDCP/EQ
+ *   - TMDS_HOT_PLUG, HDCP_RESET, HDMI_RESET helper sequences
+ *   - MST3367_HDMI_INIT (banks 2, 0, 0x80) as the final step
+ *
+ * Replace mst3367_hdmi_init in the test sequence with this node.
+ */
+static int hd60pro_mst3367_hw_init_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	int ret = 0;
+	u8 val;
+
+	seq_puts(s, "mst3367_hw_init: full MST3367_HwInitialize sequence\n");
+
+	if (!allow_mailbox_writes || !allow_i2c_read_command1a) {
+		seq_puts(s, "blocked; reload with allow_mailbox_writes=1 allow_i2c_read_command1a=1\n");
+		return 0;
+	}
+	if (!base) {
+		seq_puts(s, "no mailbox base\n");
+		return 0;
+	}
+
+/*
+ * MST3367 register access via firmware device-channel 0x9c.
+ *
+ * From disassembly of MZ0380_SetAnalogVideoDecoderRegister_EX.part.0 at
+ * ARM64 VMA 0x2ae18 and MZ0380_GetAnalogVideoDecoderRegister_EX.part.0
+ * at 0x2ad80: the correct packet formats for MST3367 are:
+ *
+ *   Write: [0x800, 0x1b, 0x9c, reg, val]   (5 words, cmd 0x1b = PIPELINE_WRITE)
+ *   Read:  [0x800, 0x1a, 0x9c, reg, 0]     (5 words, cmd 0x1a = I2C_READ8)
+ *   Bank-switch: [0x800, 0x1b, 0x9c, 0x00, bank]  (word[3]=0 = bank-switch indicator)
+ *
+ * The firmware maps device-channel 0x9c to the MST3367 at I2C addr 0xC0.
+ * Cmd 0x20 (raw I2C) does NOT reach the MST3367 on this device.
+ *
+ * IMPORTANT: word[3]=0x00 in a cmd 0x1b packet means bank-switch, NOT a write
+ * to register 0x00.  Therefore writes to MST3367 register 0x00 (soft-reset)
+ * are skipped in this implementation.
+ */
+#define MST_BSEL(bank) \
+	do { \
+		u32 _p[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_PIPELINE_WRITE, \
+			      0x9cu, 0x00u, (u8)(bank) }; \
+		ret = hd60pro_mailbox_send_locked(hd, _p, ARRAY_SIZE(_p), \
+						  HD60PRO_MBOX_TIMEOUT_US, NULL); \
+		if (ret) goto out_unlock; \
+	} while (0)
+
+#define MST_WR(reg, val_byte) \
+	do { \
+		u32 _p[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_PIPELINE_WRITE, \
+			      0x9cu, (u8)(reg), (u8)(val_byte) }; \
+		ret = hd60pro_mailbox_send_locked(hd, _p, ARRAY_SIZE(_p), \
+						  HD60PRO_MBOX_TIMEOUT_US, NULL); \
+		if (ret) goto out_unlock; \
+	} while (0)
+
+#define MST_RD(reg, out) \
+	do { \
+		u32 _p[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8, \
+			      0x9cu, (u8)(reg), 0 }; \
+		ret = hd60pro_mailbox_send_locked(hd, _p, ARRAY_SIZE(_p), \
+						  HD60PRO_MBOX_TIMEOUT_US, NULL); \
+		(out) = ioread32(base + 0x010) & 0xff; \
+		if (ret) goto out_unlock; \
+	} while (0)
+
+/* Write GPIO via cmd 0x15 (MZ0380_SetGpioValue) */
+#define GPIO_WR(gpio_num, gpio_val) \
+	do { \
+		u32 _mask = BIT(gpio_num); \
+		u32 _pkt[4] = { HD60PRO_MBOX_DOORBELL, \
+				HD60PRO_MBOX_CMD_GPIO_ALT_SET, \
+				_mask, \
+				(gpio_val) ? _mask : 0u }; \
+		ret = hd60pro_mailbox_send_locked(hd, _pkt, ARRAY_SIZE(_pkt), \
+						  HD60PRO_MBOX_TIMEOUT_US, NULL); \
+		if (ret) goto out_unlock; \
+	} while (0)
+
+	/*
+	 * GPIO8 reset→release: puts MST3367 in hardware reset (LOW), then
+	 * releases it (HIGH).  When GPIO8 goes HIGH the MST3367 boots and
+	 * automatically loads its internal EDID RAM from external EEPROM chip
+	 * 0x66 via I2C.  This must happen AFTER edid_load has written the
+	 * correct EDID to chip 0x66, and BEFORE the GPIO9 HPD pulse that tells
+	 * the source to re-read the EDID.
+	 *
+	 * If GPIO8 is left HIGH the whole time (as in the original code) the
+	 * MST3367 never reloads EDID from chip 0x66 and keeps serving whatever
+	 * blank/default EDID it had from firmware startup.
+	 *
+	 * GPIO9 (HPD) pulse: HIGH→LOW→HIGH after MST3367 EDID is loaded.
+	 * The source then reads EDID from MST3367's (now correct) internal RAM
+	 * and begins TMDS training.  CDR lock follows.
+	 */
+	mutex_lock(&hd->mailbox_lock);
+	{
+		u32 mask8 = BIT(8);
+		u32 mask9 = BIT(9);
+		u32 pkt8_lo[4] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_GPIO_ALT_SET,
+				   mask8, 0 };      /* GPIO8=LOW: MST3367 in HW reset */
+		u32 pkt8_hi[4] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_GPIO_SET,
+				   mask8, mask8 };  /* GPIO8=HIGH: release reset */
+		u32 pkt9_hi[4] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_GPIO_ALT_SET,
+				   mask9, mask9 };  /* GPIO9=HIGH */
+		u32 pkt9_lo[4] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_GPIO_ALT_SET,
+				   mask9, 0 };      /* GPIO9=LOW */
+
+		/* Step 1: GPIO8 LOW → MST3367 enters hardware reset */
+		ret = hd60pro_mailbox_send_locked(hd, pkt8_lo, ARRAY_SIZE(pkt8_lo),
+						  HD60PRO_MBOX_TIMEOUT_US, NULL);
+		seq_printf(s, "gpio8=0 (mst3367_hw_reset) ret=%d\n", ret);
+		if (ret) { mutex_unlock(&hd->mailbox_lock); goto done; }
+		mutex_unlock(&hd->mailbox_lock);
+		msleep(50);   /* 50ms in reset: chip drains internal state */
+
+		/* Step 2: GPIO8 HIGH → MST3367 released; starts loading EDID from chip 0x66 */
+		mutex_lock(&hd->mailbox_lock);
+		ret = hd60pro_mailbox_send_locked(hd, pkt8_hi, ARRAY_SIZE(pkt8_hi),
+						  HD60PRO_MBOX_TIMEOUT_US, NULL);
+		seq_printf(s, "gpio8=1 (mst3367_edid_reload) ret=%d\n", ret);
+		if (ret) { mutex_unlock(&hd->mailbox_lock); goto done; }
+		mutex_unlock(&hd->mailbox_lock);
+		msleep(300);  /* 300ms: MST3367 boots + reads 256-byte EDID from 0x66 over I2C */
+
+		/* Step 3: GPIO9 HPD pulse — MST3367 now has correct EDID in its RAM */
+		mutex_lock(&hd->mailbox_lock);
+		ret = hd60pro_mailbox_send_locked(hd, pkt9_hi, ARRAY_SIZE(pkt9_hi),
+						  HD60PRO_MBOX_TIMEOUT_US, NULL);
+		seq_printf(s, "gpio9=1 ret=%d\n", ret);
+		if (ret) { mutex_unlock(&hd->mailbox_lock); goto done; }
+		mutex_unlock(&hd->mailbox_lock);
+		msleep(150);  /* 150ms: HDMI spec >100ms for source to detect HPD */
+		mutex_lock(&hd->mailbox_lock);
+
+		ret = hd60pro_mailbox_send_locked(hd, pkt9_lo, ARRAY_SIZE(pkt9_lo),
+						  HD60PRO_MBOX_TIMEOUT_US, NULL);
+		seq_printf(s, "gpio9=0 ret=%d\n", ret);
+		if (ret) { mutex_unlock(&hd->mailbox_lock); goto done; }
+		mutex_unlock(&hd->mailbox_lock);
+		msleep(150);  /* 150ms LOW: source detects disconnect */
+		mutex_lock(&hd->mailbox_lock);
+
+		ret = hd60pro_mailbox_send_locked(hd, pkt9_hi, ARRAY_SIZE(pkt9_hi),
+						  HD60PRO_MBOX_TIMEOUT_US, NULL);
+		seq_printf(s, "gpio9=1 ret=%d\n", ret);
+		if (ret) { mutex_unlock(&hd->mailbox_lock); goto done; }
+		mutex_unlock(&hd->mailbox_lock);
+		msleep(300);  /* 300ms: source reads EDID from MST3367 + starts TMDS training */
+	}
+
+	if (ret)
+		goto done;
+
+	mutex_lock(&hd->mailbox_lock);
+
+	/* === Bank 0: initial config === */
+	MST_BSEL(0);
+	/* Input clock config */
+	MST_WR(0x13, 0x08);
+
+	/*
+	 * TMDS_HOT_PLUG(0) inline: GPIO1=HIGH, bank0[0xB7] &= ~0x02 (HPD off).
+	 * For our device (0x12ab:0380) arg=0 → GPIO1=1, clear B7 bit1.
+	 */
+	GPIO_WR(1, 1);
+	MST_RD(0xb7, val);
+	MST_WR(0xb7, val & 0xfdu);
+
+	/* Input path control */
+	MST_WR(0x41, 0x6f);
+	MST_WR(0xb8, 0x00);
+
+	/* Signal select/mux regs */
+	MST_WR(0x64, 0x02);
+	MST_WR(0x65, 0xff);
+	MST_WR(0x66, 0x00);
+	MST_WR(0x67, 0x02);
+
+	/* === Bank 1: TMDS clock/sync detector === */
+	MST_BSEL(1);
+	MST_WR(0x0f, 0x02);   /* bank1[0x0F] = 0x02 */
+	MST_WR(0x16, 0x30);   /* bank1[0x16] = 0x30 */
+	/* bank1[0x17/0x18/0x19]: TMDS EQ bias per-lane (LXV4L2D VMA 0x21b10-0x21b48).
+	 * Written to 0 for the standard path where context[6500]==1 (short cable). */
+	MST_WR(0x17, 0x00);   /* bank1[0x17] = 0x00 (lane0 EQ bias) */
+	MST_WR(0x18, 0x00);   /* bank1[0x18] = 0x00 (lane1 EQ bias) */
+	MST_WR(0x19, 0x00);   /* bank1[0x19] = 0x00 (lane2 EQ bias) */
+	MST_WR(0x1a, 0x50);   /* bank1[0x1A] = 0x50 */
+	MST_RD(0x2a, val);
+	MST_WR(0x2a, (val & 0xf8u) | 0x07u); /* bits[2:0] = 0b111 */
+	MST_WR(0x24, 0x40);   /* bank1[0x24] = 0x40 (bit0=0 → skip 5-iter loop) */
+	MST_WR(0x25, 0x00);
+	/* bit0 of bank1[0x24] is 0, so the 5-iteration loop at 0x21bf8 is skipped */
+	MST_WR(0x30, 0x80);
+	MST_WR(0x31, 0x00);
+	MST_WR(0x32, 0x00);
+
+	/* === Bank 2: TMDS PLL, HDCP/EQ === */
+	MST_BSEL(2);
+	MST_WR(0x08, 0x03);   /* bank2[0x08] = 0x03 */
+	MST_WR(0x01, 0x61);   /* TMDS PLL: 0x60 | 0x01 */
+	MST_WR(0x02, 0xf5);
+	MST_RD(0x03, val);
+	MST_WR(0x03, (val & 0xfdu) | 0x02u);
+	MST_WR(0x04, 0x01);
+	MST_WR(0x05, 0x00);
+	MST_WR(0x06, 0x08);
+	MST_WR(0x1c, 0x1a);
+	MST_WR(0x1d, 0x00);
+	MST_WR(0x1e, 0x00);
+	MST_WR(0x1f, 0x00);
+	MST_RD(0x25, val);
+	MST_WR(0x25, val | 0xa2u);
+	MST_RD(0x02, val);
+	MST_WR(0x02, val | 0x80u);
+	MST_RD(0x07, val);
+	MST_WR(0x07, (val & 0xfbu) | 0x04u);
+	MST_WR(0x17, 0x80);
+	MST_WR(0x19, 0xff);
+	MST_WR(0x1a, 0xff);
+	MST_WR(0x1b, 0xfc);
+	MST_WR(0x20, 0x00);
+	MST_RD(0x21, val);
+	MST_WR(0x21, val & 0xfcu);
+	MST_WR(0x22, 0x26);
+	MST_WR(0x27, 0x00);
+	MST_RD(0x2e, val);
+	MST_WR(0x2e, val | 0xa1u);
+
+	/* === Bank 0: more config (EQ, input bias, clock routing) === */
+	MST_BSEL(0);
+	MST_WR(0xb0, 0x14);
+	MST_RD(0xae, val);
+	MST_WR(0xae, (val & 0xfbu) | 0x04u);
+	MST_WR(0xad, 0x05);
+	MST_WR(0xb1, 0xc0);
+	MST_WR(0xb2, 0x00);
+	MST_WR(0xb3, 0x00);
+	MST_WR(0xb4, 0x55);
+	MST_RD(0xb4, val);
+	MST_WR(0xb4, val & 0xfcu);
+	/*
+	 * bank0[0xAB]/[0xAC]: sync input select / clock routing bits.
+	 * ARM64 HwInitialize at VMA 0x21f7c/0x21fa4 ORs in w21=0x15 (hardcoded
+	 * constant set at 0x21c40).  0x15 = bits 4,2,0 = select bits for the
+	 * HDMI input path.  Our previous code used 0x00 which left the path
+	 * unselected and caused the TMDS data lanes never to lock (0x56=0x00).
+	 */
+	MST_RD(0xab, val);
+	MST_WR(0xab, (val & 0x80u) | 0x15u);
+	MST_RD(0xac, val);
+	MST_WR(0xac, (val & 0xc0u) | 0x15u);
+
+	/*
+	 * TMDS_HOT_PLUG(0) again: GPIO1=HIGH, bank0[0xB7] &= ~0x02.
+	 * Called a second time before the reset sequence.
+	 */
+	GPIO_WR(1, 1);
+	MST_RD(0xb7, val);
+	MST_WR(0xb7, val & 0xfdu);
+
+	/*
+	 * HDCP_RESET: bank0[0xB8] = 0x10 then 0x00 (reset pulse).
+	 */
+	MST_WR(0xb8, 0x10);
+	MST_WR(0xb8, 0x00);
+
+	/*
+	 * HDMI_RESET: bank2[0x07] = 0xF4 then 0x04 (reset pulse).
+	 */
+	MST_BSEL(2);
+	MST_WR(0x07, 0xf4);
+	MST_WR(0x07, 0x04);
+	MST_BSEL(0);
+
+	/*
+	 * bank0[0x51] = 0x81: TMDS equalizer/termination control.
+	 * Written at LXV4L2D VMA 0x21ff4 just before TMDS_HOT_PLUG(3) and
+	 * MST3367_HDMI_INIT.  0x81 = bit7|bit0.  Missing this write leaves
+	 * the TMDS input path improperly terminated so the PLL cannot lock.
+	 */
+	MST_WR(0x51, 0x81);
+
+	/*
+	 * TMDS_HOT_PLUG(3): GPIO1=HIGH, bank0[0xB7] |= 0x02 (HPD on).
+	 * Then immediately overwritten to 0x00 per binary at 0x22018.
+	 */
+	GPIO_WR(1, 1);
+	MST_RD(0xb7, val);
+	MST_WR(0xb7, val | 0x02u);
+	MST_WR(0xb7, 0x00);  /* overwrite per HwInitialize+0x6d0 */
+
+	/*
+	 * === MST3367_HDMI_INIT (ARM64 VMA 0x121920) ===
+	 * Final step: configure HDMI PLL, signal path, and routing.
+	 */
+	/* Bank 2: HDMI PLL */
+	MST_BSEL(2);
+	MST_RD(0x01, val);
+	MST_WR(0x01, (val & 0x0fu) | 0x60u);
+	MST_RD(0x04, val);
+	MST_WR(0x04, (val & 0xfeu) | 0x01u);
+	MST_WR(0x06, 0x08);
+	MST_RD(0x09, val);
+	MST_WR(0x09, (val & 0xdfu) | 0x20u);
+	MST_BSEL(0);
+
+	/* Bank 0: HDMI signal path */
+	MST_RD(0x54, val);
+	MST_WR(0x54, val & 0xefu);    /* clear bit4: disable ADC, enable HDMI */
+	MST_RD(0xac, val);
+	MST_WR(0xac, val | 0x80u);    /* bit7: HDMI audio PLL enable (before soft reset) */
+
+	/*
+	 * Soft reset cycle: ARM64 HDMI_INIT at VMA 0x216ac/0x2172c.
+	 * MST_BSEL(0x80) = writes MST3367[0x00]=0x80 = soft reset SET + bank 0.
+	 * CEx/CF registers must be written DURING the soft reset so the chip
+	 * applies them when it exits reset.
+	 * MST_BSEL(0) = writes MST3367[0x00]=0x00 = soft reset CLEAR.
+	 * Note: word[3]=0x00 in cmd 0x1b is the bank-switch mechanism, which is
+	 * exactly how the MST3367 soft reset is triggered (writing reg 0x00).
+	 */
+	MST_BSEL(0x80);                              /* soft reset SET */
+	MST_RD(0xce, val);
+	MST_WR(0xce, val | 0x80u);                  /* during soft reset */
+	MST_RD(0xcf, val);
+	MST_WR(0xcf, (val & 0xf8u) | 0x02u);       /* during soft reset */
+	MST_BSEL(0);                                 /* soft reset CLEAR */
+
+	/*
+	 * Second soft-reset pass: write D0/CF (ARM64 HDMI_INIT VMA 0x21748).
+	 *
+	 * The ARM binary uses GetRegister(bank=128, reg) / SetRegister(bank=128, reg)
+	 * here. Each of those calls independently enters SR (writes reg[0x00]=0x80),
+	 * performs ONE register access, then exits SR (writes reg[0x00]=0x00).
+	 * The order is: GetD0, GetCF, SetD0, SetCF — reads come first, writes after.
+	 *
+	 * Using a single continuous SR window for all four operations produces
+	 * different chip behaviour: the CDR never starts because each SR exit is what
+	 * triggers the chip's internal CDR sequencer to advance one step.  Matching
+	 * the ARM binary's independent per-operation SR pulses is required.
+	 *
+	 * reg[0xD0] bits[1:0]=0x01 selects CDR frequency range.
+	 * reg[0xCF] bit7=0 means "format not yet detected" (default / initial).
+	 */
+	{
+		u8 val_d0 = 0, val_cf = 0;
+
+		/* Read D0 in its own SR pulse */
+		MST_BSEL(0x80); MST_RD(0xd0, val_d0); MST_BSEL(0);
+		/* Read CF in its own SR pulse */
+		MST_BSEL(0x80); MST_RD(0xcf, val_cf); MST_BSEL(0);
+		/* Write D0 in its own SR pulse (CDR freq range bits[1:0] = 0x01) */
+		MST_BSEL(0x80); MST_WR(0xd0, (val_d0 & 0xfcu) | 0x01u); MST_BSEL(0);
+		/* Write CF in its own SR pulse (clear bit7: format unknown) */
+		MST_BSEL(0x80); MST_WR(0xcf, val_cf & 0x7fu);            MST_BSEL(0);
+	}
+
+	/*
+	 * HwInitialize post-HDMI_INIT settle (ARM64 VMA 0x219e4):
+	 * After completing the full HDMI_INIT register write sequence (banks 0/1/2
+	 * plus soft-reset passes above), the ARM binary's HwInitialize waits
+	 * 499,488 µs ≈ 500ms before proceeding.  This allows the MST3367 PLL to
+	 * lock to the TMDS clock and the chip to stabilise before TMDS_RESET is
+	 * asserted.  Without this wait the CDR never acquires lock.
+	 *
+	 * ARM64 disassembly (HwInitialize VMA 0x219e4):
+	 *   mov w0, #0xa120
+	 *   movk w0, #0x7, lsl #16   → w0 = 0x7a120 = 499,488 µs
+	 *   bl udelay
+	 */
+	mutex_unlock(&hd->mailbox_lock);
+	msleep(500);   /* match ARM binary 500ms post-HDMI_INIT settle */
+	mutex_lock(&hd->mailbox_lock);
+
+	/*
+	 * MST3367_TMDS_RESET (ARM64 VMA 0x218b0):
+	 * After HDMI_INIT configures the CDR, the ARM binary calls TMDS_RESET
+	 * which asserts then releases a reset pulse on reg[0xB8].  Without this
+	 * pulse the CDR appears configured but never starts acquiring lock —
+	 * reg[0x56] stays 0x00 indefinitely even when TMDS clock is present.
+	 *
+	 * TMDS_RESET sequence (from disassembly):
+	 *   WriteReg(ctx, bank=0, reg=0xB8, val=0xFF)  → assert reset
+	 *   udelay(1,000,000)                           → hold 1 second
+	 *   WriteReg(ctx, bank=0, reg=0xB8, val=0x00)  → release reset
+	 *
+	 * ARM64 disassembly (TMDS_RESET VMA 0x218b4-0x218d8):
+	 *   mov w3, #0xffffffff   ← val=0xFF
+	 *   mov w2, #0xffffffb8   ← reg=0xB8
+	 *   mov w1, #0x0          ← bank=0
+	 *   bl write_reg_4arg
+	 *   mov w0, #0x4240       ← 16960
+	 *   movk w0, #0xf, lsl #16 ← w0 = 0x000F4240 = 999,488 µs ≈ 1 second
+	 *   bl udelay
+	 *   bl write_reg_4arg(ctx, bank=0, reg=0xB8, val=0x00)
+	 */
+	MST_WR(0xB8, 0xFF);   /* assert TMDS reset */
+	mutex_unlock(&hd->mailbox_lock);
+	msleep(1000);          /* hold 1000ms — ARM binary uses 999,488µs busywait */
+	mutex_lock(&hd->mailbox_lock);
+	MST_WR(0xB8, 0x00);   /* release TMDS reset → CDR starts acquisition */
+
+	/*
+	 * CDR_Reset (ARM64 VMA 0x1c538):
+	 * After TMDS_RESET, CDR_Reset performs a software CDR acquisition
+	 * trigger by cycling the CDR enable/disable path (regs 0x8C and 0x16)
+	 * and pulsing a reset bit (reg 0x05 bit0?, reg 0x73 bit3).
+	 *
+	 * CDR_Reset sequence decoded from ARM64:
+	 *   WriteReg(0x8C, 0x00)           → disable CDR output
+	 *   WriteReg(0x16, 0x00)           → disable CDR clock
+	 *   val=RdReg(0x97); WrReg(0x97, val|0x20)  → set acquisition mode bit
+	 *   WriteReg(0x05, 0x82)           → assert CDR reset
+	 *   val=RdReg(0x73); WrReg(0x73, val|0x08)  → pulse CDR trigger
+	 *   val=RdReg(0x97); WrReg(0x97, val&~0x20) → clear mode bit
+	 *   WriteReg(0x05, 0x00)           → de-assert CDR reset
+	 *   val=RdReg(0x73); WrReg(0x73, val&~0x08) → clear trigger
+	 *   WriteReg(0x8C, 0x20)           → re-enable CDR output
+	 *   WriteReg(0x16, 0x07)           → re-enable CDR clock (all 3 channels)
+	 */
+	{
+		u8 v97 = 0, v73 = 0;
+
+		MST_WR(0x8C, 0x00);   /* disable CDR output */
+		MST_WR(0x16, 0x00);   /* disable CDR clock */
+		MST_RD(0x97, v97);
+		MST_WR(0x97, v97 | 0x20u);   /* set acquisition mode bit5 */
+		MST_WR(0x05, 0x82);   /* assert CDR reset */
+		MST_RD(0x73, v73);
+		MST_WR(0x73, v73 | 0x08u);   /* pulse CDR trigger bit3 */
+		MST_RD(0x97, v97);
+		MST_WR(0x97, v97 & 0xDFu);   /* clear bit5 */
+		MST_WR(0x05, 0x00);   /* de-assert CDR reset */
+		MST_RD(0x73, v73);
+		MST_WR(0x73, v73 & 0xF7u);   /* clear trigger bit3 */
+		MST_WR(0x8C, 0x20);   /* re-enable CDR output */
+		MST_WR(0x16, 0x07);   /* re-enable CDR clock (channels 0,1,2) */
+	}
+
+	seq_puts(s, "init sequence complete\n");
+
+out_unlock:
+	mutex_unlock(&hd->mailbox_lock);
+
+#undef MST_BSEL
+#undef MST_WR
+#undef MST_RD
+#undef GPIO_WR
+
+	/*
+	 * ARM binary has schedule_timeout_interruptible(25ms) after HDMI_INIT
+	 * returns (VMA ~0x22044 in HwInitialize caller).  Give the CDR 25ms to
+	 * start acquiring lock before we read status registers.
+	 */
+	msleep(25);
+
+	/* Verify: read key registers after init + 25ms settle */
+	{
+		u8 v00 = 0, v51 = 0, v55 = 0, vac = 0, vab = 0, v56 = 0, v5e = 0;
+		u8 vce = 0, vcf = 0, vd0 = 0;
+		u32 p_00[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8, 0x9cu, 0x00, 0 };
+		u32 p_51[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8, 0x9cu, 0x51, 0 };
+		u32 p_ab[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8, 0x9cu, 0xab, 0 };
+		u32 p_ac[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8, 0x9cu, 0xac, 0 };
+		u32 p_55[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8, 0x9cu, 0x55, 0 };
+		u32 p_56[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8, 0x9cu, 0x56, 0 };
+		u32 p_5e[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8, 0x9cu, 0x5e, 0 };
+		u32 p_ce[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8, 0x9cu, 0xce, 0 };
+		u32 p_cf[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8, 0x9cu, 0xcf, 0 };
+		u32 p_d0[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8, 0x9cu, 0xd0, 0 };
+
+		mutex_lock(&hd->mailbox_lock);
+		hd60pro_mailbox_send_locked(hd, p_00, ARRAY_SIZE(p_00), HD60PRO_MBOX_TIMEOUT_US, NULL);
+		v00 = ioread32(base + 0x010) & 0xff;
+		hd60pro_mailbox_send_locked(hd, p_51, ARRAY_SIZE(p_51), HD60PRO_MBOX_TIMEOUT_US, NULL);
+		v51 = ioread32(base + 0x010) & 0xff;
+		hd60pro_mailbox_send_locked(hd, p_ab, ARRAY_SIZE(p_ab), HD60PRO_MBOX_TIMEOUT_US, NULL);
+		vab = ioread32(base + 0x010) & 0xff;
+		hd60pro_mailbox_send_locked(hd, p_ac, ARRAY_SIZE(p_ac), HD60PRO_MBOX_TIMEOUT_US, NULL);
+		vac = ioread32(base + 0x010) & 0xff;
+		hd60pro_mailbox_send_locked(hd, p_55, ARRAY_SIZE(p_55), HD60PRO_MBOX_TIMEOUT_US, NULL);
+		v55 = ioread32(base + 0x010) & 0xff;
+		hd60pro_mailbox_send_locked(hd, p_56, ARRAY_SIZE(p_56), HD60PRO_MBOX_TIMEOUT_US, NULL);
+		v56 = ioread32(base + 0x010) & 0xff;
+		hd60pro_mailbox_send_locked(hd, p_5e, ARRAY_SIZE(p_5e), HD60PRO_MBOX_TIMEOUT_US, NULL);
+		v5e = ioread32(base + 0x010) & 0xff;
+		hd60pro_mailbox_send_locked(hd, p_ce, ARRAY_SIZE(p_ce), HD60PRO_MBOX_TIMEOUT_US, NULL);
+		vce = ioread32(base + 0x010) & 0xff;
+		hd60pro_mailbox_send_locked(hd, p_cf, ARRAY_SIZE(p_cf), HD60PRO_MBOX_TIMEOUT_US, NULL);
+		vcf = ioread32(base + 0x010) & 0xff;
+		hd60pro_mailbox_send_locked(hd, p_d0, ARRAY_SIZE(p_d0), HD60PRO_MBOX_TIMEOUT_US, NULL);
+		vd0 = ioread32(base + 0x010) & 0xff;
+		mutex_unlock(&hd->mailbox_lock);
+
+		/* Also read new CDR_Reset registers */
+		u8 v16 = 0, v73 = 0, v8c = 0, v97 = 0, vb8 = 0;
+		u32 p_16[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8, 0x9cu, 0x16, 0 };
+		u32 p_73[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8, 0x9cu, 0x73, 0 };
+		u32 p_8c[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8, 0x9cu, 0x8c, 0 };
+		u32 p_97[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8, 0x9cu, 0x97, 0 };
+		u32 p_b8[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_READ8, 0x9cu, 0xb8, 0 };
+
+		mutex_lock(&hd->mailbox_lock);
+		hd60pro_mailbox_send_locked(hd, p_16, ARRAY_SIZE(p_16), HD60PRO_MBOX_TIMEOUT_US, NULL);
+		v16 = ioread32(base + 0x010) & 0xff;
+		hd60pro_mailbox_send_locked(hd, p_73, ARRAY_SIZE(p_73), HD60PRO_MBOX_TIMEOUT_US, NULL);
+		v73 = ioread32(base + 0x010) & 0xff;
+		hd60pro_mailbox_send_locked(hd, p_8c, ARRAY_SIZE(p_8c), HD60PRO_MBOX_TIMEOUT_US, NULL);
+		v8c = ioread32(base + 0x010) & 0xff;
+		hd60pro_mailbox_send_locked(hd, p_97, ARRAY_SIZE(p_97), HD60PRO_MBOX_TIMEOUT_US, NULL);
+		v97 = ioread32(base + 0x010) & 0xff;
+		hd60pro_mailbox_send_locked(hd, p_b8, ARRAY_SIZE(p_b8), HD60PRO_MBOX_TIMEOUT_US, NULL);
+		vb8 = ioread32(base + 0x010) & 0xff;
+		mutex_unlock(&hd->mailbox_lock);
+
+		seq_printf(s, "verify: reg[0x00]=0x%02x (expect 0x00: SR cleared, bank0)\n", v00);
+		seq_printf(s, "verify: reg[0x51]=0x%02x (expect 0x81 TMDS EQ term)\n", v51);
+		seq_printf(s, "verify: reg[0xAB]=0x%02x (bits[4,2,0] expect 0x15 set)\n", vab);
+		seq_printf(s, "verify: reg[0xAC]=0x%02x (bit7=HDMI_audio_PLL bits[4,2,0]=0x15)\n", vac);
+		seq_printf(s, "verify: reg[0x55]=0x%02x lock_bits[5:2]=0x%x %s\n",
+			   v55, (v55 >> 2) & 0xf,
+			   ((v55 & 0x3c) == 0x3c) ? "LOCKED" : "no lock yet");
+		seq_printf(s, "verify: reg[0x56]=0x%02x (TMDS sub-lock lanes)\n", v56);
+		seq_printf(s, "verify: reg[0x5E]=0x%02x (bit4=TMDS_clk_det)\n", v5e);
+		seq_printf(s, "verify: reg[0xCE]=0x%02x (expect bit7=1)  reg[0xCF]=0x%02x (expect bits[2:0]=0x02, bit7=0)  reg[0xD0]=0x%02x (expect bits[1:0]=0x01)\n",
+			   vce, vcf, vd0);
+		seq_printf(s, "verify: CDR_Reset: reg[0x16]=0x%02x(exp 0x07)  reg[0x8C]=0x%02x(exp 0x20)  reg[0x97]=0x%02x(bit5=0)  reg[0x73]=0x%02x(bit3=0)  reg[0xB8]=0x%02x(exp 0x00)\n",
+			   v16, v8c, v97, v73, vb8);
+	}
+
+	seq_printf(s, "result: %d\n", ret);
+done:
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_mst3367_hw_init);
+
+/*
+ * mst3367_hpd_on: write MST3367 bank0[0xb7] = 0x02 to assert the chip's own
+ * HPD output.  The hw_init sequence calls TMDS_HOT_PLUG(3) which momentarily
+ * sets b7 |= 0x02 then immediately clears it to 0x00.  This leaves the
+ * MST3367's HPD register de-asserted after init, which may prevent it from
+ * processing incoming TMDS traffic.  Writing 0x02 here tells the chip to
+ * assert HPD (bit1).
+ *
+ * Call this AFTER mst3367_hw_init and BEFORE hpd_pulse so that:
+ *   1. MST3367 is fully configured (hw_init)
+ *   2. MST3367's own HPD is asserted (this node)
+ *   3. GPIO9 HPD pulse causes the source to re-enumerate against a fully
+ *      configured chip that is ready to receive HDMI (hpd_pulse)
+ */
+static int hd60pro_mst3367_hpd_on_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	int ret = 0;
+	u32 completion = 0;
+	/* bank-select to bank 0 */
+	u32 bsel0[5] = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_PIPELINE_WRITE,
+			 0x9cu, 0x00u, 0x00u };
+	/* bank0[0xb7] = 0x02: assert MST3367 HPD output (bit1) */
+	u32 wb7[5]   = { HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_PIPELINE_WRITE,
+			 0x9cu, 0xb7u, 0x02u };
+
+	seq_puts(s, "mst3367_hpd_on: writing MST3367 bank0[0xb7]=0x02 (HPD assert) via cmd 0x1b\n");
+
+	if (!allow_mailbox_writes) {
+		seq_puts(s, "disabled; reload with allow_mailbox_writes=1\n");
+		return 0;
+	}
+
+	if (!base) {
+		seq_puts(s, "selected mailbox BAR is not mapped\n");
+		return 0;
+	}
+
+	mutex_lock(&hd->mailbox_lock);
+	ret = hd60pro_mailbox_send_locked(hd, bsel0, ARRAY_SIZE(bsel0),
+					  HD60PRO_MBOX_TIMEOUT_US, &completion);
+	seq_printf(s, "bsel0 ret=%d completion=0x%08x\n", ret, completion);
+	if (!ret) {
+		ret = hd60pro_mailbox_send_locked(hd, wb7, ARRAY_SIZE(wb7),
+						  HD60PRO_MBOX_TIMEOUT_US, &completion);
+		seq_printf(s, "b7=0x02 ret=%d completion=0x%08x\n", ret, completion);
+	}
+	mutex_unlock(&hd->mailbox_lock);
+
+	if (!ret)
+		seq_puts(s, "result: OK\n");
+	else
+		seq_printf(s, "result: FAILED ret=%d\n", ret);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_mst3367_hpd_on);
 
 static int hd60pro_logo_upload_plan_show(struct seq_file *s, void *unused)
 {
@@ -5101,7 +7161,7 @@ static int hd60pro_health_show(struct seq_file *s, void *unused)
 	seq_printf(s, "pipeline_ready: %d\n", hd->pipeline_ready);
 	seq_printf(s, "streaming: %d\n", hd->streaming);
 	seq_printf(s, "dma_desc_allocated: %d\n", hd->dma_desc_cpu != NULL);
-	seq_printf(s, "dma_frame_allocated: %d\n", hd->dma_frame_cpu != NULL);
+	seq_printf(s, "dma_frame_allocated: %d\n", hd->dma_frame_cpu[0] != NULL);
 	seq_printf(s, "mailbox_000: 0x%08x\n", mbox_000);
 	seq_printf(s, "mailbox_008: 0x%08x\n", mbox_008);
 	seq_printf(s, "mailbox_00c: 0x%08x\n", mbox_00c);
@@ -5131,22 +7191,73 @@ static int hd60pro_alloc_diag_dma(struct hd60pro_dev *hd)
 	hd->win_dma_control_size = HD60PRO_WINDOWS_DMA_CONTROL_BYTES;
 	hd->win_dma_status_size = HD60PRO_WINDOWS_DMA_STATUS_BYTES;
 
+	if (force_32bit_dma) {
+		if (dma_set_mask_and_coherent(&hd->pdev->dev, DMA_BIT_MASK(32)))
+			dev_warn(&hd->pdev->dev, "force_32bit_dma: failed to set 32-bit mask\n");
+		else
+			dev_info(&hd->pdev->dev, "force_32bit_dma: DMA mask set to 32-bit\n");
+	}
+
 	hd->dma_desc_cpu = dma_alloc_coherent(&hd->pdev->dev,
 					      hd->dma_desc_size,
 					      &hd->dma_desc_dma, GFP_KERNEL);
 	if (!hd->dma_desc_cpu)
 		return -ENOMEM;
 
-	hd->dma_frame_cpu = dma_alloc_coherent(&hd->pdev->dev,
-					       hd->dma_frame_size,
-					       &hd->dma_frame_dma, GFP_KERNEL);
-	if (!hd->dma_frame_cpu) {
-		dma_free_coherent(&hd->pdev->dev, hd->dma_desc_size,
-				  hd->dma_desc_cpu, hd->dma_desc_dma);
-		hd->dma_desc_cpu = NULL;
-		hd->dma_desc_dma = 0;
-		hd->dma_desc_size = 0;
-		return -ENOMEM;
+	{
+		/*
+		 * Allocate each ping-pong buffer separately.  The buddy allocator
+		 * max order on most systems is 4 MB (order-10), so a single
+		 * 16 MB contiguous allocation fails.  Firmware receives all four
+		 * addresses explicitly via cmd 0x02 and picks the right one from
+		 * BAR0[0x44] bits[1:0]; per-buffer addresses are correct even if
+		 * the blocks are not physically adjacent.
+		 *
+		 * We record dma_frame_total_size = buf_stride so the free path
+		 * knows how much to pass to dma_free_coherent per buffer.
+		 */
+		size_t buf_stride = hd->dma_frame_size + HD60PRO_DMA_HDR_SIZE;
+		int fi;
+
+		hd->dma_frame_total_size = buf_stride; /* per-buffer size for free */
+
+		for (fi = 0; fi < HD60PRO_DMA_BUF_COUNT; fi++) {
+			hd->dma_frame_cpu[fi] = dma_alloc_coherent(&hd->pdev->dev,
+								   buf_stride,
+								   &hd->dma_frame_dma[fi],
+								   GFP_KERNEL);
+			if (!hd->dma_frame_cpu[fi]) {
+				int fj;
+
+				for (fj = 0; fj < fi; fj++) {
+					dma_free_coherent(&hd->pdev->dev, buf_stride,
+							  hd->dma_frame_cpu[fj],
+							  hd->dma_frame_dma[fj]);
+					hd->dma_frame_cpu[fj] = NULL;
+					hd->dma_frame_dma[fj] = 0;
+				}
+				dma_free_coherent(&hd->pdev->dev, hd->dma_desc_size,
+						  hd->dma_desc_cpu, hd->dma_desc_dma);
+				hd->dma_desc_cpu = NULL;
+				hd->dma_desc_dma = 0;
+				hd->dma_desc_size = 0;
+				return -ENOMEM;
+			}
+		}
+
+		/* Log whether buffers happen to be contiguous (ideal for BAR5 window) */
+		if (hd->dma_frame_dma[1] == hd->dma_frame_dma[0] + buf_stride &&
+		    hd->dma_frame_dma[2] == hd->dma_frame_dma[0] + 2 * buf_stride &&
+		    hd->dma_frame_dma[3] == hd->dma_frame_dma[0] + 3 * buf_stride) {
+			dev_info(&hd->pdev->dev,
+				 "dma_frame: contiguous base=0x%llx stride=0x%zx\n",
+				 (u64)hd->dma_frame_dma[0], buf_stride);
+		} else {
+			dev_info(&hd->pdev->dev,
+				 "dma_frame: non-contiguous [0]=0x%llx [1]=0x%llx [2]=0x%llx [3]=0x%llx\n",
+				 (u64)hd->dma_frame_dma[0], (u64)hd->dma_frame_dma[1],
+				 (u64)hd->dma_frame_dma[2], (u64)hd->dma_frame_dma[3]);
+		}
 	}
 
 	hd->win_dma_control_cpu =
@@ -5174,7 +7285,13 @@ static int hd60pro_alloc_diag_dma(struct hd60pro_dev *hd)
 	}
 
 	memset(hd->dma_desc_cpu, 0, hd->dma_desc_size);
-	memset(hd->dma_frame_cpu, 0, hd->dma_frame_size);
+	{
+		size_t buf_stride = hd->dma_frame_size + HD60PRO_DMA_HDR_SIZE;
+		int fi;
+
+		for (fi = 0; fi < HD60PRO_DMA_BUF_COUNT; fi++)
+			memset(hd->dma_frame_cpu[fi], 0, buf_stride);
+	}
 	memset(hd->win_dma_control_cpu, 0, hd->win_dma_control_size);
 	memset(hd->win_dma_status_cpu, 0, hd->win_dma_status_size);
 	for (i = 0; i < HD60PRO_WINDOWS_DMA_CHANNELS; i++)
@@ -5184,7 +7301,7 @@ static int hd60pro_alloc_diag_dma(struct hd60pro_dev *hd)
 	desc = hd->dma_desc_cpu;
 	desc->magic = cpu_to_le32(HD60PRO_HOST_DESC_MAGIC);
 	desc->version = cpu_to_le32(HD60PRO_HOST_DESC_VERSION);
-	desc->frame_dma = cpu_to_le64(hd->dma_frame_dma);
+	desc->frame_dma = cpu_to_le64(hd->dma_frame_dma[0]);
 	desc->frame_bytes = cpu_to_le32(hd->dma_frame_size);
 	desc->width = cpu_to_le32(HD60PRO_DEFAULT_WIDTH);
 	desc->height = cpu_to_le32(HD60PRO_DEFAULT_HEIGHT);
@@ -5223,11 +7340,22 @@ err_free_control:
 	hd->win_dma_control_dma = 0;
 	hd->win_dma_control_size = 0;
 err_free_frame:
-	dma_free_coherent(&hd->pdev->dev, hd->dma_frame_size,
-			  hd->dma_frame_cpu, hd->dma_frame_dma);
-	hd->dma_frame_cpu = NULL;
-	hd->dma_frame_dma = 0;
-	hd->dma_frame_size = 0;
+	{
+		int fi;
+
+		for (fi = 0; fi < HD60PRO_DMA_BUF_COUNT; fi++) {
+			if (hd->dma_frame_cpu[fi]) {
+				dma_free_coherent(&hd->pdev->dev,
+						  hd->dma_frame_total_size,
+						  hd->dma_frame_cpu[fi],
+						  hd->dma_frame_dma[fi]);
+				hd->dma_frame_cpu[fi] = NULL;
+				hd->dma_frame_dma[fi] = 0;
+			}
+		}
+		hd->dma_frame_size = 0;
+		hd->dma_frame_total_size = 0;
+	}
 	dma_free_coherent(&hd->pdev->dev, hd->dma_desc_size,
 			  hd->dma_desc_cpu, hd->dma_desc_dma);
 	hd->dma_desc_cpu = NULL;
@@ -5270,12 +7398,21 @@ static void hd60pro_free_diag_dma(struct hd60pro_dev *hd)
 		hd->win_dma_control_size = 0;
 	}
 
-	if (hd->dma_frame_cpu) {
-		dma_free_coherent(&hd->pdev->dev, hd->dma_frame_size,
-				  hd->dma_frame_cpu, hd->dma_frame_dma);
-		hd->dma_frame_cpu = NULL;
-		hd->dma_frame_dma = 0;
+	if (hd->dma_frame_cpu[0]) {
+		int fi;
+
+		for (fi = 0; fi < HD60PRO_DMA_BUF_COUNT; fi++) {
+			if (hd->dma_frame_cpu[fi]) {
+				dma_free_coherent(&hd->pdev->dev,
+						  hd->dma_frame_total_size,
+						  hd->dma_frame_cpu[fi],
+						  hd->dma_frame_dma[fi]);
+				hd->dma_frame_cpu[fi] = NULL;
+				hd->dma_frame_dma[fi] = 0;
+			}
+		}
 		hd->dma_frame_size = 0;
+		hd->dma_frame_total_size = 0;
 	}
 
 	if (hd->dma_desc_cpu) {
@@ -5300,9 +7437,9 @@ static int hd60pro_dma_info_show(struct seq_file *s, void *unused)
 	seq_printf(s, "desc_cpu: %px\n", hd->dma_desc_cpu);
 	seq_printf(s, "desc_dma: %pad\n", &hd->dma_desc_dma);
 	seq_printf(s, "desc_size: %zu\n", hd->dma_desc_size);
-	seq_printf(s, "frame_allocated: %d\n", hd->dma_frame_cpu != NULL);
-	seq_printf(s, "frame_cpu: %px\n", hd->dma_frame_cpu);
-	seq_printf(s, "frame_dma: %pad\n", &hd->dma_frame_dma);
+	seq_printf(s, "frame_allocated: %d\n", hd->dma_frame_cpu[0] != NULL);
+	seq_printf(s, "frame_cpu[0]: %px\n", hd->dma_frame_cpu[0]);
+	seq_printf(s, "frame_dma[0]: %pad\n", &hd->dma_frame_dma[0]);
 	seq_printf(s, "frame_size: %zu\n", hd->dma_frame_size);
 	seq_printf(s, "windows_device_0xd0_control_cpu: %px\n",
 		   hd->win_dma_control_cpu);
@@ -5389,11 +7526,24 @@ static int hd60pro_capture_info_show(struct seq_file *s, void *unused)
 	seq_printf(s, "irq_requested: %d\n", hd->irq >= 0);
 	seq_printf(s, "irq_count: %u\n", hd->irq_count);
 	seq_printf(s, "mailbox_irq_count: %u\n", hd->mailbox_irq_count);
+	seq_printf(s, "dma_frame_count: %u\n", hd->dma_frame_count);
+	if (hd->bar0) {
+		seq_printf(s, "bar0_040_dma_field_flags: 0x%08x\n",
+			   ioread32(hd->bar0 + HD60PRO_REG_DMA_FIELD_FLAGS));
+		seq_printf(s, "bar0_044_dma_buf_idx: 0x%08x\n",
+			   ioread32(hd->bar0 + HD60PRO_REG_DMA_BUF_IDX));
+		seq_printf(s, "bar0_050_dma_ack: 0x%08x\n",
+			   ioread32(hd->bar0 + HD60PRO_REG_DMA_ACK_BASE));
+		seq_printf(s, "bar0_060: 0x%08x\n", ioread32(hd->bar0 + 0x060));
+		seq_printf(s, "bar0_064: 0x%08x\n", ioread32(hd->bar0 + 0x064));
+		seq_printf(s, "bar0_068: 0x%08x\n", ioread32(hd->bar0 + 0x068));
+		seq_printf(s, "bar0_06c: 0x%08x\n", ioread32(hd->bar0 + 0x06c));
+	}
 	seq_printf(s, "dma_buffers_prepared: %d\n",
-		   hd->dma_desc_cpu != NULL && hd->dma_frame_cpu != NULL);
+		   hd->dma_desc_cpu != NULL && hd->dma_frame_cpu[0] != NULL);
 	seq_printf(s, "dma_desc_dma: %pad\n", &hd->dma_desc_dma);
 	seq_printf(s, "dma_desc_size: %zu\n", hd->dma_desc_size);
-	seq_printf(s, "dma_frame_dma: %pad\n", &hd->dma_frame_dma);
+	seq_printf(s, "dma_frame_dma[0]: %pad\n", &hd->dma_frame_dma[0]);
 	seq_printf(s, "dma_frame_size: %zu\n", hd->dma_frame_size);
 	seq_printf(s, "windows_dma_control_prepared: %d\n",
 		   hd->win_dma_control_cpu != NULL);
@@ -5436,9 +7586,9 @@ static int hd60pro_endpoint_info_show(struct seq_file *s, void *unused)
 	seq_puts(s, "firmware_dmac_symbols: VPL_DMAC_SetMMRInfo SetupProfile StartHead StartTail IntrEnable IntrClear Reset\n");
 	seq_printf(s, "pipeline_ready_after_a2: %d\n", hd->pipeline_ready);
 	seq_printf(s, "host_dma_buffers_prepared: %d\n",
-		   hd->dma_desc_cpu != NULL && hd->dma_frame_cpu != NULL);
+		   hd->dma_desc_cpu != NULL && hd->dma_frame_cpu[0] != NULL);
 	seq_printf(s, "host_dma_desc_dma: %pad\n", &hd->dma_desc_dma);
-	seq_printf(s, "host_dma_frame_dma: %pad\n", &hd->dma_frame_dma);
+	seq_printf(s, "host_dma_frame_dma: %pad\n", &hd->dma_frame_dma[0]);
 	seq_printf(s, "bar5_payload0_0x40: 0x%08x\n", bar5_040);
 	seq_printf(s, "bar5_payload1_0x44: 0x%08x\n", bar5_044);
 	seq_printf(s, "bar5_payload2_0x48: 0x%08x\n", bar5_048);
@@ -5485,7 +7635,7 @@ static int hd60pro_direct_memory_info_show(struct seq_file *s, void *unused)
 	seq_printf(s, "linux_v4l2_frames_completed: %u\n", hd->sequence);
 	seq_printf(s, "linux_pipeline_ready_after_a2: %d\n", hd->pipeline_ready);
 	seq_printf(s, "linux_dma_buffers_prepared: %d\n",
-		   hd->dma_desc_cpu != NULL && hd->dma_frame_cpu != NULL);
+		   hd->dma_desc_cpu != NULL && hd->dma_frame_cpu[0] != NULL);
 	seq_printf(s, "linux_last_frame_sequence: %u\n",
 		   hd->last_frame_meta.sequence);
 	seq_printf(s, "linux_last_frame_timestamp_ns: %llu\n",
@@ -5533,7 +7683,7 @@ static int hd60pro_windows_directmemory_drain_path_show(struct seq_file *s,
 	seq_puts(s, "linux_status:\n");
 	seq_printf(s, "  pipeline_ready: %d\n", hd->pipeline_ready);
 	seq_printf(s, "  dma_buffers_prepared: %d\n",
-		   hd->dma_desc_cpu != NULL && hd->dma_frame_cpu != NULL);
+		   hd->dma_desc_cpu != NULL && hd->dma_frame_cpu[0] != NULL);
 	seq_printf(s, "  v4l2_frames_completed: %u\n", hd->sequence);
 	seq_printf(s, "  last_frame_payload_bytes: %u\n",
 		   hd->last_frame_meta.payload_bytes);
@@ -5640,10 +7790,10 @@ static int hd60pro_capture_start_plan_show(struct seq_file *s, void *unused)
 	seq_printf(s, "pci_bus_master_enabled: %d\n",
 		   !!(command & PCI_COMMAND_MASTER));
 	seq_printf(s, "dma_buffers_prepared: %d\n",
-		   hd->dma_desc_cpu != NULL && hd->dma_frame_cpu != NULL);
+		   hd->dma_desc_cpu != NULL && hd->dma_frame_cpu[0] != NULL);
 	seq_printf(s, "candidate_host_desc_dma: %pad\n", &hd->dma_desc_dma);
 	seq_printf(s, "candidate_host_desc_size: %zu\n", hd->dma_desc_size);
-	seq_printf(s, "candidate_host_frame_dma: %pad\n", &hd->dma_frame_dma);
+	seq_printf(s, "candidate_host_frame_dma: %pad\n", &hd->dma_frame_dma[0]);
 	seq_printf(s, "candidate_host_frame_size: %zu\n", hd->dma_frame_size);
 	if (desc) {
 		seq_printf(s, "candidate_host_desc_magic: 0x%08x\n",
@@ -5761,6 +7911,140 @@ static int hd60pro_set_vic_event_record_show(struct seq_file *s, void *unused)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(hd60pro_set_vic_event_record);
+
+/*
+ * send_set_vic: sends firmware commands 0x29 (SET_VIC_PARAMS) and 0x2a
+ * (POST_SET_VIC) via the mailbox for 1080p60 HDMI input.
+ *
+ * Packet layout derived from LXV4L2D_MZ0380.ko MZ0380_StartFirmware +
+ * MZ0380_SendVendorCommand_P5 decompilation:
+ *
+ * CMD 0x29 (11 words):
+ *   w[0] = 0x800 doorbell
+ *   w[1] = 0x29  cmd id
+ *   w[2] = color_space(6)<<24 | pixel_fmt(7)<<16 | fps(60)<<8 | chan(0)
+ *   w[3] = height(1080)<<16 | width(1920)
+ *   w[4] = 0 (progressive)
+ *   w[5] = 0x02000000 (nosg/pip: nosg_ch2=2, others=0)
+ *   w[6] = 0 (sync correction)
+ *   w[7] = height<<16 | width (display dims = input dims)
+ *   w[8] = fps<<24 | 0 | buf_count(1)<<8 | pip_mode(1)
+ *   w[9] = 0 (OSD)
+ *   w[10]= color matrix: Cb_off(0x6e)<<24|Y_ref(0xf0)<<16|chroma_en(1)|Cr_off(0x29)<<8
+ *
+ * CMD 0x2a (6 words):
+ *   w[0] = 0x800 doorbell
+ *   w[1] = 0x2a  cmd id
+ *   w[2] = chan(0) | buf_fmt(2)<<8 | 0x100000
+ *   w[3] = audio_sample_rate (48000)
+ *   w[4] = dma_buf_count(8)<<16 | 0x100
+ *   w[5] = dma_flags: enable(1)<<8
+ */
+static int hd60pro_send_set_vic_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	u32 completion = 0;
+	int ret;
+
+	/* 1080p60 HDMI SET_VIC_PARAMS */
+	u32 set_vic[11] = {
+		HD60PRO_MBOX_DOORBELL,	/* [0] doorbell */
+		0x00000029,		/* [1] cmd SET_VIC_PARAMS */
+		0x06073c00,		/* [2] color_space=6|pixel_fmt=7|fps=60|chan=0 */
+		0x04380780,		/* [3] height=1080<<16|width=1920 */
+		0x00000000,		/* [4] progressive */
+		0x02000000,		/* [5] pip/nosg params */
+		0x00000000,		/* [6] sync correction */
+		0x04380780,		/* [7] display dims = input dims */
+		0x3c000101,		/* [8] fps=60<<24|buf_count=1<<8|pip_mode=1 */
+		0x00000000,		/* [9] OSD */
+		0x6ef02901,		/* [10] color matrix defaults */
+	};
+
+	/* POST_SET_VIC stream notify */
+	u32 post_vic[6] = {
+		HD60PRO_MBOX_DOORBELL,	/* [0] doorbell */
+		0x0000002a,		/* [1] cmd POST_SET_VIC */
+		0x00100200,		/* [2] chan=0|buf_fmt=2<<8|0x100000 */
+		0x0000bb80,		/* [3] audio_sample_rate=48000 */
+		0x00080100,		/* [4] dma_buf_count=8<<16|0x100 */
+		0x00000100,		/* [5] dma enable */
+	};
+
+	seq_puts(s, "send_set_vic: sending SET_VIC_PARAMS(0x29) + POST_SET_VIC(0x2a) for 1080p60 HDMI\n");
+	seq_puts(s, "source: MZ0380_StartFirmware + MZ0380_SendVendorCommand_P5 decompile\n");
+	seq_puts(s, "note: 0x29 uses IRQ-based completion in Windows (MZ0380_WaitInterruptComplete),\n");
+	seq_puts(s, "      not BAR0[0x2c] polling; we ignore timeout and proceed to 0x2a anyway\n");
+
+	if (!hd->pipeline_ready) {
+		seq_puts(s, "result: BLOCKED pipeline_ready=0\n");
+		return 0;
+	}
+
+	seq_printf(s, "irq_count_before: %u mailbox_irq_before: %u\n",
+		   hd->irq_count, hd->mailbox_irq_count);
+
+	mutex_lock(&hd->mailbox_lock);
+
+	/*
+	 * Cmd 0x29 uses interrupt-based completion in the original driver
+	 * (SendVendorCommand_P5 param_4=1 → MZ0380_WaitInterruptComplete).
+	 * BAR0[0x2c] polling times out — that is expected. The firmware did
+	 * receive the packet (values appear in BAR0[0x008/0x00c]).
+	 * Proceed to 0x2a regardless of the timeout.
+	 */
+	ret = hd60pro_mailbox_send_locked(hd, set_vic, ARRAY_SIZE(set_vic),
+					  HD60PRO_MBOX_TIMEOUT_US, &completion);
+	seq_printf(s, "set_vic_0x29 ret=%d (ETIMEDOUT expected) completion=0x%08x\n",
+		   ret, completion);
+	seq_printf(s, "  bar0_004=0x%08x bar0_008=0x%08x bar0_00c=0x%08x\n",
+		   ioread32(base + 0x004), ioread32(base + 0x008),
+		   ioread32(base + 0x00c));
+	seq_printf(s, "  bar0_010=0x%08x bar0_014=0x%08x bar0_028=0x%08x bar0_02c=0x%08x\n",
+		   ioread32(base + 0x010), ioread32(base + 0x014),
+		   ioread32(base + 0x028), ioread32(base + 0x02c));
+
+	/* small delay to let firmware process 0x29 before sending 0x2a */
+	mutex_unlock(&hd->mailbox_lock);
+	msleep(200);
+	mutex_lock(&hd->mailbox_lock);
+
+	seq_printf(s, "irq_count_after_0x29_200ms: %u mailbox_irq: %u\n",
+		   hd->irq_count, hd->mailbox_irq_count);
+	seq_printf(s, "  bar0_02c_after_delay: 0x%08x\n",
+		   ioread32(base + 0x02c));
+
+	ret = hd60pro_mailbox_send_locked(hd, post_vic, ARRAY_SIZE(post_vic),
+					  HD60PRO_MBOX_TIMEOUT_US, &completion);
+	seq_printf(s, "post_vic_0x2a ret=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x bar0_02c=0x%08x\n",
+		   ret, completion,
+		   ioread32(base + 0x008), ioread32(base + 0x00c),
+		   ioread32(base + 0x010), ioread32(base + 0x02c));
+
+	/* check BAR5 for any DMA/interrupt state changes */
+	if (hd->bar5) {
+		seq_printf(s, "  bar5_018=0x%08x bar5_01c=0x%08x bar5_030=0x%08x bar5_044=0x%08x\n",
+			   ioread32(hd->bar5 + 0x018),
+			   ioread32(hd->bar5 + 0x01c),
+			   ioread32(hd->bar5 + 0x030),
+			   ioread32(hd->bar5 + 0x044));
+	}
+
+	mutex_unlock(&hd->mailbox_lock);
+
+	msleep(500);
+	seq_printf(s, "irq_count_final_500ms_later: %u mailbox_irq: %u\n",
+		   hd->irq_count, hd->mailbox_irq_count);
+	if (hd->bar5) {
+		seq_printf(s, "  bar5_030_final: 0x%08x bar5_044_final: 0x%08x\n",
+			   ioread32(hd->bar5 + 0x030),
+			   ioread32(hd->bar5 + 0x044));
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_send_set_vic);
 
 static int hd60pro_endpoint_transport_plan_show(struct seq_file *s,
 						void *unused)
@@ -5993,7 +8277,7 @@ static int hd60pro_windows_buffer_queue_info_show(struct seq_file *s,
 	seq_printf(s, "  dma_buffers_prepared: %d\n", !!desc);
 	if (desc) {
 		seq_printf(s, "  linux_desc_dma: %pad\n", &hd->dma_desc_dma);
-		seq_printf(s, "  linux_frame_dma: %pad\n", &hd->dma_frame_dma);
+		seq_printf(s, "  linux_frame_dma: %pad\n", &hd->dma_frame_dma[0]);
 		seq_printf(s, "  linux_frame_size: %zu\n", hd->dma_frame_size);
 		seq_printf(s, "  modeled_stream_8144: 0x%08x\n",
 			   le32_to_cpu(desc->windows_stream_8144));
@@ -6032,7 +8316,7 @@ static int hd60pro_windows_frame_producer_search_show(struct seq_file *s,
 	seq_printf(s, "  dma_buffers_prepared: %d\n", !!desc);
 	if (desc) {
 		seq_printf(s, "  linux_desc_dma: %pad\n", &hd->dma_desc_dma);
-		seq_printf(s, "  linux_frame_dma: %pad\n", &hd->dma_frame_dma);
+		seq_printf(s, "  linux_frame_dma: %pad\n", &hd->dma_frame_dma[0]);
 		seq_printf(s, "  linux_frame_size: %zu\n", hd->dma_frame_size);
 		seq_printf(s, "  descriptor_magic: 0x%08x\n",
 			   le32_to_cpu(desc->magic));
@@ -6066,7 +8350,7 @@ static int hd60pro_windows_external_buffer_info_show(struct seq_file *s,
 	seq_printf(s, "  dma_buffers_prepared: %d\n", !!desc);
 	if (desc) {
 		seq_printf(s, "  linux_candidate_frame_dma: %pad\n",
-			   &hd->dma_frame_dma);
+			   &hd->dma_frame_dma[0]);
 		seq_printf(s, "  linux_candidate_frame_size: %zu\n",
 			   hd->dma_frame_size);
 		seq_printf(s, "  windows_live_external_alloc_size: 0x%08x\n",
@@ -6128,7 +8412,7 @@ static int hd60pro_windows_dma_mapping_info_show(struct seq_file *s,
 	if (desc) {
 		seq_printf(s, "  linux_desc_dma: %pad\n", &hd->dma_desc_dma);
 		seq_printf(s, "  linux_desc_size: %zu\n", hd->dma_desc_size);
-		seq_printf(s, "  linux_frame_dma: %pad\n", &hd->dma_frame_dma);
+		seq_printf(s, "  linux_frame_dma: %pad\n", &hd->dma_frame_dma[0]);
 		seq_printf(s, "  linux_frame_size: %zu\n", hd->dma_frame_size);
 	}
 	seq_puts(s, "next_static_reverse_targets: xrefs to device+0xc8/+0xd0/+0x138/+0x140/+0x190/+0x1190 after 0x14028d83d and any mailbox/BAR write that carries those physical addresses\n");
@@ -6171,7 +8455,7 @@ static int hd60pro_windows_dma_publish_search_show(struct seq_file *s,
 	seq_printf(s, "  pci_bus_master_enabled: %d\n",
 		   !!(command & PCI_COMMAND_MASTER));
 	seq_printf(s, "  dma_desc_prepared: %d\n", hd->dma_desc_cpu ? 1 : 0);
-	seq_printf(s, "  dma_frame_prepared: %d\n", hd->dma_frame_cpu ? 1 : 0);
+	seq_printf(s, "  dma_frame_prepared: %d\n", hd->dma_frame_cpu[0] ? 1 : 0);
 	seq_printf(s, "  windows_dma_control_prepared: %d\n",
 		   hd->win_dma_control_cpu ? 1 : 0);
 	seq_printf(s, "  windows_dma_status_prepared: %d\n",
@@ -6373,7 +8657,7 @@ static int hd60pro_windows_stream_callback_search_show(struct seq_file *s,
 	seq_printf(s, "  pipeline_ready: %d\n", hd->pipeline_ready);
 	seq_printf(s, "  v4l2_registered: %d\n", enable_v4l2);
 	seq_printf(s, "  synthetic_v4l2: %d\n", synthetic_v4l2);
-	seq_printf(s, "  dma_buffers_prepared: %d\n", hd->dma_frame_cpu ? 1 : 0);
+	seq_printf(s, "  dma_buffers_prepared: %d\n", hd->dma_frame_cpu[0] ? 1 : 0);
 	seq_printf(s, "  real_capture_programmed: 0\n");
 
 	return 0;
@@ -6540,6 +8824,125 @@ static int hd60pro_firmware_pcie_outbound_regs_show(struct seq_file *s,
 }
 DEFINE_SHOW_ATTRIBUTE(hd60pro_firmware_pcie_outbound_regs);
 
+/*
+ * bar5_dma_program: directly program the PCIe endpoint outbound window from
+ * the host side, mirroring what ep.ko pcie_set_outbound does from firmware.
+ *
+ * After cmds 0x29/0x2a/0x06 succeed, the firmware wants to DMA frames to
+ * host RAM, but BAR5[0x054/0x058] (outbound target address) remain 0 —
+ * the firmware never calls pcie_set_outbound because it doesn't know where
+ * to send frames. We replicate pcie_set_outbound from the host:
+ *
+ *   BAR5[0x050] = 0x00000001  (enable outbound window)
+ *   BAR5[0x074] = 0x90000000  (endpoint-space base for outbound)
+ *   BAR5[0x07c] = 0x91ffffff  (endpoint-space limit)
+ *   BAR5[0x054] = frame_dma_low   (host physical address low 32 bits)
+ *   BAR5[0x058] = frame_dma_high  (host physical address high 32 bits)
+ *
+ * Requires: allow_mailbox_writes=1 (uses same gate), dma_frame_dma != 0.
+ * After reading this file, trigger STREAMON and watch for bit-0 frame IRQs.
+ */
+static int hd60pro_bar5_dma_program_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	u32 frame_low, frame_high;
+	u32 r050, r054, r058, r074, r07c;
+
+	if (!hd->bar5) {
+		seq_puts(s, "bar5_dma_program: BAR5 not mapped\n");
+		return 0;
+	}
+	if (!hd->dma_frame_dma[0]) {
+		seq_puts(s, "bar5_dma_program: no dma_frame_dma (run init first)\n");
+		return 0;
+	}
+	if (!allow_mailbox_writes) {
+		seq_puts(s, "bar5_dma_program: blocked; reload with allow_mailbox_writes=1\n");
+		return 0;
+	}
+
+	frame_low  = (u32)(hd->dma_frame_dma[0] & 0xffffffffULL);
+	frame_high = (u32)(hd->dma_frame_dma[0] >> 32);
+
+	seq_printf(s, "bar5_dma_program: frame_dma=0x%016llx low=0x%08x high=0x%08x\n",
+		   (unsigned long long)hd->dma_frame_dma[0], frame_low, frame_high);
+	seq_puts(s, "bar5_dma_program: reading before...\n");
+	seq_printf(s, "  bar5_050=0x%08x bar5_054=0x%08x bar5_058=0x%08x\n",
+		   ioread32(hd->bar5 + 0x050),
+		   ioread32(hd->bar5 + 0x054),
+		   ioread32(hd->bar5 + 0x058));
+	seq_printf(s, "  bar5_074=0x%08x bar5_07c=0x%08x bar5_0d4=0x%08x\n",
+		   ioread32(hd->bar5 + 0x074),
+		   ioread32(hd->bar5 + 0x07c),
+		   ioread32(hd->bar5 + 0x0d4));
+
+	/* Program outbound window (mirrors firmware ep.ko pcie_set_outbound) */
+	iowrite32(0x90000000, hd->bar5 + 0x074);
+	iowrite32(0x91ffffff, hd->bar5 + 0x07c);
+	iowrite32(frame_low,  hd->bar5 + 0x054);
+	iowrite32(frame_high, hd->bar5 + 0x058);
+	iowrite32(0x00000001, hd->bar5 + 0x050);
+	/* pcie_set_outbound also writes +0xd4 = 0x0f000000 */
+	iowrite32(0x0f000000, hd->bar5 + 0x0d4);
+
+	seq_puts(s, "bar5_dma_program: written, reading after...\n");
+	r050 = ioread32(hd->bar5 + 0x050);
+	r054 = ioread32(hd->bar5 + 0x054);
+	r058 = ioread32(hd->bar5 + 0x058);
+	r074 = ioread32(hd->bar5 + 0x074);
+	r07c = ioread32(hd->bar5 + 0x07c);
+	seq_printf(s, "  bar5_050=0x%08x bar5_054=0x%08x bar5_058=0x%08x\n",
+		   r050, r054, r058);
+	seq_printf(s, "  bar5_074=0x%08x bar5_07c=0x%08x bar5_0d4=0x%08x\n",
+		   r074, r07c, ioread32(hd->bar5 + 0x0d4));
+	seq_printf(s, "bar5_dma_program: outbound window %s (054/058 sticky: %s)\n",
+		   (r050 & 1) ? "enabled" : "NOT enabled (050 bit0 clear)",
+		   (r054 == frame_low && r058 == frame_high) ? "YES" : "NO (may be read-only from host)");
+	seq_puts(s, "bar5_dma_program: now start streaming and watch for bit-0 IRQs\n");
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_bar5_dma_program);
+
+/*
+ * frame_buffer_peek: dump first 256 bytes of the DMA frame buffer via
+ * CPU virtual address. If the firmware DMA'd anything, it shows here.
+ * All zeros = firmware hasn't written yet; non-zero = DMA is working.
+ */
+static int hd60pro_frame_buffer_peek_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	const u8 *buf;
+	unsigned int i;
+	bool any_nonzero = false;
+
+	if (!hd->dma_frame_cpu[0]) {
+		seq_puts(s, "frame_buffer_peek: no DMA frame buffer\n");
+		return 0;
+	}
+
+	buf = (const u8 *)hd->dma_frame_cpu[0];
+	seq_printf(s, "frame_buffer_peek: dma_frame_dma[0]=0x%016llx size=%zu\n",
+		   (unsigned long long)hd->dma_frame_dma[0], hd->dma_frame_size);
+
+	for (i = 0; i < 256; i++) {
+		if (buf[i])
+			any_nonzero = true;
+	}
+	seq_printf(s, "frame_buffer_peek: first 256 bytes %s\n",
+		   any_nonzero ? "have non-zero content (DMA working!)" : "are all zero (no DMA yet)");
+
+	for (i = 0; i < 256; i += 16) {
+		seq_printf(s, "%04x: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
+			   i,
+			   buf[i+ 0], buf[i+ 1], buf[i+ 2], buf[i+ 3],
+			   buf[i+ 4], buf[i+ 5], buf[i+ 6], buf[i+ 7],
+			   buf[i+ 8], buf[i+ 9], buf[i+10], buf[i+11],
+			   buf[i+12], buf[i+13], buf[i+14], buf[i+15]);
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_frame_buffer_peek);
+
 static int hd60pro_firmware_dmac_outbound_path_show(struct seq_file *s,
 						    void *unused)
 {
@@ -6570,7 +8973,7 @@ static int hd60pro_firmware_dmac_outbound_path_show(struct seq_file *s,
 	seq_printf(s, "  pipeline_ready: %d\n", hd->pipeline_ready);
 	seq_printf(s, "  v4l2_synthetic_frames: %d\n", synthetic_v4l2);
 	seq_printf(s, "  dma_buffers_prepared: %d\n",
-		   hd->dma_desc_cpu && hd->dma_frame_cpu);
+		   hd->dma_desc_cpu && hd->dma_frame_cpu[0]);
 	seq_printf(s, "  real_dma_programmed: 0\n");
 
 	return 0;
@@ -7343,18 +9746,249 @@ static void hd60pro_return_queued_buffers(struct hd60pro_dev *hd,
 	spin_unlock_irqrestore(&hd->queued_lock, flags);
 }
 
+/*
+ * hd60pro_frame_tasklet - deliver one captured frame to vb2.
+ *
+ * Called from IRQ context (softirq) when BAR0[0x30] bit 0 fires.
+ * Flow from LXV4L2D_MZ0380.ko decompilation:
+ *   1. Read BAR0[0x44] bits[1:0] → active ping-pong buffer index (0-3).
+ *   2. Frame payload starts at BAR0 + dma_bar0_frame_offset
+ *      + buf_idx * frame_size + HD60PRO_DMA_HDR_SIZE.
+ *   3. memcpy_fromio into the vb2 vmalloc buffer.
+ *   4. ACK: write 0 to BAR0[0x50 + buf_idx * 4].
+ *
+ * If dma_bar0_frame_offset is wrong the frame will be garbage (or zeros).
+ * Adjust the module parameter until dmesg shows increasing frame counts
+ * and ffplay shows a real picture.
+ */
+static void hd60pro_frame_tasklet(unsigned long priv)
+{
+	struct hd60pro_dev *hd = (struct hd60pro_dev *)priv;
+	void __iomem *base = hd->bar0;
+	unsigned int frame_size = hd60pro_frame_size();
+	u32 buf_idx;
+	struct hd60pro_buffer *buf;
+	void *vaddr;
+	unsigned long flags;
+	u64 timestamp;
+	u32 sequence;
+
+	if (!base || !hd->dma_capture_active)
+		return;
+
+	/* BAR0[0x44] bits[1:0] = which ping-pong buffer is ready */
+	buf_idx = ioread32(base + HD60PRO_REG_DMA_BUF_IDX) & (HD60PRO_DMA_BUF_COUNT - 1);
+
+	/*
+	 * Per-channel ACK register: for single-channel HD60 Pro (channel 0),
+	 * the ACK byte is always at BAR0[0x50] (channel + 0x50 with channel=0).
+	 * Windows driver MZ0380_HwProcessAnalogPCIPacket writes 0 here after
+	 * copying each frame, and does NOT gate the copy on the ACK value.
+	 */
+	spin_lock_irqsave(&hd->queued_lock, flags);
+	if (list_empty(&hd->queued_bufs) || !hd->streaming) {
+		spin_unlock_irqrestore(&hd->queued_lock, flags);
+		/* ACK so hardware can reuse the buffer slot */
+		iowrite8(0, base + HD60PRO_REG_DMA_ACK_BASE);
+		return;
+	}
+	buf = list_first_entry(&hd->queued_bufs, struct hd60pro_buffer, list);
+	list_del(&buf->list);
+	sequence = hd->sequence++;
+	spin_unlock_irqrestore(&hd->queued_lock, flags);
+
+	timestamp = ktime_get_ns();
+	vaddr = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
+
+	/*
+	 * Frame payload is in the host DMA buffer, NOT in BAR0 SRAM.
+	 * Firmware DMAes pixel data via the BAR5 outbound window to
+	 * dma_frame_cpu[buf_idx] + HD60PRO_DMA_HDR_SIZE (4KB header offset).
+	 * Windows driver (MZ0380_HwProcessAnalogPCIPacket):
+	 *   func_0x002100d0(vb2_buf, dma_buf + 0x1000, payload_bytes)
+	 *   *dma_buf = 0   (clear header dword so firmware knows host consumed frame)
+	 *   BAR0[channel + 0x50] = 0  (ACK channel 0)
+	 */
+	if (hd->dma_frame_cpu[buf_idx]) {
+		u8 *dma_buf = (u8 *)hd->dma_frame_cpu[buf_idx];
+
+		memcpy(vaddr, dma_buf + HD60PRO_DMA_HDR_SIZE, frame_size);
+		/* Clear first dword of DMA header so firmware can detect reuse */
+		*(u32 *)dma_buf = 0;
+	} else {
+		hd60pro_fill_synthetic_frame(vaddr, frame_size);
+	}
+
+	/* ACK channel 0 so firmware can write the next frame */
+	iowrite8(0, base + HD60PRO_REG_DMA_ACK_BASE);
+
+	vb2_set_plane_payload(&buf->vb.vb2_buf, 0, frame_size);
+	buf->vb.sequence = sequence;
+	buf->vb.field = HD60PRO_DEFAULT_FIELD;
+	buf->vb.vb2_buf.timestamp = timestamp;
+	hd->last_frame_meta.timestamp_ns = timestamp;
+	hd->last_frame_meta.duration_ns = HD60PRO_DEFAULT_FRAME_PERIOD_NS;
+	hd->last_frame_meta.payload_bytes = frame_size;
+	hd->last_frame_meta.flags = 0x00000100;
+	hd->last_frame_meta.extra = 0;
+	hd->last_frame_meta.sequence = sequence;
+	hd->dma_frame_count++;
+	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+
+	dev_info_ratelimited(&hd->pdev->dev,
+			     "frame: buf_idx=%u seq=%u total=%u\n",
+			     buf_idx, sequence, hd->dma_frame_count);
+}
+
 static int hd60pro_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct hd60pro_dev *hd = vb2_get_drv_priv(q);
+	int ret = 0;
 
 	hd->streaming = true;
+
+	if (allow_dma_capture && hd->bar0 && hd->irq >= 0) {
+		void __iomem *base = hd->bar0;
+		u32 completion = 0, irq_delta = 0;
+
+		pci_set_master(hd->pdev);
+
+		/*
+		 * Clear channel-0 ACK at BAR0[0x50].  Windows driver writes 0 here
+		 * after each frame (MZ0380_HwProcessAnalogPCIPacket line 291:
+		 * BAR0[channel + 0x50] = 0, where channel = 0 for HD60 Pro).
+		 * Also zero out the surrounding dword for safety.
+		 */
+		iowrite32(0, base + HD60PRO_REG_DMA_ACK_BASE);
+
+		hd->dma_frame_count = 0;
+		hd->pending_frame_status = 0;
+		hd->dma_capture_active = true;
+
+		mutex_lock(&hd->mailbox_lock);
+
+		/* Step 1: cmd 0x29 SET_VIC — tell firmware video format */
+		{
+			const u32 setvic[] = {
+				HD60PRO_MBOX_DOORBELL,
+				HD60PRO_EP_CMD_SET_VIC_PARAMS,
+				0x06073c00,  /* color_space=6|pixel_fmt=7|fps=60|chan=0 */
+				0x04380780,  /* height=1080<<16|width=1920 */
+				0x00000000,  /* progressive */
+				0x02000000,  /* pip/nosg params */
+				0x00000000,  /* sync correction */
+				0x04380780,  /* display dims = input dims */
+				0x3c000101,  /* fps<<24|buf_count=1<<8|pip_mode=1 */
+				0x00000000,  /* OSD */
+				0x6ef02901,  /* color matrix: Cb=0x6e,Y=0xf0,Cr=0x29 */
+			};
+
+			iowrite32(0, base + HD60PRO_REG_MBOX_COMPLETE);
+			ret = hd60pro_mailbox_send_async_locked(hd, setvic,
+								ARRAY_SIZE(setvic),
+								15000, &completion, &irq_delta);
+			if (ret && ret != -ETIMEDOUT)
+				goto unlock_streaming;
+			dev_info(&hd->pdev->dev,
+				 "start_streaming: cmd 0x29 ret=%d irq_delta=%u\n",
+				 ret, irq_delta);
+			ret = 0;
+		}
+
+		/* Step 2: cmd 0x2a stream notify */
+		{
+			const u32 notify[] = {
+				HD60PRO_MBOX_DOORBELL,
+				HD60PRO_EP_CMD_POST_SET_VIC,
+				0x00100200,  /* ch=0 | (2<<8) | 0x100000 */
+				0x0000bb80,  /* audio_sample_rate=48000 */
+				0x00080100,  /* iVar22=8<<16 | 0x100 */
+				0x00000100,  /* uVar28=1<<8 */
+			};
+
+			iowrite32(0, base + HD60PRO_REG_MBOX_COMPLETE);
+			ret = hd60pro_mailbox_send_async_locked(hd, notify,
+								ARRAY_SIZE(notify),
+								15000, &completion, &irq_delta);
+			if (ret && ret != -ETIMEDOUT)
+				goto unlock_streaming;
+			dev_info(&hd->pdev->dev,
+				 "start_streaming: cmd 0x2a ret=%d irq_delta=%u\n",
+				 ret, irq_delta);
+			ret = 0;
+		}
+
+		/* Step 3: cmd 0x02 — advertise 4 DMA buffer addresses */
+		if (hd->dma_frame_dma[0]) {
+			u32 pkt02[12];
+			unsigned int frame_size = hd60pro_frame_size();
+
+			pkt02[0]  = HD60PRO_MBOX_DOORBELL;
+			pkt02[1]  = 0x02;
+			pkt02[2]  = 0;
+			pkt02[3]  = frame_size;
+			pkt02[4]  = 0;
+			pkt02[5]  = (u32)(hd->dma_frame_dma[0] & 0xffffffffULL);
+			pkt02[6]  = 0;
+			pkt02[7]  = (u32)(hd->dma_frame_dma[1] & 0xffffffffULL);
+			pkt02[8]  = 0;
+			pkt02[9]  = (u32)(hd->dma_frame_dma[2] & 0xffffffffULL);
+			pkt02[10] = 0;
+			pkt02[11] = (u32)(hd->dma_frame_dma[3] & 0xffffffffULL);
+
+			iowrite32(0, base + HD60PRO_REG_MBOX_COMPLETE);
+			ret = hd60pro_mailbox_send_async_locked(hd, pkt02,
+								ARRAY_SIZE(pkt02),
+								15000, &completion, &irq_delta);
+			if (ret && ret != -ETIMEDOUT)
+				goto unlock_streaming;
+			dev_info(&hd->pdev->dev,
+				 "start_streaming: cmd 0x02 ret=%d irq_delta=%u completion=0x%08x\n",
+				 ret, irq_delta, completion);
+			ret = 0;
+		}
+
+		/* Step 4: cmd 0x06 stream start */
+		{
+			const u32 start[] = {
+				HD60PRO_MBOX_DOORBELL,
+				HD60PRO_MBOX_CMD_STREAM_START,
+				0xffffffff,
+			};
+
+			iowrite32(0, base + HD60PRO_REG_MBOX_COMPLETE);
+			ret = hd60pro_mailbox_send_async_locked(hd, start,
+								ARRAY_SIZE(start),
+								15000, &completion, &irq_delta);
+			if (ret == -ETIMEDOUT) {
+				dev_warn(&hd->pdev->dev,
+					 "start_streaming: cmd 0x06 timed out — continuing\n");
+				ret = 0;
+			} else if (ret) {
+				dev_warn(&hd->pdev->dev,
+					 "start_streaming: cmd 0x06 error %d\n", ret);
+				ret = 0;
+			} else {
+				dev_info(&hd->pdev->dev,
+					 "start_streaming: cmd 0x06 done irq_delta=%u completion=0x%08x\n",
+					 irq_delta, completion);
+			}
+		}
+
+unlock_streaming:
+		mutex_unlock(&hd->mailbox_lock);
+		if (synthetic_v4l2)
+			hd60pro_complete_synthetic_buffers(hd);
+		return ret;
+	}
+
 	if (!synthetic_v4l2) {
 		hd60pro_return_queued_buffers(hd, VB2_BUF_STATE_ERROR);
 		return 0;
 	}
 
 	/*
-	 * DMA programming is not decoded yet. Complete queued buffers with a
+	 * DMA not enabled or not ready. Complete queued buffers with a
 	 * deterministic black YUYV frame so userspace can exercise the V4L2/vb2
 	 * path while hardware capture bring-up continues independently.
 	 */
@@ -7366,6 +10000,26 @@ static int hd60pro_start_streaming(struct vb2_queue *q, unsigned int count)
 static void hd60pro_stop_streaming(struct vb2_queue *q)
 {
 	struct hd60pro_dev *hd = vb2_get_drv_priv(q);
+
+	hd->dma_capture_active = false;
+	tasklet_kill(&hd->frame_tasklet);
+
+	/* Send cmd 0x07 (stream stop, mirror of cmd 0x06) */
+	if (allow_dma_capture && hd->bar0 && hd->irq >= 0) {
+		const u32 stop[] = {
+			HD60PRO_MBOX_DOORBELL,
+			HD60PRO_MBOX_CMD_STREAM_STOP,
+			0xffffffff,
+		};
+		u32 completion = 0;
+
+		mutex_lock(&hd->mailbox_lock);
+		iowrite32(0, hd->bar0 + HD60PRO_REG_MBOX_COMPLETE);
+		hd60pro_mailbox_send_async_locked(hd, stop, ARRAY_SIZE(stop),
+						  5000, &completion, NULL);
+		mutex_unlock(&hd->mailbox_lock);
+		pci_clear_master(hd->pdev);
+	}
 
 	hd->streaming = false;
 	hd60pro_return_queued_buffers(hd, VB2_BUF_STATE_ERROR);
@@ -7825,6 +10479,586 @@ static int hd60pro_bar5_full_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(hd60pro_bar5_full);
 
+/*
+ * bar0_dma_advertise: write the host frame DMA address to BAR0[0x60..0x67].
+ * Hypothesis: the firmware reads BAR0[0x60] to learn the host DMA target
+ * before starting VIC/DMAC capture. Writes frame_dma (low/high) and
+ * desc_dma (for the full descriptor), then reads them back.
+ */
+static int hd60pro_bar0_dma_advertise_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base;
+	u32 frame_low, frame_high, desc_low, desc_high;
+
+	if (!hd->bar0) {
+		seq_puts(s, "bar0_dma_advertise: BAR0 not mapped\n");
+		return 0;
+	}
+	if (!hd->dma_frame_dma[0] || !hd->dma_desc_dma) {
+		seq_puts(s, "bar0_dma_advertise: no DMA buffers (run init first)\n");
+		return 0;
+	}
+	if (!allow_mailbox_writes) {
+		seq_puts(s, "bar0_dma_advertise: blocked; reload with allow_mailbox_writes=1\n");
+		return 0;
+	}
+
+	base = hd->bar0;
+	frame_low  = (u32)(hd->dma_frame_dma[0] & 0xffffffffULL);
+	frame_high = (u32)(hd->dma_frame_dma[0] >> 32);
+	desc_low   = (u32)(hd->dma_desc_dma & 0xffffffffULL);
+	desc_high  = (u32)(hd->dma_desc_dma >> 32);
+
+	seq_printf(s, "bar0_dma_advertise: frame_dma=0x%016llx desc_dma=0x%016llx\n",
+		   (unsigned long long)hd->dma_frame_dma[0],
+		   (unsigned long long)hd->dma_desc_dma);
+	seq_puts(s, "bar0_dma_advertise: before BAR0[0x60..0x6f]:\n");
+	seq_printf(s, "  [60]=%08x [64]=%08x [68]=%08x [6c]=%08x\n",
+		   ioread32(base + 0x60), ioread32(base + 0x64),
+		   ioread32(base + 0x68), ioread32(base + 0x6c));
+
+	/*
+	 * Write frame DMA address at BAR0[0x60..0x67] and
+	 * desc DMA address at BAR0[0x68..0x6f].
+	 * Hypothesis: firmware polls BAR0[0x60] for host frame buffer PA.
+	 */
+	iowrite32(frame_low,  base + 0x60);
+	iowrite32(frame_high, base + 0x64);
+	iowrite32(desc_low,   base + 0x68);
+	iowrite32(desc_high,  base + 0x6c);
+
+	seq_puts(s, "bar0_dma_advertise: written. BAR0[0x60..0x6f] after:\n");
+	seq_printf(s, "  [60]=%08x [64]=%08x [68]=%08x [6c]=%08x\n",
+		   ioread32(base + 0x60), ioread32(base + 0x64),
+		   ioread32(base + 0x68), ioread32(base + 0x6c));
+	seq_puts(s, "bar0_dma_advertise: now start streaming and watch for frame IRQs\n");
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_bar0_dma_advertise);
+
+/*
+ * cmd02_dma_setup: send command 0x02 (12 dwords) to advertise host DMA buffer
+ * addresses to the firmware.
+ *
+ * From MZ0380_HwInitialize (ARM firmware) decompilation, for our card type
+ * (single-channel, non-multi):
+ *
+ *   packet[0]  = 0x800         (doorbell)
+ *   packet[1]  = 0x02          (command ID)
+ *   packet[2]  = 0             (channel index)
+ *   packet[3]  = frame_size    (per-frame stride/size in bytes)
+ *   packet[4]  = 0
+ *   packet[5]  = buf0_phys     (32-bit host physical address, buffer 0)
+ *   packet[6]  = 0
+ *   packet[7]  = buf1_phys     (buffer 1)
+ *   packet[8]  = 0
+ *   packet[9]  = buf2_phys     (buffer 2)
+ *   packet[10] = 0
+ *   packet[11] = buf3_phys     (buffer 3)
+ *
+ * The firmware stores these addresses in the DMAC profile (+0x38), and
+ * pcie_set_outbound() programs BAR5[0x54] from the profile when DMA starts.
+ * Without this command, BAR5[0x54] points to firmware-internal memory.
+ *
+ * All four slots use their own dedicated DMA buffer (4-buffer mode).
+ * Also clears BAR0[0x50..0x5c] (per-buffer DMA ack registers) before sending.
+ */
+static int hd60pro_cmd02_dma_setup_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	u32 frame_size;
+	u32 packet[12];
+	u32 completion = 0;
+	int ret;
+
+	if (!hd->bar0) {
+		seq_puts(s, "cmd02_dma_setup: BAR0 not mapped\n");
+		return 0;
+	}
+	if (!hd->dma_frame_dma[0]) {
+		seq_puts(s, "cmd02_dma_setup: no dma_frame_dma (run init first)\n");
+		return 0;
+	}
+	if (!allow_mailbox_writes) {
+		seq_puts(s, "cmd02_dma_setup: blocked; reload with allow_mailbox_writes=1\n");
+		return 0;
+	}
+
+	frame_size = hd60pro_frame_size();
+
+	seq_printf(s, "cmd02_dma_setup: dma[0]=0x%016llx dma[1]=0x%016llx frame_size=0x%x\n",
+		   (unsigned long long)hd->dma_frame_dma[0],
+		   (unsigned long long)hd->dma_frame_dma[1], frame_size);
+
+	packet[0]  = HD60PRO_MBOX_DOORBELL;
+	packet[1]  = 0x02;
+	packet[2]  = 0;          /* channel */
+	packet[3]  = frame_size; /* per-buffer pixel payload size */
+	packet[4]  = 0;
+	packet[5]  = (u32)(hd->dma_frame_dma[0] & 0xffffffffULL);  /* buf0 low32 */
+	packet[6]  = 0;
+	packet[7]  = (u32)(hd->dma_frame_dma[1] & 0xffffffffULL);  /* buf1 low32 */
+	packet[8]  = 0;
+	packet[9]  = (u32)(hd->dma_frame_dma[2] & 0xffffffffULL);  /* buf2 low32 */
+	packet[10] = 0;
+	packet[11] = (u32)(hd->dma_frame_dma[3] & 0xffffffffULL);  /* buf3 low32 */
+
+	/* Clear per-buffer ack registers before DMA starts */
+	iowrite32(0, hd->bar0 + 0x050);
+	iowrite32(0, hd->bar0 + 0x054);
+	iowrite32(0, hd->bar0 + 0x058);
+	iowrite32(0, hd->bar0 + 0x05c);
+
+	seq_puts(s, "cmd02_dma_setup: cleared BAR0[0x50..0x5c], sending cmd 0x02 (12 dwords)\n");
+
+	mutex_lock(&hd->mailbox_lock);
+	ret = hd60pro_mailbox_send_async_locked(hd, packet, ARRAY_SIZE(packet),
+						15000, &completion, NULL);
+	mutex_unlock(&hd->mailbox_lock);
+
+	if (ret)
+		seq_printf(s, "cmd02_dma_setup: FAILED ret=%d\n", ret);
+	else
+		seq_printf(s, "cmd02_dma_setup: OK completion=0x%08x\n", completion);
+
+	seq_printf(s, "cmd02_dma_setup: BAR5[0x54]=0x%08x (should now be 0x%08x after DMA)\n",
+		   hd->bar5 ? ioread32(hd->bar5 + 0x054) : 0xdeadbeef,
+		   (u32)(hd->dma_frame_dma[0] & 0xffffffffULL));
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_cmd02_dma_setup);
+
+/*
+ * bar0_region_probe: read 256 bytes of BAR0 at a configurable offset.
+ * Used to scan for frame data the firmware stores in BAR0 SRAM.
+ * Set bar0_probe_offset module parameter before reading this file.
+ * Example: bar0_probe_offset=0x700000 to probe the suspected frame area.
+ */
+static unsigned long bar0_probe_offset = 0x700000;
+module_param(bar0_probe_offset, ulong, 0644);
+MODULE_PARM_DESC(bar0_probe_offset, "BAR0 byte offset for bar0_region_probe debugfs read (default 0x700000)");
+
+static int hd60pro_bar0_region_probe_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	unsigned long offset = bar0_probe_offset;
+	unsigned int probe_bytes = 0x100;
+	unsigned int row;
+
+	if (!hd->bar0) {
+		seq_puts(s, "bar0_region_probe: BAR0 not mapped\n");
+		return 0;
+	}
+	if (!mmio_dump) {
+		seq_puts(s, "bar0_region_probe: reload with mmio_dump=1\n");
+		return 0;
+	}
+
+	/* Clamp to BAR0 */
+	if (offset >= hd->bar0_len) {
+		seq_printf(s, "bar0_region_probe: offset 0x%lx >= bar0_len 0x%llx\n",
+			   offset, (unsigned long long)hd->bar0_len);
+		return 0;
+	}
+	if (offset + probe_bytes > hd->bar0_len)
+		probe_bytes = (unsigned int)(hd->bar0_len - offset);
+
+	seq_printf(s, "bar0_region_probe: offset=0x%lx bytes=%u\n", offset, probe_bytes);
+	for (row = 0; row < probe_bytes; row += 16) {
+		unsigned int col;
+		u32 vals[4] = {0, 0, 0, 0};
+
+		for (col = 0; col < 4 && (row + col * 4) < probe_bytes; col++)
+			vals[col] = ioread32(hd->bar0 + offset + row + col * 4);
+		seq_printf(s, "%06lx: %08x %08x %08x %08x\n",
+			   offset + row, vals[0], vals[1], vals[2], vals[3]);
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_bar0_region_probe);
+
+/*
+ * setvic_inject: experimental SET_VIC (cmd 0x29) injection.
+ *
+ * From ep.ko pciep_isr decompilation, the firmware receives SET_VIC via
+ * endpoint interrupt event 0x29 with ep_command payload at:
+ *   +0x05 fps, +0x06 fw_or_mode, +0x08 width (LE16), +0x0a height (LE16)
+ *
+ * Hypothesis: mailbox cmd 0x29 routes directly to pciep_isr event 0x29,
+ * analogous to how mailbox cmd 0x60/0x61 routes to pciep_isr event 0x60/0x61.
+ *
+ * CONFIRMED: firmware responds to cmd 0x29 via IRQ (bit-11) after ~500ms-1s.
+ * The official driver waits 20 seconds (200,000,000 × 100ns units).
+ * We use hd60pro_mailbox_send_async_locked which wakes on any IRQ change.
+ *
+ * After cmd 0x29 IRQ, we also send cmd 0x2a (stream notify) which tells the
+ * firmware to activate the epint/hready path and start tinyvenc DMA.
+ *
+ * Cmd 0x2a payload from MZ0380_StartFirmware decompilation (6 dwords):
+ *   dword[2] = ch | (num_streams << 8) | 0x100000
+ *   dword[3] = audio_sample_rate (48000 = 0xbb80)
+ *   dword[4] = (iVar22 << 16) | 0x100
+ *   dword[5] = uVar15 | (uVar28 << 8)
+ * For single-channel 1080p60: num_streams=2, iVar22=8, uVar28=1.
+ *
+ * Requires: allow_mailbox_writes=1 and pipeline_ready=1 before reading.
+ * Warning: this call can block up to 15 seconds per command while waiting for IRQ.
+ */
+static int hd60pro_setvic_inject_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	/*
+	 * cmd 0x29 = SET_VIC, 1080p60 progressive, 11 dwords.
+	 * Confirmed: firmware responds via mailbox IRQ (bit-11) after ~500ms.
+	 */
+	const u32 setvic_packet[] = {
+		0x00000800,   /* doorbell */
+		0x00000029,   /* cmd 0x29 = SET_VIC */
+		0x00073c00,   /* ch=0, fps=60(0x3c), fw_mode=7, interlace=0 */
+		0x04380780,   /* width=0x0780=1920, height=0x0438=1080 (each LE16) */
+		0x00000000,
+		0x00000000,
+		0x00000000,
+		0x04380780,   /* input_frame_width=1920, input_frame_height=1080 */
+		0x00000001,   /* bitstream_count=1 */
+		0x00000000,
+		0x00000000,   /* interrupt_reduce=0 at byte 0x22 */
+	};
+	/*
+	 * cmd 0x2a = stream notify, 6 dwords.
+	 * Tells firmware to start epint/hready path → tinyvenc → DMA.
+	 * From MZ0380_StartFirmware: ch=0, num_streams=2, audio=48000, iVar22=8.
+	 */
+	const u32 notify_packet[] = {
+		0x00000800,   /* doorbell */
+		0x0000002a,   /* cmd 0x2a = stream notify */
+		0x00100200,   /* ch=0 | (2<<8) | 0x100000 */
+		0x0000bb80,   /* audio_sample_rate = 48000 */
+		0x00080100,   /* iVar22=8 << 16 | flag=0x100 */
+		0x00000100,   /* uVar15=0 | uVar28=1 << 8 */
+	};
+	u32 irq_before, completion;
+	u32 irq_delta = 0;
+	int ret;
+
+	if (!allow_mailbox_writes) {
+		seq_puts(s, "setvic_inject: blocked; reload with allow_mailbox_writes=1\n");
+		return 0;
+	}
+	if (!hd->pipeline_ready) {
+		seq_puts(s, "setvic_inject: blocked; pipeline not ready (run init first)\n");
+		return 0;
+	}
+	if (!base) {
+		seq_puts(s, "setvic_inject: no mailbox base\n");
+		return 0;
+	}
+
+	/* --- cmd 0x29 SET_VIC --- */
+	irq_before = hd->irq_count;
+	seq_puts(s, "setvic_inject: sending cmd 0x29 SET_VIC 1080p60 (waiting up to 15s)\n");
+	seq_printf(s, "setvic_inject: irq_count_before=%u\n", irq_before);
+
+	mutex_lock(&hd->mailbox_lock);
+	/* Clear stale completion before sending */
+	iowrite32(0, base + HD60PRO_REG_MBOX_COMPLETE);
+	ret = hd60pro_mailbox_send_async_locked(hd, setvic_packet,
+						ARRAY_SIZE(setvic_packet),
+						15000, &completion, &irq_delta);
+	mutex_unlock(&hd->mailbox_lock);
+
+	seq_printf(s, "setvic_inject: cmd29_ret=%d irq_delta=%u completion=0x%08x\n",
+		   ret, irq_delta, completion);
+	seq_printf(s, "setvic_inject: bar0_004=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_02c=0x%08x\n",
+		   ioread32(base + 0x04), ioread32(base + 0x08),
+		   ioread32(base + 0x0c), ioread32(base + 0x2c));
+
+	if (ret == -ENODEV) {
+		seq_puts(s, "setvic_inject: device dead, aborting\n");
+		return 0;
+	}
+	if (ret == -ETIMEDOUT) {
+		seq_puts(s, "setvic_inject: cmd 0x29 timed out after 15s\n");
+		return 0;
+	}
+	seq_puts(s, "setvic_inject: cmd 0x29 responded\n");
+
+	/* --- cmd 0x2a stream notify --- */
+	irq_before = hd->irq_count;
+	seq_puts(s, "setvic_inject: sending cmd 0x2a stream-notify (waiting up to 15s)\n");
+	seq_printf(s, "setvic_inject: irq_count_before_2a=%u\n", irq_before);
+
+	mutex_lock(&hd->mailbox_lock);
+	iowrite32(0, base + HD60PRO_REG_MBOX_COMPLETE);
+	ret = hd60pro_mailbox_send_async_locked(hd, notify_packet,
+						ARRAY_SIZE(notify_packet),
+						15000, &completion, &irq_delta);
+	mutex_unlock(&hd->mailbox_lock);
+
+	seq_printf(s, "setvic_inject: cmd2a_ret=%d irq_delta=%u completion=0x%08x\n",
+		   ret, irq_delta, completion);
+	seq_printf(s, "setvic_inject: bar0_004=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_02c=0x%08x\n",
+		   ioread32(base + 0x04), ioread32(base + 0x08),
+		   ioread32(base + 0x0c), ioread32(base + 0x2c));
+	seq_printf(s, "setvic_inject: irq_count_after=%u mailbox_irq_after=%u\n",
+		   hd->irq_count, hd->mailbox_irq_count);
+	if (ret == -ETIMEDOUT)
+		seq_puts(s, "setvic_inject: cmd 0x2a timed out after 15s\n");
+	else
+		seq_puts(s, "setvic_inject: done; now try VIDIOC_STREAMON or check bar0_region_probe\n");
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_setvic_inject);
+
+/*
+ * stream_start_test: full hardware capture sequence without V4L2 buffers.
+ *
+ * Sends the complete start sequence (cmds 0x29 + 0x2a + 0x02 + 0x06), enables
+ * dma_capture_active so the IRQ handler recognises DMA-frame interrupts, then
+ * polls for 5 s watching irq_count vs mailbox_irq_count.  Any bit-0 IRQ
+ * (HD60PRO_IRQ_DMA_FRAME) means the firmware DMA'd a frame; frame_buffer_peek
+ * data means the DMA address in BAR5+0x054 is correct.
+ *
+ * No V4L2 buffers are required; the frame tasklet will ACK each arriving frame
+ * and print a dev_info, but won't deliver to vb2.  This lets us confirm the
+ * hardware path is alive before debugging the VLC / V4L2 layer.
+ *
+ * Requires: pipeline_ready=1, bar5_dma_program already run, allow_dma_capture=1.
+ * Safe to run multiple times; clears dma_capture_active on exit.
+ */
+static int hd60pro_stream_start_test_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	u32 irq_before, frame_irq_before;
+	u32 irq_after, completion;
+	u32 irq_delta = 0;
+	unsigned int i, poll;
+	int ret;
+	const u8 *fbuf;
+
+	/* ── guards ───────────────────────────────────────────────────────── */
+	if (!allow_mailbox_writes) {
+		seq_puts(s, "stream_start_test: blocked; reload with allow_mailbox_writes=1\n");
+		return 0;
+	}
+	if (!hd->pipeline_ready) {
+		seq_puts(s, "stream_start_test: pipeline not ready\n");
+		return 0;
+	}
+	if (!hd->bar5) {
+		seq_puts(s, "stream_start_test: BAR5 not mapped\n");
+		return 0;
+	}
+	if (!hd->dma_frame_dma[0] || !hd->dma_frame_cpu[0]) {
+		seq_puts(s, "stream_start_test: DMA buffers not allocated (reload with prepare_dma_buffers=1)\n");
+		return 0;
+	}
+	if (!allow_dma_capture) {
+		seq_puts(s, "stream_start_test: reload with allow_dma_capture=1\n");
+		return 0;
+	}
+	if (!base) {
+		seq_puts(s, "stream_start_test: no mailbox base\n");
+		return 0;
+	}
+
+	seq_puts(s, "stream_start_test: sending full start sequence for 1080p60 HDMI\n");
+	seq_printf(s, "  bar5_054=0x%08x (DMA dest; expect 0x%08x after bar5_dma_program)\n",
+		   ioread32(hd->bar5 + 0x054),
+		   (u32)(hd->dma_frame_dma[0] & 0xffffffff));
+	seq_printf(s, "  bar5_050=0x%08x  bar5_074=0x%08x  bar5_07c=0x%08x\n",
+		   ioread32(hd->bar5 + 0x050),
+		   ioread32(hd->bar5 + 0x074),
+		   ioread32(hd->bar5 + 0x07c));
+
+	irq_before      = hd->irq_count;
+	frame_irq_before = irq_before - hd->mailbox_irq_count; /* proxy: total - mbox = frame */
+
+	/* ── cmd 0x29 SET_VIC ─────────────────────────────────────────────── */
+	{
+		const u32 setvic[] = {
+			HD60PRO_MBOX_DOORBELL,
+			0x00000029,
+			0x06073c00,  /* color_space=6|pixel_fmt=7|fps=60|chan=0 */
+			0x04380780,  /* height=1080<<16|width=1920 */
+			0x00000000,
+			0x02000000,
+			0x00000000,
+			0x04380780,
+			0x3c000101,  /* fps<<24|buf_count=1<<8|pip_mode=1 */
+			0x00000000,
+			0x6ef02901,
+		};
+		mutex_lock(&hd->mailbox_lock);
+		iowrite32(0, base + HD60PRO_REG_MBOX_COMPLETE);
+		ret = hd60pro_mailbox_send_async_locked(hd, setvic, ARRAY_SIZE(setvic),
+							15000, &completion, &irq_delta);
+		mutex_unlock(&hd->mailbox_lock);
+		seq_printf(s, "cmd_0x29: ret=%d irq_delta=%u completion=0x%08x\n",
+			   ret, irq_delta, completion);
+		if (ret == -ENODEV) {
+			seq_puts(s, "stream_start_test: device dead after cmd 0x29\n");
+			return 0;
+		}
+	}
+
+	msleep(100);
+
+	/* ── cmd 0x2a POST_SET_VIC ────────────────────────────────────────── */
+	{
+		const u32 notify[] = {
+			HD60PRO_MBOX_DOORBELL,
+			0x0000002a,
+			0x00100200,
+			0x0000bb80,
+			0x00080100,
+			0x00000100,
+		};
+		mutex_lock(&hd->mailbox_lock);
+		iowrite32(0, base + HD60PRO_REG_MBOX_COMPLETE);
+		ret = hd60pro_mailbox_send_async_locked(hd, notify, ARRAY_SIZE(notify),
+							15000, &completion, &irq_delta);
+		mutex_unlock(&hd->mailbox_lock);
+		seq_printf(s, "cmd_0x2a: ret=%d irq_delta=%u completion=0x%08x\n",
+			   ret, irq_delta, completion);
+		if (ret == -ENODEV) {
+			seq_puts(s, "stream_start_test: device dead after cmd 0x2a\n");
+			return 0;
+		}
+	}
+
+	msleep(100);
+
+	/* ── cmd 0x02 DMA buffer advertise ───────────────────────────────── */
+	{
+		u32 frame_size = hd60pro_frame_size();
+		u32 pkt02[12];
+
+		pkt02[0]  = HD60PRO_MBOX_DOORBELL;
+		pkt02[1]  = 0x02;
+		pkt02[2]  = 0;
+		pkt02[3]  = frame_size;
+		pkt02[4]  = 0;
+		pkt02[5]  = (u32)(hd->dma_frame_dma[0] & 0xffffffffULL);
+		pkt02[6]  = 0;
+		pkt02[7]  = (u32)(hd->dma_frame_dma[1] & 0xffffffffULL);
+		pkt02[8]  = 0;
+		pkt02[9]  = (u32)(hd->dma_frame_dma[2] & 0xffffffffULL);
+		pkt02[10] = 0;
+		pkt02[11] = (u32)(hd->dma_frame_dma[3] & 0xffffffffULL);
+
+		seq_printf(s, "cmd_0x02: frame_size=0x%x buf[0]=0x%08x buf[1]=0x%08x\n",
+			   frame_size, pkt02[5], pkt02[7]);
+		mutex_lock(&hd->mailbox_lock);
+		iowrite32(0, base + HD60PRO_REG_MBOX_COMPLETE);
+		ret = hd60pro_mailbox_send_async_locked(hd, pkt02, ARRAY_SIZE(pkt02),
+							15000, &completion, &irq_delta);
+		mutex_unlock(&hd->mailbox_lock);
+		seq_printf(s, "cmd_0x02: ret=%d irq_delta=%u completion=0x%08x\n",
+			   ret, irq_delta, completion);
+	}
+
+	msleep(100);
+
+	/* ── cmd 0x06 STREAM_START ───────────────────────────────────────── */
+	{
+		const u32 start[] = {
+			HD60PRO_MBOX_DOORBELL,
+			HD60PRO_MBOX_CMD_STREAM_START,
+			0xffffffff,
+		};
+		mutex_lock(&hd->mailbox_lock);
+		iowrite32(0, base + HD60PRO_REG_MBOX_COMPLETE);
+		ret = hd60pro_mailbox_send_async_locked(hd, start, ARRAY_SIZE(start),
+							15000, &completion, &irq_delta);
+		mutex_unlock(&hd->mailbox_lock);
+		seq_printf(s, "cmd_0x06: ret=%d irq_delta=%u completion=0x%08x\n",
+			   ret, irq_delta, completion);
+		if (ret == -ENODEV) {
+			seq_puts(s, "stream_start_test: device dead after cmd 0x06\n");
+			return 0;
+		}
+	}
+
+	/*
+	 * Enable dma_capture_active so the IRQ handler recognises bit-0 frame
+	 * interrupts and schedules the tasklet (which will ACK but not deliver,
+	 * since there are no V4L2 buffers queued).
+	 */
+	hd->dma_capture_active = true;
+	iowrite32(0, base + HD60PRO_REG_DMA_ACK_BASE);
+
+	seq_puts(s, "stream_start_test: all 4 cmds sent; polling 5s for DMA frame IRQs\n");
+	seq_printf(s, "irq_count_before_poll=%u mailbox_irq_before=%u\n",
+		   hd->irq_count, hd->mailbox_irq_count);
+
+	/* ── poll 5 s ────────────────────────────────────────────────────── */
+	for (poll = 0; poll < 50; poll++) {
+		msleep(100);
+		/* Print progress every second */
+		if (poll % 10 == 9) {
+			seq_printf(s, "  t=%us irq_count=%u mailbox_irq=%u dma_frame_count=%u bar0_030=0x%08x bar0_044=0x%08x\n",
+				   (poll + 1) / 10,
+				   hd->irq_count, hd->mailbox_irq_count,
+				   hd->dma_frame_count,
+				   ioread32(base + 0x030),
+				   ioread32(base + 0x044));
+		}
+	}
+
+	hd->dma_capture_active = false;
+
+	/* ── final report ────────────────────────────────────────────────── */
+	irq_after = hd->irq_count;
+	seq_printf(s, "irq_count_after=%u mailbox_irq_after=%u dma_frame_count=%u\n",
+		   irq_after, hd->mailbox_irq_count, hd->dma_frame_count);
+	seq_printf(s, "total_irqs_during_poll=%u  non_mailbox_irqs=%u\n",
+		   irq_after - irq_before,
+		   (irq_after - irq_before) - (hd->mailbox_irq_count -
+			(irq_before - frame_irq_before)));
+
+	seq_printf(s, "bar5_054_after=0x%08x  bar5_050_after=0x%08x\n",
+		   ioread32(hd->bar5 + 0x054),
+		   ioread32(hd->bar5 + 0x050));
+	seq_printf(s, "bar0_040=0x%08x  bar0_044=0x%08x  bar0_050=0x%08x\n",
+		   ioread32(base + 0x040),
+		   ioread32(base + 0x044),
+		   ioread32(base + 0x050));
+
+	/* ── frame buffer peek ───────────────────────────────────────────── */
+	fbuf = (const u8 *)hd->dma_frame_cpu[0];
+	{
+		bool any_nonzero = false;
+
+		for (i = 0; i < 256; i++) {
+			if (fbuf[i])
+				any_nonzero = true;
+		}
+		seq_printf(s, "frame_buffer[0..255]: %s\n",
+			   any_nonzero ? "NON-ZERO (DMA working!)" : "all zero (no DMA)");
+		for (i = 0; i < 256; i += 16) {
+			seq_printf(s, "  %04x: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
+				   i,
+				   fbuf[i+0], fbuf[i+1], fbuf[i+2], fbuf[i+3],
+				   fbuf[i+4], fbuf[i+5], fbuf[i+6], fbuf[i+7],
+				   fbuf[i+8], fbuf[i+9], fbuf[i+10], fbuf[i+11],
+				   fbuf[i+12], fbuf[i+13], fbuf[i+14], fbuf[i+15]);
+		}
+	}
+
+	if (hd->dma_frame_count > 0)
+		seq_puts(s, "result: DMA frames received! Start VLC: vlc v4l2:///dev/video1\n");
+	else
+		seq_puts(s, "result: no DMA frames; see bar5_054 / bar0_030 above for clues\n");
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_stream_start_test);
+
 static const char *hd60pro_mailbox_reg_name(unsigned int offset)
 {
 	switch (offset) {
@@ -7857,7 +11091,11 @@ static int hd60pro_mailbox_regs_show(struct seq_file *s, void *unused)
 	u8 __iomem *bytes = hd60pro_mailbox_base(hd);
 	static const unsigned int offsets[] = {
 		0x000, 0x004, 0x008, 0x00c, 0x010, 0x014,
-		0x02c, 0x030, 0x050,
+		0x02c, 0x030,
+		0x040, 0x044, 0x048, 0x04c,
+		0x050, 0x054, 0x058, 0x05c,
+		0x060, 0x064, 0x068, 0x06c,
+		0x070, 0x074, 0x078, 0x07c,
 	};
 	unsigned int i;
 
@@ -7998,6 +11236,8 @@ static void hd60pro_debugfs_init(struct hd60pro_dev *hd)
 			    &hd60pro_endpoint_command_plan_fops);
 	debugfs_create_file("set_vic_event_record", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_set_vic_event_record_fops);
+	debugfs_create_file("send_set_vic", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_send_set_vic_fops);
 	debugfs_create_file("endpoint_transport_plan", 0400,
 			    hd->debugfs_dir, hd,
 			    &hd60pro_endpoint_transport_plan_fops);
@@ -8050,6 +11290,14 @@ static void hd60pro_debugfs_init(struct hd60pro_dev *hd)
 			    hd, &hd60pro_firmware_userland_flow_fops);
 	debugfs_create_file("endpoint_bridge_regs", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_endpoint_bridge_regs_fops);
+	debugfs_create_file("bar5_dma_program", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_bar5_dma_program_fops);
+	debugfs_create_file("bar0_dma_advertise", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_bar0_dma_advertise_fops);
+	debugfs_create_file("cmd02_dma_setup", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_cmd02_dma_setup_fops);
+	debugfs_create_file("frame_buffer_peek", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_frame_buffer_peek_fops);
 	debugfs_create_file("firmware_pcie_outbound_regs", 0400,
 			    hd->debugfs_dir, hd,
 			    &hd60pro_firmware_pcie_outbound_regs_fops);
@@ -8088,6 +11336,34 @@ static void hd60pro_debugfs_init(struct hd60pro_dev *hd)
 			    hd, &hd60pro_gpio17_generic_sequence_fops);
 	debugfs_create_file("i2c1a_c0_dc_db", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_i2c1a_c0_dc_db_fops);
+	debugfs_create_file("hdmi_probe", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_hdmi_probe_fops);
+	debugfs_create_file("mst3367_signal", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_mst3367_signal_fops);
+	debugfs_create_file("mst3367_bank_reset", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_mst3367_bank_reset_fops);
+	debugfs_create_file("i2c_scan", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_i2c_scan_fops);
+	debugfs_create_file("mst3367_probe", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_mst3367_probe_fops);
+	debugfs_create_file("mst3367_poll", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_mst3367_poll_fops);
+	debugfs_create_file("edid_load", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_edid_load_fops);
+	debugfs_create_file("edid_verify", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_edid_verify_fops);
+	debugfs_create_file("mst3367_phys_test", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_mst3367_phys_test_fops);
+	debugfs_create_file("hpd_pulse", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_hpd_pulse_fops);
+	debugfs_create_file("mst3367_hdmi_init", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_mst3367_hdmi_init_fops);
+	debugfs_create_file("mst3367_hw_init", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_mst3367_hw_init_fops);
+	debugfs_create_file("mst3367_hpd_on", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_mst3367_hpd_on_fops);
+	debugfs_create_file("gpio_read", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_gpio_read_fops);
 	debugfs_create_file("logo_upload_plan", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_logo_upload_plan_fops);
 	debugfs_create_file("logo_upload_selector100", 0400, hd->debugfs_dir,
@@ -8176,6 +11452,12 @@ static void hd60pro_debugfs_init(struct hd60pro_dev *hd)
 			    &hd60pro_mailbox_regs_fops);
 	debugfs_create_file("bar5_full", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_bar5_full_fops);
+	debugfs_create_file("bar0_region_probe", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_bar0_region_probe_fops);
+	debugfs_create_file("setvic_inject", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_setvic_inject_fops);
+	debugfs_create_file("stream_start_test", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_stream_start_test_fops);
 	debugfs_create_file("fw_version", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_fw_version_fops);
 }
@@ -8199,7 +11481,10 @@ static int hd60pro_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	mutex_init(&hd->mailbox_lock);
 	mutex_init(&hd->video_lock);
 	spin_lock_init(&hd->queued_lock);
+	spin_lock_init(&hd->irq_lock);
 	INIT_LIST_HEAD(&hd->queued_bufs);
+	tasklet_init(&hd->frame_tasklet, hd60pro_frame_tasklet,
+		     (unsigned long)hd);
 	pci_set_drvdata(pdev, hd);
 
 	if (mailbox_bar != HD60PRO_BAR0 && mailbox_bar != HD60PRO_BAR5)
@@ -8298,6 +11583,9 @@ static void hd60pro_remove(struct pci_dev *pdev)
 {
 	struct hd60pro_dev *hd = pci_get_drvdata(pdev);
 
+	hd->dma_capture_active = false;
+	tasklet_kill(&hd->frame_tasklet);
+
 	hd60pro_unregister_v4l2(hd);
 	debugfs_remove_recursive(hd->debugfs_dir);
 	hd60pro_free_diag_dma(hd);
@@ -8307,7 +11595,7 @@ static void hd60pro_remove(struct pci_dev *pdev)
 		pci_free_irq_vectors(pdev);
 	}
 
-	if (enable_busmaster)
+	if (enable_busmaster || allow_dma_capture)
 		pci_clear_master(pdev);
 
 	dev_info(&pdev->dev, "unbound HD60 Pro diagnostics\n");

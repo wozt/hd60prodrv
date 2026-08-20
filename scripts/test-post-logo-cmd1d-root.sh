@@ -177,17 +177,21 @@ run_show mst3367_signal 10 "$DBG/mst3367_signal"
 
 run_show gpio_read 5 "$DBG/gpio_read"
 
-run_quiet bar5_dma_program 10 "$DBG/bar5_dma_program"
-run_show mst3367_signal 10 "$DBG/mst3367_signal"
+# Show BAR5 DMA window config (was run_quiet; now visible so we can see if
+# BAR5+0x054 sticks or is read-only from the host side).
+run_show bar5_dma_program 10 "$DBG/bar5_dma_program"
+
 run_show capture_info 10 "$DBG/capture_info"
-run_show endpoint_info 10 "$DBG/endpoint_info"
-run_show direct_memory_info 10 "$DBG/direct_memory_info"
-run_show capture_start_plan 10 "$DBG/capture_start_plan"
 run_show health 10 "$DBG/health"
 
+# Full end-to-end stream test: sends cmds 0x29+0x2a+0x02+0x06 and polls 5 s
+# for DMA frame IRQs, then peeks at the frame buffer.
+# This tells us whether the firmware/DMA path is alive WITHOUT needing VLC.
+run_show stream_start_test 120 "$DBG/stream_start_test"
+
 echo
-echo "=== Hardware ready. Run VLC to start capture: ==="
-echo "    vlc v4l2:///dev/video1"
-echo "=== Or use ffmpeg: ffmpeg -f v4l2 -i /dev/video1 -vframes 1 /tmp/frame.jpg ==="
-echo "=== send_set_vic node also available for manual test: ==="
-echo "    cat $DBG/send_set_vic"
+echo "=== After stream_start_test: check dmesg for start_streaming logs ==="
+echo "    sudo dmesg | grep hd60pro | tail -20"
+echo "=== If DMA frames received above, start VLC as root: ==="
+echo "    sudo vlc v4l2:///dev/video1"
+echo "=== Or ffmpeg: sudo ffmpeg -f v4l2 -i /dev/video1 -vframes 1 /tmp/frame.jpg ==="

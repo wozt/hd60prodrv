@@ -68,15 +68,16 @@ for idx in range(frames):
         if b != fallback[off & 3]:
             diff += 1
     diff_pct = (diff * 100.0) / len(sample)
-    print(f"frame[{idx}]: sample_nonzero={nonzero}/{len(sample)} fallback_diff={diff_pct:.4f}%")
-    if diff_pct > 0.5:
+    nonzero_pct = (nonzero * 100.0) / len(sample)
+    print(f"frame[{idx}]: sample_nonzero={nonzero}/{len(sample)} ({nonzero_pct:.4f}%) fallback_diff={diff_pct:.4f}%")
+    if diff_pct > 0.5 and nonzero_pct > 1.0:
         real_candidate = True
 
 if real_candidate:
     print("result: NON-FALLBACK frame data detected")
     raise SystemExit(0)
 
-print("result: captured data still matches synthetic black fallback")
+print("result: captured data is still fallback-like or empty")
 raise SystemExit(2)
 PY
 ANALYZE_STATUS=$?

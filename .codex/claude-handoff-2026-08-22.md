@@ -341,6 +341,20 @@ is still not final image-quality proof, but it is much stronger than "VLC
 opened" because it distinguishes the fallback from actual hardware-produced
 bytes.
 
+New real-DMA polling fallback:
+
+The V4L2 real-DMA path no longer depends only on a frame IRQ. While streaming
+with `synthetic_v4l2=0`, the driver polls the four coherent DMA buffer headers
+every `real_dma_poll_ms` milliseconds, default 16. If any header dword is
+non-zero and <= the expected 1080p YUYV payload size, the driver copies
+`dma_frame_cpu[buf] + 0x1000` into the queued vb2 buffer, clears the header, and
+ACKs BAR0+0x50. The IRQ tasklet and poller now use the same delivery helper.
+
+The driver deliberately ignores IRQ events with a zero or oversized DMA header.
+This prevents a false "real frame" where an IRQ causes a stale zero buffer to
+be copied to V4L2. `capture_info` now reports `real_dma_poll_ms` and
+`dma_poll_count`.
+
 Added offline extractor:
 
 ```sh

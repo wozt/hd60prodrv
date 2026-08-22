@@ -330,6 +330,10 @@ static uint real_dma_timeout_ms = 2000;
 module_param(real_dma_timeout_ms, uint, 0644);
 MODULE_PARM_DESC(real_dma_timeout_ms, "Timeout before queued V4L2 buffers are completed with error when real DMA produces no frames");
 
+static uint real_dma_poll_ms = 16;
+module_param(real_dma_poll_ms, uint, 0644);
+MODULE_PARM_DESC(real_dma_poll_ms, "Poll coherent DMA frame headers while real-DMA streaming, in case frame IRQ delivery is missing; 0 disables");
+
 static uint real_dma_cmd_timeout_ms = 3000;
 module_param(real_dma_cmd_timeout_ms, uint, 0644);
 MODULE_PARM_DESC(real_dma_cmd_timeout_ms, "Per-mailbox-command timeout used by V4L2 real DMA stream start");
@@ -402,8 +406,10 @@ struct hd60pro_dev {
 	spinlock_t irq_lock;
 	u32 pending_frame_status;
 	u32 dma_frame_count;
+	u32 dma_poll_count;
 	struct tasklet_struct frame_tasklet;
 	struct delayed_work stream_timeout_work;
+	struct delayed_work dma_poll_work;
 	bool dma_capture_active;
 };
 
@@ -3518,7 +3524,9 @@ static int hd60pro_capture_info_show(struct seq_file *s, void *unused)
 	seq_printf(s, "irq_count: %u\n", hd->irq_count);
 	seq_printf(s, "mailbox_irq_count: %u\n", hd->mailbox_irq_count);
 	seq_printf(s, "dma_frame_count: %u\n", hd->dma_frame_count);
+	seq_printf(s, "dma_poll_count: %u\n", hd->dma_poll_count);
 	seq_printf(s, "dma_frame_irq_mask: 0x%08x\n", dma_frame_irq_mask);
+	seq_printf(s, "real_dma_poll_ms: %u\n", real_dma_poll_ms);
 	seq_printf(s, "real_dma_timeout_ms: %u\n", real_dma_timeout_ms);
 	seq_printf(s, "real_dma_cmd_timeout_ms: %u\n",
 		   real_dma_cmd_timeout_ms);
@@ -5407,6 +5415,7 @@ struct hd60pro_buffer {
 
 static void hd60pro_complete_synthetic_buffers(struct hd60pro_dev *hd);
 static void hd60pro_schedule_stream_timeout(struct hd60pro_dev *hd);
+static void hd60pro_schedule_dma_poll(struct hd60pro_dev *hd);
 
 static int hd60pro_build_cmd02_packet(struct hd60pro_dev *hd, u32 packet[12],
 				      struct seq_file *s)
@@ -5505,8 +5514,10 @@ static void hd60pro_buf_queue(struct vb2_buffer *vb)
 
 	if (complete_now && synthetic_v4l2)
 		hd60pro_complete_synthetic_buffers(hd);
-	else if (complete_now)
+	else if (complete_now) {
 		hd60pro_schedule_stream_timeout(hd);
+		hd60pro_schedule_dma_poll(hd);
+	}
 }
 
 static void hd60pro_fill_synthetic_frame(void *vaddr, size_t size)
@@ -5620,29 +5631,11 @@ static void hd60pro_schedule_stream_timeout(struct hd60pro_dev *hd)
 			 msecs_to_jiffies(real_dma_timeout_ms));
 }
 
-/*
- * hd60pro_frame_tasklet - deliver one captured frame to vb2.
- *
- * Called from IRQ context (softirq) when BAR0[0x30] matches
- * dma_frame_irq_mask. Windows notes point at bit 0 for DMA done; local
- * firmware observations also show bit 10 as a frame/event notification.
- * Flow from LXV4L2D_MZ0380.ko decompilation:
- *   1. Read BAR0[0x44] bits[1:0] → active ping-pong buffer index (0-3).
- *   2. Frame payload starts at BAR0 + dma_bar0_frame_offset
- *      + buf_idx * frame_size + HD60PRO_DMA_HDR_SIZE.
- *   3. memcpy_fromio into the vb2 vmalloc buffer.
- *   4. ACK: write 0 to BAR0[0x50 + buf_idx * 4].
- *
- * If dma_bar0_frame_offset is wrong the frame will be garbage (or zeros).
- * Adjust the module parameter until dmesg shows increasing frame counts
- * and ffplay shows a real picture.
- */
-static void hd60pro_frame_tasklet(unsigned long priv)
+static bool hd60pro_deliver_dma_frame(struct hd60pro_dev *hd, u32 buf_idx,
+				      u32 frame_status, bool from_poll)
 {
-	struct hd60pro_dev *hd = (struct hd60pro_dev *)priv;
 	void __iomem *base = hd->bar0;
 	unsigned int frame_size = hd60pro_frame_size();
-	u32 buf_idx;
 	struct hd60pro_buffer *buf;
 	void *vaddr;
 	unsigned long flags;
@@ -5650,25 +5643,30 @@ static void hd60pro_frame_tasklet(unsigned long priv)
 	u32 sequence;
 	u32 dma_payload = 0;
 	u32 payload_size = frame_size;
-	u32 frame_status;
 	u8 *dma_buf = NULL;
 
 	if (!base || !hd->dma_capture_active)
-		return;
+		return false;
 
-	spin_lock_irqsave(&hd->irq_lock, flags);
-	frame_status = hd->pending_frame_status;
-	hd->pending_frame_status = 0;
-	spin_unlock_irqrestore(&hd->irq_lock, flags);
+	buf_idx &= HD60PRO_DMA_BUF_COUNT - 1;
 
-	/* BAR0[0x44] bits[1:0] = which ping-pong buffer is ready */
-	buf_idx = ioread32(base + HD60PRO_REG_DMA_BUF_IDX) & (HD60PRO_DMA_BUF_COUNT - 1);
 	if (hd->dma_frame_cpu[buf_idx]) {
 		dma_buf = (u8 *)hd->dma_frame_cpu[buf_idx];
 		dma_payload = get_unaligned_le32(dma_buf);
-		if (dma_payload && dma_payload <= frame_size)
-			payload_size = dma_payload;
 	}
+	if (!dma_buf)
+		return false;
+	if (!dma_payload || dma_payload > frame_size) {
+		if (!from_poll) {
+			iowrite8(0, base + HD60PRO_REG_DMA_ACK_BASE);
+			dev_info_ratelimited(&hd->pdev->dev,
+					     "frame event ignored: source=irq status=0x%08x buf_idx=%u invalid_header=0x%08x frame_size=%u\n",
+					     frame_status, buf_idx, dma_payload,
+					     frame_size);
+		}
+		return false;
+	}
+	payload_size = dma_payload;
 
 	/*
 	 * Per-channel ACK register: for single-channel HD60 Pro (channel 0),
@@ -5690,10 +5688,11 @@ static void hd60pro_frame_tasklet(unsigned long priv)
 		/* ACK so hardware can reuse the buffer slot */
 		iowrite8(0, base + HD60PRO_REG_DMA_ACK_BASE);
 		dev_info_ratelimited(&hd->pdev->dev,
-				     "frame event without queued vb2 buffer: status=0x%08x buf_idx=%u payload=%u header=0x%08x total=%u\n",
+				     "frame event without queued vb2 buffer: source=%s status=0x%08x buf_idx=%u payload=%u header=0x%08x total=%u\n",
+				     from_poll ? "poll" : "irq",
 				     frame_status, buf_idx, payload_size,
 				     dma_payload, hd->dma_frame_count);
-		return;
+		return true;
 	}
 	buf = list_first_entry(&hd->queued_bufs, struct hd60pro_buffer, list);
 	list_del(&buf->list);
@@ -5739,11 +5738,86 @@ static void hd60pro_frame_tasklet(unsigned long priv)
 	hd->dma_frame_count++;
 	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 	hd60pro_schedule_stream_timeout(hd);
+	hd60pro_schedule_dma_poll(hd);
 
 	dev_info_ratelimited(&hd->pdev->dev,
-			     "frame: status=0x%08x buf_idx=%u payload=%u header=0x%08x seq=%u total=%u\n",
+			     "frame: source=%s status=0x%08x buf_idx=%u payload=%u header=0x%08x seq=%u total=%u\n",
+			     from_poll ? "poll" : "irq",
 			     frame_status, buf_idx, payload_size,
 			     dma_payload, sequence, hd->dma_frame_count);
+	return true;
+}
+
+static void hd60pro_dma_poll_work(struct work_struct *work)
+{
+	struct hd60pro_dev *hd =
+		container_of(to_delayed_work(work), struct hd60pro_dev,
+			     dma_poll_work);
+	unsigned int i;
+
+	if (!real_dma_poll_ms || synthetic_v4l2 || !hd->streaming ||
+	    !hd->dma_capture_active)
+		return;
+
+	hd->dma_poll_count++;
+	for (i = 0; i < HD60PRO_DMA_BUF_COUNT; i++) {
+		u8 *dma_buf = hd->dma_frame_cpu[i];
+		u32 payload;
+
+		if (!dma_buf)
+			continue;
+		payload = get_unaligned_le32(dma_buf);
+		if (!payload || payload > hd60pro_frame_size())
+			continue;
+
+		hd60pro_deliver_dma_frame(hd, i, BIT(31) | i, true);
+		break;
+	}
+
+	hd60pro_schedule_dma_poll(hd);
+}
+
+static void hd60pro_schedule_dma_poll(struct hd60pro_dev *hd)
+{
+	if (!real_dma_poll_ms || synthetic_v4l2 || !hd->streaming ||
+	    !hd->dma_capture_active)
+		return;
+
+	mod_delayed_work(system_wq, &hd->dma_poll_work,
+			 msecs_to_jiffies(real_dma_poll_ms));
+}
+
+/*
+ * hd60pro_frame_tasklet - deliver one captured frame to vb2.
+ *
+ * Called from IRQ context (softirq) when BAR0[0x30] matches
+ * dma_frame_irq_mask. Windows notes point at bit 0 for DMA done; local
+ * firmware observations also show bit 10 as a frame/event notification.
+ * Flow from LXV4L2D_MZ0380.ko decompilation:
+ *   1. Read BAR0[0x44] bits[1:0] -> active ping-pong buffer index (0-3).
+ *   2. Copy from dma_frame_cpu[buf_idx] + 0x1000 into the vb2 buffer.
+ *   3. Clear the DMA header dword and ACK BAR0[0x50].
+ */
+static void hd60pro_frame_tasklet(unsigned long priv)
+{
+	struct hd60pro_dev *hd = (struct hd60pro_dev *)priv;
+	void __iomem *base = hd->bar0;
+	unsigned long flags;
+	u32 frame_status;
+	u32 buf_idx;
+
+	if (!base || !hd->dma_capture_active)
+		return;
+
+	spin_lock_irqsave(&hd->irq_lock, flags);
+	frame_status = hd->pending_frame_status;
+	hd->pending_frame_status = 0;
+	spin_unlock_irqrestore(&hd->irq_lock, flags);
+
+	/* BAR0[0x44] bits[1:0] = which ping-pong buffer is ready */
+	buf_idx = ioread32(base + HD60PRO_REG_DMA_BUF_IDX) &
+		  (HD60PRO_DMA_BUF_COUNT - 1);
+	hd60pro_deliver_dma_frame(hd, buf_idx, frame_status, false);
 }
 
 static int hd60pro_start_streaming(struct vb2_queue *q, unsigned int count)
@@ -5768,6 +5842,7 @@ static int hd60pro_start_streaming(struct vb2_queue *q, unsigned int count)
 		iowrite32(0, base + HD60PRO_REG_DMA_ACK_BASE);
 
 		hd->dma_frame_count = 0;
+		hd->dma_poll_count = 0;
 		hd->pending_frame_status = 0;
 		hd->dma_capture_active = true;
 
@@ -5888,8 +5963,10 @@ unlock_streaming:
 		mutex_unlock(&hd->mailbox_lock);
 		if (synthetic_v4l2)
 			hd60pro_complete_synthetic_buffers(hd);
-		else
+		else {
 			hd60pro_schedule_stream_timeout(hd);
+			hd60pro_schedule_dma_poll(hd);
+		}
 		return ret;
 	}
 
@@ -5913,6 +5990,7 @@ static void hd60pro_stop_streaming(struct vb2_queue *q)
 	struct hd60pro_dev *hd = vb2_get_drv_priv(q);
 
 	cancel_delayed_work_sync(&hd->stream_timeout_work);
+	cancel_delayed_work_sync(&hd->dma_poll_work);
 	hd->dma_capture_active = false;
 	tasklet_kill(&hd->frame_tasklet);
 
@@ -7395,6 +7473,7 @@ static int hd60pro_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		     (unsigned long)hd);
 	INIT_DELAYED_WORK(&hd->stream_timeout_work,
 			  hd60pro_stream_timeout_work);
+	INIT_DELAYED_WORK(&hd->dma_poll_work, hd60pro_dma_poll_work);
 	pci_set_drvdata(pdev, hd);
 
 	if (mailbox_bar != HD60PRO_BAR0 && mailbox_bar != HD60PRO_BAR5)

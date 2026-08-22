@@ -185,7 +185,7 @@ DMA_FRAMES="$(sed -n 's/^dma_frame_count: //p' "$TMPDIR/capture-after.txt" | tai
 
 echo
 echo "== frame_buffer_peek after stream =="
-cat "$DBG/frame_buffer_peek"
+cat "$DBG/frame_buffer_peek" | tee "$TMPDIR/frame-buffer-peek.txt"
 
 if [ "$LAST_EXTRA" = "0x00000000" ] && [ "${DMA_FRAMES:-0}" != "0" ]; then
 	echo
@@ -197,6 +197,12 @@ elif [ "$ANALYZE_STATUS" -eq 0 ]; then
 	echo "final_verdict: REAL_FRAME_CANDIDATE"
 	rmmod hd60prodrv
 	exit 0
+elif grep -Eq 'header_payload=0x00000000 .*payload_1000_10ff=NONZERO' "$TMPDIR/frame-buffer-peek.txt"; then
+	echo
+	echo "final_verdict: HEADERLESS_DMA_CANDIDATE"
+	echo "retry_hint: EXTRA_ARGS='allow_dma_headerless_frames=1' sudo -E ./scripts/test-after-cold-boot-real-frame-root.sh"
+	rmmod hd60prodrv
+	exit 14
 fi
 
 echo

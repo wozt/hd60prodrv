@@ -463,6 +463,7 @@ PREINIT_FAILED
 FIRMWARE_LOAD_TIMEOUT
 FIRMWARE_LOAD_FAILED
 FALLBACK_ONLY
+HEADERLESS_DMA_CANDIDATE
 REAL_DMA_FRAME_METADATA
 REAL_FRAME_CANDIDATE
 ```
@@ -497,7 +498,8 @@ like a real DMA frame in metadata. Validation confirmed synthetic mode reports
 Guarded headerless-DMA experiment:
 
 If `frame_buffer_peek` after streaming shows payload bytes at `+0x1000` are
-non-zero but `header_payload=0`, reload with:
+non-zero but `header_payload=0`, the cold-boot script now reports
+`HEADERLESS_DMA_CANDIDATE` and prints this retry hint:
 
 ```sh
 EXTRA_ARGS='allow_dma_headerless_frames=1' \

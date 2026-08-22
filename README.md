@@ -1,5 +1,23 @@
 # hd60prodrv
 
+## WARNING: DO NOT USE THIS DRIVER RIGHT NOW
+
+This repository is not safe for real hardware use at the moment.
+
+Recent low-level PCIe/MMIO/mailbox experiments against an Elgato HD60 Pro
+`12ab:0380` card appear to have left the card no longer enumerating on the PCIe
+bus, even after full power-off, reseating, and testing in another PC. The exact
+root cause is not proven, but the current codebase contains experimental paths
+that can put this hardware into a severe broken state.
+
+Do not build, load, run, or copy commands from this repository on an HD60 Pro
+unless you are intentionally doing board-level recovery/reverse engineering and
+accept the risk of permanently breaking the card.
+
+Known high-risk areas include PCI reset/remove-rescan recovery, raw mailbox
+writes, BAR0/BAR5 MMIO experiments, firmware download commands, and debugfs
+diagnostics that send commands to the device.
+
 Experimental Linux bring-up driver for the Elgato Game Capture HD60 Pro PCIe
 card seen as:
 

@@ -5708,6 +5708,20 @@ static bool hd60pro_dma_payload_nonzero(const u8 *dma_buf)
 	return false;
 }
 
+static void hd60pro_clear_dma_frame_buffers(struct hd60pro_dev *hd)
+{
+	size_t size = hd->dma_frame_total_size;
+	unsigned int i;
+
+	if (!size)
+		size = hd60pro_frame_size() + HD60PRO_DMA_HDR_SIZE;
+
+	for (i = 0; i < HD60PRO_DMA_BUF_COUNT; i++) {
+		if (hd->dma_frame_cpu[i])
+			memset(hd->dma_frame_cpu[i], 0, size);
+	}
+}
+
 static void hd60pro_return_queued_buffers(struct hd60pro_dev *hd,
 					  enum vb2_buffer_state state)
 {
@@ -5989,6 +6003,8 @@ static int hd60pro_start_streaming(struct vb2_queue *q, unsigned int count)
 		hd->dma_frame_count = 0;
 		hd->dma_poll_count = 0;
 		hd->pending_frame_status = 0;
+		memset(&hd->last_frame_meta, 0, sizeof(hd->last_frame_meta));
+		hd60pro_clear_dma_frame_buffers(hd);
 		hd->dma_capture_active = true;
 
 		mutex_lock(&hd->mailbox_lock);

@@ -118,6 +118,10 @@
   payload bytes at `+0x1000` are nonzero but the 4-byte payload header is zero.
   Before this, the poll worker skipped those buffers before
   `hd60pro_deliver_dma_frame()` could accept them.
+- V4L2 real-DMA stream start now clears all advertised DMA frame buffers and
+  resets `last_frame_meta` before enabling capture. This prevents stale payload
+  bytes from a previous attempt from becoming a false `HEADERLESS_DMA_CANDIDATE`
+  or a stale frame in VLC after retrying.
 
 ## What Changed In This Pass
 
@@ -560,6 +564,9 @@ header dword as a full 1080p YUYV DMA frame, covering the possibility that the
 firmware does not populate the 4-byte payload header Linux currently expects.
 It now works through both IRQ and poll delivery paths; older builds only
 accepted headerless buffers when an IRQ reached `hd60pro_deliver_dma_frame()`.
+The DMA buffers are cleared on each V4L2 stream start, so any nonzero
+`frame_buffer_peek` payload after the next cold-boot run should be fresh data
+from that run.
 
 Also map the 0x3c-byte `MassMemAccess_StartDMAC` profile completely:
 

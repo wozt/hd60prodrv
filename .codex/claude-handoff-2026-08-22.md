@@ -109,6 +109,10 @@
   the old diagnostic behavior, and `VIDIOC_ENUMAUDIO/G_AUDIO/S_AUDIO` exposes a
   single HDMI stereo audio input. ALSA/real decoded audio samples are still not
   implemented.
+- `scripts/test-after-cold-boot-real-frame-root.sh` now logs
+  `v4l2-ctl --all` and `--list-ctrls` before and after the stream attempt, so
+  the next cold-boot run records input status/control/audio-probe compatibility
+  together with the real-frame verdict.
 
 ## What Changed In This Pass
 

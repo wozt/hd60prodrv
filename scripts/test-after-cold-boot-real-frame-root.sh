@@ -142,6 +142,11 @@ echo "== V4L2 devices =="
 v4l2-ctl --list-devices 2>/dev/null || true
 
 echo
+echo "== v4l2 probe surface before stream =="
+v4l2-ctl -d "$DEVICE" --all 2>&1 | tee "$TMPDIR/v4l2-all-before.txt" || true
+v4l2-ctl -d "$DEVICE" --list-ctrls 2>&1 | tee "$TMPDIR/v4l2-ctrls-before.txt" || true
+
+echo
 echo "== capture_info before stream =="
 cat "$DBG/capture_info"
 
@@ -197,6 +202,11 @@ echo "== capture_info after stream =="
 cat "$DBG/capture_info" | tee "$TMPDIR/capture-after.txt"
 LAST_EXTRA="$(sed -n 's/^last_frame_extra: //p' "$TMPDIR/capture-after.txt" | tail -1)"
 DMA_FRAMES="$(sed -n 's/^dma_frame_count: //p' "$TMPDIR/capture-after.txt" | tail -1)"
+
+echo
+echo "== v4l2 probe surface after stream =="
+v4l2-ctl -d "$DEVICE" --all 2>&1 | tee "$TMPDIR/v4l2-all-after.txt" || true
+v4l2-ctl -d "$DEVICE" --list-ctrls 2>&1 | tee "$TMPDIR/v4l2-ctrls-after.txt" || true
 
 echo
 echo "== frame_buffer_peek after stream =="

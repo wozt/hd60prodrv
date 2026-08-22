@@ -1672,6 +1672,17 @@ event 0x6e  LOAD_FILES path; may transform payload bytes, then acks
 event 0x07  STOP_STREAMING path; runs echo '0' > /sys/vpl_pciep/hready and kills capture_app_infinite/capture_audio_8ch
 ```
 
+The ARM Linux export in `/tmp/mz0380-ghidra-stream/MZ0380_StopFirmware.c`
+confirms the host-side mailbox form for this stop path:
+
+```text
+[0x800, 0x07, 0xffffffff], length 3 dwords, wait=200000000 100 ns units
+```
+
+Linux `stop_streaming()` now sends this by default through
+`send_stream_stop_cmd07=1`, independent of the experimental legacy start
+command `0x06`.
+
 The `SET_VIC` userland format string is richer than the ISR log:
 
 ```text

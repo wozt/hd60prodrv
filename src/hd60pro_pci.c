@@ -297,6 +297,10 @@ static bool send_stream_start_cmd06;
 module_param(send_stream_start_cmd06, bool, 0444);
 MODULE_PARM_DESC(send_stream_start_cmd06, "Also send legacy/unknown mailbox cmd 0x06 after 0x29+0x2a+0x02 when real DMA capture starts");
 
+static bool send_stream_stop_cmd07 = true;
+module_param(send_stream_stop_cmd07, bool, 0444);
+MODULE_PARM_DESC(send_stream_stop_cmd07, "Send ARM/firmware STOP_STREAMING cmd 0x07 during real-DMA V4L2 streamoff");
+
 static bool allow_stream_extra_commands;
 module_param(allow_stream_extra_commands, bool, 0444);
 MODULE_PARM_DESC(allow_stream_extra_commands, "Allow explicit experimental Windows 0x2d/0x31 stream-extra packets");
@@ -6128,8 +6132,8 @@ static void hd60pro_stop_streaming(struct vb2_queue *q)
 	hd->dma_capture_active = false;
 	tasklet_kill(&hd->frame_tasklet);
 
-	/* Send cmd 0x07 only when the matching legacy cmd 0x06 was used. */
-	if (allow_dma_capture && send_stream_start_cmd06 && hd->bar0 &&
+	/* ARM MZ0380_StopFirmware sends STOP_STREAMING cmd 0x07 directly. */
+	if (allow_dma_capture && send_stream_stop_cmd07 && hd->bar0 &&
 	    hd->irq >= 0) {
 		const u32 stop[] = {
 			HD60PRO_MBOX_DOORBELL,
@@ -6147,7 +6151,7 @@ static void hd60pro_stop_streaming(struct vb2_queue *q)
 		pci_clear_master(hd->pdev);
 	} else if (allow_dma_capture && hd->bar0 && hd->irq >= 0) {
 		dev_info(&hd->pdev->dev,
-			 "stop_streaming: skipping cmd 0x07 because cmd 0x06 was not sent\n");
+			 "stop_streaming: skipping cmd 0x07 (send_stream_stop_cmd07=0)\n");
 		pci_clear_master(hd->pdev);
 	}
 

@@ -25,9 +25,9 @@
   `v4l2-ctl`/VLC can keep moving while the DMAC path is still being decoded.
 - V4L2 real-DMA mailbox startup uses `real_dma_cmd_timeout_ms` instead of fixed
   15 s command waits. Default is 3000 ms per command.
-- `stop_streaming()` skips legacy `cmd 0x07` unless `send_stream_start_cmd06=1`
-  was used. This avoids hanging userspace on stream close while `cmd 0x06` is
-  disabled by default.
+- `stop_streaming()` now sends ARM-confirmed STOP_STREAMING `cmd 0x07` by
+  default when real DMA capture was active. Disable with
+  `send_stream_stop_cmd07=0` only for diagnostics.
 - Added `scripts/load-vlc-source-root.sh` for the current user-facing load path.
 - Added `scripts/load-vlc-real-root.sh` for the explicit real-DMA VLC load path
   (`synthetic_v4l2=0`, DMA buffers, IRQ, bus master, mailbox writes). It
@@ -100,6 +100,10 @@
   controls for brightness/contrast/saturation/hue/audio volume/audio mute.
   Notes are in `docs/qcap-sdk-notes.md`, with a reproducible helper at
   `scripts/analyze-qcap-sdk.sh`.
+- Rechecked the ARM Ghidra export in `/tmp/mz0380-ghidra-stream/`: its
+  `MZ0380_StopFirmware` sends `[0x800, 0x07, 0xffffffff]` with the same
+  `200000000` 100 ns timeout model as stream-start commands. Linux stream-off
+  now mirrors that instead of tying `cmd 0x07` to experimental `cmd 0x06`.
 
 ## What Changed In This Pass
 

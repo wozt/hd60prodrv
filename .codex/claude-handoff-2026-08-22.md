@@ -319,6 +319,15 @@ If `send_stream_extra_commands=1` is also set, the V4L2 real-DMA startup and
 This is deliberately for exact Windows trace payloads only; do not use guessed
 values.
 
+New `cmd 0x02` guard:
+
+The current decoded DMA-advertisement packet carries four 32-bit host buffer
+addresses in dwords 5/7/9/11, with zeroes in the alternating dwords. Linux now
+uses one shared builder for V4L2 real-DMA, `cmd02_dma_setup`, and
+`stream_start_test`. If any coherent DMA buffer is above 4 GiB, the driver
+refuses to send `cmd 0x02` and prints a `force_32bit_dma=1` hint. This avoids
+silent address truncation and makes no-frame results meaningful.
+
 Added offline extractor:
 
 ```sh

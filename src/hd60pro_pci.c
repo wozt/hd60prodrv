@@ -3426,6 +3426,7 @@ static int hd60pro_dma_info_show(struct seq_file *s, void *unused)
 	seq_printf(s, "frame_cpu[0]: %px\n", hd->dma_frame_cpu[0]);
 	seq_printf(s, "frame_dma[0]: %pad\n", &hd->dma_frame_dma[0]);
 	seq_printf(s, "frame_size: %zu\n", hd->dma_frame_size);
+	seq_puts(s, "cmd02_dma_address_model: decoded 32-bit addresses in dwords 5/7/9/11; force_32bit_dma=1 is required for meaningful real-DMA tests\n");
 	seq_printf(s, "windows_device_0xd0_control_cpu: %px\n",
 		   hd->win_dma_control_cpu);
 	seq_printf(s, "windows_device_0xc8_control_dma: %pad\n",
@@ -3445,6 +3446,11 @@ static int hd60pro_dma_info_show(struct seq_file *s, void *unused)
 			   i, &hd->win_dma_channel_dma[i]);
 		seq_printf(s, "windows_device_channel%u_size: %zu\n",
 			   i, hd->win_dma_channel_size[i]);
+	}
+	for (i = 0; i < HD60PRO_DMA_BUF_COUNT; i++) {
+		seq_printf(s, "cmd02_dma_frame[%u]: 0x%016llx fits32=%d\n",
+			   i, (unsigned long long)hd->dma_frame_dma[i],
+			   hd->dma_frame_dma[i] && !(hd->dma_frame_dma[i] >> 32));
 	}
 	if (desc) {
 		seq_printf(s, "host_desc_magic: 0x%08x\n",
@@ -5402,6 +5408,59 @@ struct hd60pro_buffer {
 static void hd60pro_complete_synthetic_buffers(struct hd60pro_dev *hd);
 static void hd60pro_schedule_stream_timeout(struct hd60pro_dev *hd);
 
+static int hd60pro_build_cmd02_packet(struct hd60pro_dev *hd, u32 packet[12],
+				      struct seq_file *s)
+{
+	u32 frame_size = hd60pro_frame_size();
+	unsigned int i;
+
+	for (i = 0; i < HD60PRO_DMA_BUF_COUNT; i++) {
+		u64 dma = hd->dma_frame_dma[i];
+
+		if (!dma) {
+			if (s)
+				seq_printf(s, "cmd_0x02: missing dma_frame_dma[%u]\n", i);
+			else
+				dev_warn(&hd->pdev->dev,
+					 "cmd_0x02: missing dma_frame_dma[%u]\n", i);
+			return -ENODEV;
+		}
+
+		/*
+		 * The decoded MZ0380 command-0x02 path currently carries four
+		 * 32-bit host physical addresses in dwords 5/7/9/11, with
+		 * zeroes in the alternating dwords.  Do not silently truncate a
+		 * >32-bit DMA address; that makes a no-frame test meaningless.
+		 */
+		if (dma >> 32) {
+			if (s)
+				seq_printf(s,
+					   "cmd_0x02: dma_frame_dma[%u]=0x%016llx does not fit decoded 32-bit packet; reload with force_32bit_dma=1\n",
+					   i, (unsigned long long)dma);
+			else
+				dev_warn(&hd->pdev->dev,
+					 "cmd_0x02: dma_frame_dma[%u]=0x%016llx does not fit decoded 32-bit packet; reload with force_32bit_dma=1\n",
+					 i, (unsigned long long)dma);
+			return -ERANGE;
+		}
+	}
+
+	packet[0]  = HD60PRO_MBOX_DOORBELL;
+	packet[1]  = 0x02;
+	packet[2]  = 0;
+	packet[3]  = frame_size;
+	packet[4]  = 0;
+	packet[5]  = (u32)hd->dma_frame_dma[0];
+	packet[6]  = 0;
+	packet[7]  = (u32)hd->dma_frame_dma[1];
+	packet[8]  = 0;
+	packet[9]  = (u32)hd->dma_frame_dma[2];
+	packet[10] = 0;
+	packet[11] = (u32)hd->dma_frame_dma[3];
+
+	return 0;
+}
+
 static int hd60pro_queue_setup(struct vb2_queue *q, unsigned int *nbuffers,
 			       unsigned int *nplanes, unsigned int sizes[],
 			       struct device *alloc_devs[])
@@ -5776,20 +5835,10 @@ static int hd60pro_start_streaming(struct vb2_queue *q, unsigned int count)
 		/* Step 3: cmd 0x02 — advertise 4 DMA buffer addresses */
 		if (hd->dma_frame_dma[0]) {
 			u32 pkt02[12];
-			unsigned int frame_size = hd60pro_frame_size();
 
-			pkt02[0]  = HD60PRO_MBOX_DOORBELL;
-			pkt02[1]  = 0x02;
-			pkt02[2]  = 0;
-			pkt02[3]  = frame_size;
-			pkt02[4]  = 0;
-			pkt02[5]  = (u32)(hd->dma_frame_dma[0] & 0xffffffffULL);
-			pkt02[6]  = 0;
-			pkt02[7]  = (u32)(hd->dma_frame_dma[1] & 0xffffffffULL);
-			pkt02[8]  = 0;
-			pkt02[9]  = (u32)(hd->dma_frame_dma[2] & 0xffffffffULL);
-			pkt02[10] = 0;
-			pkt02[11] = (u32)(hd->dma_frame_dma[3] & 0xffffffffULL);
+			ret = hd60pro_build_cmd02_packet(hd, pkt02, NULL);
+			if (ret)
+				goto unlock_streaming;
 
 			iowrite32(0, base + HD60PRO_REG_MBOX_COMPLETE);
 			ret = hd60pro_mailbox_send_async_locked(hd, pkt02,
@@ -6397,18 +6446,11 @@ static int hd60pro_cmd02_dma_setup_show(struct seq_file *s, void *unused)
 		   (unsigned long long)hd->dma_frame_dma[0],
 		   (unsigned long long)hd->dma_frame_dma[1], frame_size);
 
-	packet[0]  = HD60PRO_MBOX_DOORBELL;
-	packet[1]  = 0x02;
-	packet[2]  = 0;          /* channel */
-	packet[3]  = frame_size; /* per-buffer pixel payload size */
-	packet[4]  = 0;
-	packet[5]  = (u32)(hd->dma_frame_dma[0] & 0xffffffffULL);  /* buf0 low32 */
-	packet[6]  = 0;
-	packet[7]  = (u32)(hd->dma_frame_dma[1] & 0xffffffffULL);  /* buf1 low32 */
-	packet[8]  = 0;
-	packet[9]  = (u32)(hd->dma_frame_dma[2] & 0xffffffffULL);  /* buf2 low32 */
-	packet[10] = 0;
-	packet[11] = (u32)(hd->dma_frame_dma[3] & 0xffffffffULL);  /* buf3 low32 */
+	ret = hd60pro_build_cmd02_packet(hd, packet, s);
+	if (ret) {
+		seq_printf(s, "cmd02_dma_setup: blocked ret=%d\n", ret);
+		return 0;
+	}
 
 	/* Clear per-buffer ack registers before DMA starts */
 	iowrite32(0, hd->bar0 + 0x050);
@@ -6754,18 +6796,11 @@ static int hd60pro_stream_start_test_show(struct seq_file *s, void *unused)
 		u32 frame_size = hd60pro_frame_size();
 		u32 pkt02[12];
 
-		pkt02[0]  = HD60PRO_MBOX_DOORBELL;
-		pkt02[1]  = 0x02;
-		pkt02[2]  = 0;
-		pkt02[3]  = frame_size;
-		pkt02[4]  = 0;
-		pkt02[5]  = (u32)(hd->dma_frame_dma[0] & 0xffffffffULL);
-		pkt02[6]  = 0;
-		pkt02[7]  = (u32)(hd->dma_frame_dma[1] & 0xffffffffULL);
-		pkt02[8]  = 0;
-		pkt02[9]  = (u32)(hd->dma_frame_dma[2] & 0xffffffffULL);
-		pkt02[10] = 0;
-		pkt02[11] = (u32)(hd->dma_frame_dma[3] & 0xffffffffULL);
+		ret = hd60pro_build_cmd02_packet(hd, pkt02, s);
+		if (ret) {
+			seq_printf(s, "cmd_0x02: blocked ret=%d\n", ret);
+			return 0;
+		}
 
 		seq_printf(s, "cmd_0x02: frame_size=0x%x buf[0]=0x%08x buf[1]=0x%08x\n",
 			   frame_size, pkt02[5], pkt02[7]);

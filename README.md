@@ -128,6 +128,11 @@ runs base firmware load before exposing the V4L2 real-DMA path. Set
 to black buffers when the firmware produces no frame, but it exercises the
 mailbox/DMA startup path instead of pure synthetic mode.
 
+The decoded command `0x02` DMA advertisement currently carries four 32-bit host
+buffer addresses. The real-DMA scripts therefore load with `force_32bit_dma=1`.
+If a future manual load omits that and coherent buffers land above 4 GiB, the
+driver refuses to send `cmd 0x02` instead of silently truncating DMA addresses.
+
 Audio capture is not exposed as ALSA yet. The decoded firmware audio path is
 tracked in `docs/audio-driver-notes.md`.
 

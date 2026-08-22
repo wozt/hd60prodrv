@@ -283,6 +283,12 @@ firmware mailbox. That may be necessary, but there is no decoded evidence yet
 that `cmd 0x02` alone causes firmware to build the MassMemAccess request fields
 above or submit `/dev/vpl_dmac` ioctl `0xde00`.
 
+Correction to older notes: `cmd 0x02` is not proven to write VPL_DMAC
+`profile+0x38` or BAR5+0x54 directly. `profile+0x38..0x3b` are the
+byte-sized outbound controls from option `0x50`; host frame addresses live in
+the 32-bit `cmd 0x02` packet and must still be tied to tinyvenc's decoded
+`0x90000000` aperture path.
+
 The next useful reverse target is tinyvenc's call site for
 `TK_MMA_StartOneFrame`/`TK_MMA_ProcessOneFrame`.
 

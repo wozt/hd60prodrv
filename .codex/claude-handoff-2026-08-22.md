@@ -483,6 +483,14 @@ uses one shared builder for V4L2 real-DMA, `cmd02_dma_setup`, and
 refuses to send `cmd 0x02` and prints a `force_32bit_dma=1` hint. This avoids
 silent address truncation and makes no-frame results meaningful.
 
+Important correction after the tinyvenc7/MassMemAccess reverse work:
+`cmd 0x02` should no longer be described as writing DMAC `profile+0x38` or
+BAR5+0x54 directly. `profile+0x38..0x3b` are byte-sized
+`pcie_set_outbound()` controls from MassMemAccess option `0x50`. The current
+working model is that `cmd 0x02` advertises host buffers, while tinyvenc's
+actual MMA requests target `request+0x38 = 0x90000000`; the missing proof is
+how the advertised host buffers are bound behind that endpoint aperture.
+
 New real-frame verifier:
 
 ```sh

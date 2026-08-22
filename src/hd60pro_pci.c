@@ -6779,11 +6779,11 @@ static int hd60pro_bar5_full_show(struct seq_file *s, void *unused)
 DEFINE_SHOW_ATTRIBUTE(hd60pro_bar5_full);
 
 /*
- * cmd02_dma_setup: send command 0x02 (12 dwords) to advertise host DMA buffer
- * addresses to the firmware.
+ * cmd02_dma_setup: send command 0x02 (12 dwords) to advertise host DMA
+ * buffer addresses to the firmware.
  *
- * From MZ0380_HwInitialize (ARM firmware) decompilation, for our card type
- * (single-channel, non-multi):
+ * From the decoded MZ0380 stream path, for our current single-channel
+ * 1080p60 test shape:
  *
  *   packet[0]  = 0x800         (doorbell)
  *   packet[1]  = 0x02          (command ID)
@@ -6798,9 +6798,13 @@ DEFINE_SHOW_ATTRIBUTE(hd60pro_bar5_full);
  *   packet[10] = 0
  *   packet[11] = buf3_phys     (buffer 3)
  *
- * The firmware stores these addresses in the DMAC profile (+0x38), and
- * pcie_set_outbound() programs BAR5[0x54] from the profile when DMA starts.
- * Without this command, BAR5[0x54] points to firmware-internal memory.
+ * Newer ARM firmware reverse engineering shows these dwords do not map
+ * directly to VPL_DMAC profile+0x38.  profile+0x38..0x3b are byte-sized
+ * pcie_set_outbound controls produced by MassMemAccess option 0x50.  The
+ * tinyvenc7 video path instead submits MassMemAccess requests with
+ * request+0x38 = 0x90000000 and request+0x34 = a firmware-side descriptor or
+ * payload buffer pointer.  The unresolved binding is how these host buffer
+ * addresses become visible behind that 0x90000000 endpoint aperture.
  *
  * All four slots use their own dedicated DMA buffer (4-buffer mode).
  * Also clears BAR0[0x50..0x5c] (per-buffer DMA ack registers) before sending.
@@ -6831,6 +6835,8 @@ static int hd60pro_cmd02_dma_setup_show(struct seq_file *s, void *unused)
 	seq_printf(s, "cmd02_dma_setup: dma[0]=0x%016llx dma[1]=0x%016llx frame_size=0x%x\n",
 		   (unsigned long long)hd->dma_frame_dma[0],
 		   (unsigned long long)hd->dma_frame_dma[1], frame_size);
+	seq_puts(s, "cmd02_dma_setup: decoded packet carries host addrs in dwords 5/7/9/11; it is not proven to write DMAC profile+0x38\n");
+	seq_puts(s, "cmd02_dma_setup: tinyvenc7 MMA requests use request+0x38=0x90000000; this test probes whether cmd 0x02 binds host addrs behind that aperture\n");
 
 	ret = hd60pro_build_cmd02_packet(hd, packet, s);
 	if (ret) {
@@ -6856,9 +6862,8 @@ static int hd60pro_cmd02_dma_setup_show(struct seq_file *s, void *unused)
 	else
 		seq_printf(s, "cmd02_dma_setup: OK completion=0x%08x\n", completion);
 
-	seq_printf(s, "cmd02_dma_setup: BAR5[0x54]=0x%08x (should now be 0x%08x after DMA)\n",
-		   hd->bar5 ? ioread32(hd->bar5 + 0x054) : 0xdeadbeef,
-		   (u32)(hd->dma_frame_dma[0] & 0xffffffffULL));
+	seq_printf(s, "cmd02_dma_setup: BAR5[0x54]=0x%08x (diagnostic only; not expected to equal buf0 without decoded pcie_set_outbound binding)\n",
+		   hd->bar5 ? ioread32(hd->bar5 + 0x054) : 0xdeadbeef);
 
 	return 0;
 }

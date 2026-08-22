@@ -77,6 +77,14 @@
   endpoint/mailbox is still not accepting host doorbells in the current
   non-cold-boot state. A short 2-attempt validation after the classification
   patch now reports `classification: doorbell_all_ones_without_irq`.
+- Added read-only `mailbox_compare` to dump the BAR0 and BAR5 candidate mailbox
+  offsets side by side in the same hardware state. The cold-boot real-frame
+  script now prints it before and after `preinit_command1`; use it to prove
+  whether the failure is BAR0-specific or both candidate windows are inert.
+  BAR5 was tested once with a single 20 ms preinit attempt and is not a safe
+  mailbox alternative: it changed PCI config and both BAR windows to
+  `0xffffffff`; `lspci` then reported `Unknown header type 7f`. The script now
+  blocks `MAILBOX_BAR=5` unless `ALLOW_UNSAFE_MAILBOX_BAR5=1` is set.
 
 ## What Changed In This Pass
 
@@ -103,6 +111,7 @@
   - `setvic_inject`
   - `stream_start_test`
   - `frame_buffer_peek`
+  - `mailbox_compare`
   - `firmware_pcie_outbound_regs`
   - `firmware_dmac_outbound_path`
   - `firmware_audio_path`

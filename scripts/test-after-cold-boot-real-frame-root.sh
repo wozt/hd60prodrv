@@ -18,6 +18,13 @@ OUT="${OUT:-/tmp/hd60prodrv-cold-real-v4l2.yuyv}"
 FRAME_BYTES="${FRAME_BYTES:-4147200}"
 PREINIT_TIMEOUT="${PREINIT_TIMEOUT:-65s}"
 FIRMWARE_LOAD_TIMEOUT="${FIRMWARE_LOAD_TIMEOUT:-220s}"
+MAILBOX_BAR="${MAILBOX_BAR:-0}"
+
+if [ "$MAILBOX_BAR" != "0" ] && [ "${ALLOW_UNSAFE_MAILBOX_BAR5:-0}" != "1" ]; then
+	echo "MAILBOX_BAR=$MAILBOX_BAR is blocked by default: BAR5 mailbox writes made PCI config/MMIO read 0xffffffff in local testing." >&2
+	echo "Use ALLOW_UNSAFE_MAILBOX_BAR5=1 only for deliberate recovery-lab diagnostics after reading the handoff." >&2
+	exit 2
+fi
 
 if ! command -v v4l2-ctl >/dev/null 2>&1; then
 	echo "v4l2-ctl is required" >&2
@@ -44,7 +51,7 @@ rmmod hd60prodrv 2>/dev/null || true
 	firmware_load_mode="${FIRMWARE_LOAD_MODE:-base}" \
 	firmware_base_selector="${FIRMWARE_BASE_SELECTOR:-1}" \
 	firmware_name="${FIRMWARE_NAME:-hd60prodrv/MZ0380.HD.HEX}" \
-	mailbox_bar=0 \
+	mailbox_bar="$MAILBOX_BAR" \
 	${EXTRA_ARGS:-}
 
 DBG="/sys/kernel/debug/hd60prodrv/0000:22:00.0"
@@ -64,6 +71,10 @@ echo "== windows_preinit_state before =="
 cat "$DBG/windows_preinit_state"
 
 echo
+echo "== mailbox_compare before =="
+cat "$DBG/mailbox_compare"
+
+echo
 echo "== preinit_command1 =="
 set +e
 timeout "$PREINIT_TIMEOUT" cat "$DBG/preinit_command1" >"$TMPDIR/preinit.txt"
@@ -78,6 +89,10 @@ grep -E '^(result|classification|attempts_run|success_count|timeout_count|enodev
 echo
 echo "== windows_preinit_state after preinit =="
 cat "$DBG/windows_preinit_state"
+
+echo
+echo "== mailbox_compare after preinit =="
+cat "$DBG/mailbox_compare"
 
 if [ "$PREINIT_STATUS" -ne 0 ]; then
 	echo

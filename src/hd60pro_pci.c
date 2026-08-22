@@ -7255,6 +7255,65 @@ static int hd60pro_mailbox_regs_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(hd60pro_mailbox_regs);
 
+static void hd60pro_mailbox_compare_dump_bar(struct seq_file *s,
+					     const char *name,
+					     u8 __iomem *bytes,
+					     resource_size_t len)
+{
+	static const unsigned int offsets[] = {
+		0x000, 0x004, 0x008, 0x00c, 0x010, 0x014,
+		0x02c, 0x030,
+		0x040, 0x044, 0x048, 0x04c,
+		0x050, 0x054, 0x058, 0x05c,
+		0x060, 0x064, 0x068, 0x06c,
+		0x0d4, 0x0dc,
+	};
+	unsigned int i;
+
+	seq_printf(s, "%s_mapped: %d\n", name, !!bytes);
+	seq_printf(s, "%s_len: %pa\n", name, &len);
+	if (!bytes)
+		return;
+
+	seq_printf(s, "%s_window_dead: %d\n", name,
+		   hd60pro_mmio_window_dead(bytes));
+	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
+		unsigned int offset = offsets[i];
+		const char *reg_name = hd60pro_mailbox_reg_name(offset);
+
+		if (offset + sizeof(u32) > len)
+			continue;
+		seq_printf(s, "%s_0x%03x: 0x%08x %s\n", name, offset,
+			   ioread32(bytes + offset), reg_name ? reg_name : "-");
+	}
+}
+
+static int hd60pro_mailbox_compare_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	u16 pci_command;
+	u16 pci_status;
+
+	if (!mmio_dump) {
+		seq_puts(s, "disabled; reload with mmio_dump=1 for read-only diagnostics\n");
+		return 0;
+	}
+
+	pci_read_config_word(hd->pdev, PCI_COMMAND, &pci_command);
+	pci_read_config_word(hd->pdev, PCI_STATUS, &pci_status);
+
+	seq_puts(s, "mailbox_compare: read-only BAR0/BAR5 candidate mailbox snapshot\n");
+	seq_printf(s, "selected_mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
+	seq_printf(s, "pci_command: 0x%04x\n", pci_command);
+	seq_printf(s, "pci_status: 0x%04x\n", pci_status);
+	seq_printf(s, "pci_current_state: %d\n", hd->pdev->current_state);
+	hd60pro_mailbox_compare_dump_bar(s, "bar0", hd->bar0, hd->bar0_len);
+	hd60pro_mailbox_compare_dump_bar(s, "bar5", hd->bar5, hd->bar5_len);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_mailbox_compare);
+
 static int hd60pro_windows_preinit_state_show(struct seq_file *s, void *unused)
 {
 	struct hd60pro_dev *hd = s->private;
@@ -7567,6 +7626,8 @@ static void hd60pro_debugfs_init(struct hd60pro_dev *hd)
 			    &hd60pro_bar5_regs_fops);
 	debugfs_create_file("mailbox_regs", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_mailbox_regs_fops);
+	debugfs_create_file("mailbox_compare", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_mailbox_compare_fops);
 	debugfs_create_file("windows_preinit_state", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_windows_preinit_state_fops);
 	debugfs_create_file("bar5_full", 0400, hd->debugfs_dir, hd,

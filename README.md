@@ -237,6 +237,17 @@ This script pins power management without reset, records `windows_preinit_state`
 runs the Windows-style `preinit_command1`, and sends `fw_status_command10` only
 if preinit completes.
 
+To use the cold-boot window for the full frame objective, run the one-shot
+real-frame path instead:
+
+```sh
+sudo ./scripts/test-after-cold-boot-real-frame-root.sh
+```
+
+It keeps one module instance loaded, runs preinit, base firmware load, V4L2
+real-DMA streaming, and raw frame analysis. Success means non-fallback YUYV data
+was captured from `/dev/video0`.
+
 ## Development Plan
 
 1. Bring-up and inventory

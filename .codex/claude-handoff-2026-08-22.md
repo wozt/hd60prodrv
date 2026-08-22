@@ -444,19 +444,35 @@ fields copied into stack temporaries around `sp+0x140..0x240`.
 
 ## Suggested Next Target
 
-After a full host power cycle, first run:
+After a full host power cycle, the most goal-directed test is:
 
 ```sh
-sudo ./scripts/test-after-cold-boot-root.sh
+sudo ./scripts/test-after-cold-boot-real-frame-root.sh
 ```
 
-If `preinit_command1` succeeds again, run the post-logo path and inspect
-`stream_start_test`. If `0x29/0x2a/0x02` still produces no DMA frames, the next
-static target is the exact Windows `0x2d` and `0x31` 1080p60 payload sequence.
-Start from `windows_stream_extra_commands`, then map the sanitized mode-table
-values feeding `MZ0380_StartFirmware.c` lines 1176..1311. Static `scale_tb[4]`
-only proves the 1920x1080 row; the remaining fields must come from runtime
-stream state or a Windows trace.
+It keeps one module instance loaded and runs power prep, preinit, base firmware
+load, V4L2 real-DMA streaming, and fallback-vs-real frame analysis. Its
+`final_verdict` is the quickest answer to whether the current cold boot produced
+hardware frame bytes.
+
+Possible verdicts:
+
+```text
+PREINIT_TIMEOUT
+PREINIT_FAILED
+FIRMWARE_LOAD_TIMEOUT
+FIRMWARE_LOAD_FAILED
+FALLBACK_ONLY
+REAL_FRAME_CANDIDATE
+```
+
+If that script reaches firmware success but reports `FALLBACK_ONLY`, inspect
+`capture_info` and then test exact Windows `0x2d` and `0x31` 1080p60 payloads
+through `EXTRA_ARGS`. Start from `windows_stream_extra_commands` and
+`decode-mz0380-stream-tables.py --module-args-template`, then map the sanitized
+mode-table values feeding `MZ0380_StartFirmware.c` lines 1176..1311. Static
+`scale_tb[4]` only proves the 1920x1080 row; the remaining fields must come
+from runtime stream state or a Windows trace.
 
 Also map the 0x3c-byte `MassMemAccess_StartDMAC` profile completely:
 

@@ -402,6 +402,27 @@ kernel PCI device. `test-after-cold-boot-root.sh` also prints sysfs
 `d3cold_allowed` before the preinit attempt. Read-only validation showed
 `pci_current_state: 0` in the current boot state.
 
+Base-firmware cold-boot script update:
+
+`scripts/test-after-cold-boot-base-fw-root.sh` now prints the same PCI power
+state and condensed `preinit summary` as the main cold-boot script. If preinit
+succeeds, it also prints a condensed `firmware_load summary`.
+
+The `firmware_load` debugfs node now emits a `classification` field:
+
+```text
+prepare_timeout
+prepare_mailbox_or_mmio_dead
+prepare_error
+commit_timeout
+commit_mailbox_or_mmio_dead
+commit_error
+firmware_load_completed
+```
+
+Use this script after PSU cold boot when the goal is to immediately test the
+Windows base-firmware `0x0e/0x0f` path after a successful preinit.
+
 Added offline extractor:
 
 ```sh

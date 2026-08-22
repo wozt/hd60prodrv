@@ -5292,6 +5292,7 @@ static int hd60pro_firmware_load_show(struct seq_file *s, void *unused)
 	u32 commit_irq_delta = 0;
 	size_t prepare_dwords;
 	unsigned int commit_timeout_ms;
+	const char *classification = "not_started";
 	bool base_mode;
 	bool full_mode;
 	int ret;
@@ -5394,8 +5395,12 @@ static int hd60pro_firmware_load_show(struct seq_file *s, void *unused)
 	seq_printf(s, "prepare_result: %d\n", ret);
 	seq_printf(s, "prepare_completion: 0x%08x\n", prepare_completion);
 	seq_printf(s, "prepare_irq_delta: %u\n", prepare_irq_delta);
-	if (ret)
+	if (ret) {
+		classification = ret == -ETIMEDOUT ? "prepare_timeout" :
+				 ret == -ENODEV ? "prepare_mailbox_or_mmio_dead" :
+				 "prepare_error";
 		goto out_unlock;
+	}
 
 	memcpy_toio(base + HD60PRO_FW_WINDOW_OFFSET, fw->data, fw->size);
 	wmb();
@@ -5411,6 +5416,12 @@ static int hd60pro_firmware_load_show(struct seq_file *s, void *unused)
 	seq_printf(s, "commit_result: %d\n", ret);
 	seq_printf(s, "commit_completion: 0x%08x\n", commit_completion);
 	seq_printf(s, "commit_irq_delta: %u\n", commit_irq_delta);
+	if (ret)
+		classification = ret == -ETIMEDOUT ? "commit_timeout" :
+				 ret == -ENODEV ? "commit_mailbox_or_mmio_dead" :
+				 "commit_error";
+	else
+		classification = "firmware_load_completed";
 	msleep(100);
 
 out_unlock:
@@ -5427,6 +5438,7 @@ out_unlock:
 		   hd60pro_mailbox_bar_name(), status2);
 	seq_printf(s, "windows_success_condition_bar_%s_0x08_eq_0: %d\n",
 		   hd60pro_mailbox_bar_name(), status0 == 0);
+	seq_printf(s, "classification: %s\n", classification);
 	seq_printf(s, "result: %d\n", ret);
 	release_firmware(fw);
 

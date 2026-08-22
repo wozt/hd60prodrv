@@ -965,6 +965,7 @@ static int hd60pro_preinit_command1_show(struct seq_file *s, void *unused)
 		   success_count ? "preinit_completed" :
 		   enodev_count ? "mailbox_or_mmio_dead" :
 		   total_irq_delta ? "interrupt_without_completion" :
+		   final_doorbell == U32_MAX ? "doorbell_all_ones_without_irq" :
 		   first_completion_change ? "completion_changed_without_success" :
 		   "mailbox_silent_timeout");
 

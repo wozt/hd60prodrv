@@ -70,6 +70,13 @@
 - Safe V4L2 smoke retested after these script edits:
   `v4l2-ctl --device=/dev/video0 --stream-mmap --stream-count=1` produced a
   4,147,200-byte YUYV frame. This validates the V4L2 node/fallback path only.
+- Current local retest after the latest pushed diagnostics still fails before
+  firmware load: `sudo ./scripts/test-after-cold-boot-real-frame-root.sh`
+  reports `final_verdict: PREINIT_FAILED`, zero IRQ delta, BAR0+0x30 stays
+  zero, and `final_doorbell_bar0_000: 0xffffffff`. This strongly indicates the
+  endpoint/mailbox is still not accepting host doorbells in the current
+  non-cold-boot state. A short 2-attempt validation after the classification
+  patch now reports `classification: doorbell_all_ones_without_irq`.
 
 ## What Changed In This Pass
 

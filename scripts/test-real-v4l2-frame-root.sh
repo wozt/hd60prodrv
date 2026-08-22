@@ -9,6 +9,9 @@ fi
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$ROOT"
 
+TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR"' EXIT
+
 DEVICE="${DEVICE:-/dev/video0}"
 FRAMES="${FRAMES:-4}"
 OUT="${OUT:-/tmp/hd60prodrv-real-v4l2.yuyv}"
@@ -86,7 +89,14 @@ set -e
 echo
 echo "== capture_info after =="
 if [ -r "$DBG/capture_info" ]; then
-	cat "$DBG/capture_info"
+	cat "$DBG/capture_info" | tee "$TMPDIR/capture-after.txt"
+	LAST_EXTRA="$(sed -n 's/^last_frame_extra: //p' "$TMPDIR/capture-after.txt" | tail -1)"
+	DMA_FRAMES="$(sed -n 's/^dma_frame_count: //p' "$TMPDIR/capture-after.txt" | tail -1)"
+	if [ "$LAST_EXTRA" = "0x00000000" ] && [ "${DMA_FRAMES:-0}" != "0" ]; then
+		echo
+		echo "metadata_result: REAL_DMA_FRAME_METADATA"
+		exit 0
+	fi
 fi
 
 exit "$ANALYZE_STATUS"

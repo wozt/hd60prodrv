@@ -179,13 +179,20 @@ set -e
 
 echo
 echo "== capture_info after stream =="
-cat "$DBG/capture_info"
+cat "$DBG/capture_info" | tee "$TMPDIR/capture-after.txt"
+LAST_EXTRA="$(sed -n 's/^last_frame_extra: //p' "$TMPDIR/capture-after.txt" | tail -1)"
+DMA_FRAMES="$(sed -n 's/^dma_frame_count: //p' "$TMPDIR/capture-after.txt" | tail -1)"
 
 echo
 echo "== frame_buffer_peek after stream =="
 cat "$DBG/frame_buffer_peek"
 
-if [ "$ANALYZE_STATUS" -eq 0 ]; then
+if [ "$LAST_EXTRA" = "0x00000000" ] && [ "${DMA_FRAMES:-0}" != "0" ]; then
+	echo
+	echo "final_verdict: REAL_DMA_FRAME_METADATA"
+	rmmod hd60prodrv
+	exit 0
+elif [ "$ANALYZE_STATUS" -eq 0 ]; then
 	echo
 	echo "final_verdict: REAL_FRAME_CANDIDATE"
 	rmmod hd60prodrv

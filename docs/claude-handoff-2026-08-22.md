@@ -197,6 +197,73 @@ pcie_set_outbound(profile+0x38, profile+0x39, profile+0x3a)
 but only after firmware userspace built and submitted a valid 0x3c-byte DMAC
 profile.
 
+New focused profile/request notes are in `docs/dmac-profile-notes.md`.
+
+Useful new reverse facts from `/tmp/mma-set-options.txt`,
+`/tmp/mma-start-one-frame.txt`, and `/tmp/mma-process-one-frame.txt`:
+
+```text
+MassMemAccess_SetOptions option 0x50:
+  object+0x60 = (u8)opt+0x04
+  object+0x61 = (u8)opt+0x08
+  object+0x62 = (u8)opt+0x0c
+  object+0x63 = 1
+
+MassMemAccess_SetOptions option 0x17:
+  validates base/size/stride/object+0x50 and rejects size&7
+  for size > 0x800, splits work into (size + 0x7ff) >> 11 chunks
+
+MassMemAccess_ProcessOneFrame mode 3:
+  chunks are <=0x800 bytes
+  object+0x58 = request+0x34 + (chunk << 11)
+  object+0x5c = request+0x38 + (chunk << 11)
+  object+0x54 = object+0x50 + chunk * (request+0x20 << 8)
+  helper 0xa64 starts the DMAC profile and helper 0x9d4 waits
+```
+
+Current implementation implication: Linux `cmd 0x02` advertises the four
+coherent host frame buffer addresses, but it is not yet proven to populate the
+MassMemAccess request consumed by `StartOneFrame`/`ProcessOneFrame` or submit
+`/dev/vpl_dmac` ioctl `0xde00`. The next useful reverse target is the
+host-to-firmware event path that builds that request from Windows stream
+commands, SET_VIC/channel_done, or tinyvenc/libvideocap state.
+
+Do not add guessed DMAC MMR writes. Either trigger the firmware path that builds
+the 0x3c profile, or mirror a fully decoded profile after request construction
+is understood.
+
+Additional tinyvenc link decoded in this pass:
+
+```text
+tinyvenc5/tinyvenc7/tinyvenc8 import:
+  VideoCap_GetBufVIC
+  VideoCap_StartVIC
+  TK_MMA_StartOneFrame
+  TK_MMA_ProcessOneFrame
+  TK_MMA_WaitOneFrameComplete
+  TK_MMA_SetOptions
+
+TK_MMA_StartOneFrame/TK_MMA_ProcessOneFrame wrappers:
+  if r0 == NULL: return -1
+  massmem_object = *(u32 *)r0
+  request = r0 + 4
+  r1 -> wrapper/request +0x3c
+  r2 -> wrapper/request +0x38
+  r3 -> wrapper/request +0x18
+  call MassMemAccess_StartOneFrame or MassMemAccess_ProcessOneFrame
+
+VideoCap_GetBufVIC:
+  ioctl(fd, 0x8078e303)
+  stack+0x5c/+0x60/+0x64 -> MemMgr_GetVirtAddr -> output+0x38/+0x3c/+0x40
+  stack+0x90 low 13 bits -> output+0x54
+  stack+0x90 bits 16..28 -> output+0x50
+```
+
+This makes tinyvenc7's call sites for `VideoCap_GetBufVIC` and `TK_MMA_*` the
+highest-value static reverse target. It should reveal how VIC buffer records
+become MassMemAccess request fields and whether the host `cmd 0x02` addresses
+are consumed in that bridge.
+
 ## Reverse Engineering Notes
 
 Useful ARM/Linux firmware root:

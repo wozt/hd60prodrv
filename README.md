@@ -241,7 +241,8 @@ sudo ./scripts/test-after-cold-boot-root.sh
 
 This script pins power management without reset, records `windows_preinit_state`,
 runs the Windows-style `preinit_command1`, and sends `fw_status_command10` only
-if preinit completes.
+if preinit completes. The preinit path now waits 2 s per attempt, matching the
+ARM MZ0380 Linux driver's `20000000` 100 ns timeout for command `0x01`.
 
 To use the cold-boot window for the full frame objective, run the one-shot
 real-frame path instead:

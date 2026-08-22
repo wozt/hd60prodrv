@@ -37,9 +37,11 @@
   firmware produces no frame.
 - Added `irq_mode=auto|intx|msi|msix` so IRQ selection can be forced during
   mailbox/stream diagnostics.
-- Updated `preinit_command1` to match Windows more closely: 100 attempts by
-  default, 500 ms per attempt (`preinit_command1_attempts`,
-  `preinit_command1_timeout_ms`).
+- Updated `preinit_command1` to match Windows/ARM more closely: 100 attempts by
+  default, 2000 ms per attempt (`preinit_command1_attempts`,
+  `preinit_command1_timeout_ms`). The ARM `MZ0380_HwInitialize` decompile passes
+  `20000000` 100 ns units into `MZ0380_SendVendorCommand_P5` for command `0x01`,
+  which becomes a 2 s wait in `MZ0380_WaitInterruptComplete`.
 - `hd60pro_mailbox_send_async_locked` now polls BAR0+0x30 for BIT(11) and runs
   the same ACK sequence as the IRQ handler if the status bit appears. This
   emulates the Windows ISR event path even if Linux interrupt delivery is wrong.
@@ -88,6 +90,9 @@
 - Added `scripts/pci-preflight-root.sh` and wired it into power prep and module
   load paths. If PCI config reads all `0xff` or header type is `0x7f/0xff`, the
   scripts now stop before `insmod` and ask for a full PSU cold boot.
+- Aligned preinit timing with the ARM Linux driver: default
+  `preinit_command1_timeout_ms` is now 2000 ms, and cold-boot wrapper timeouts
+  default to 230 s so all 100 attempts can actually run.
 
 ## What Changed In This Pass
 

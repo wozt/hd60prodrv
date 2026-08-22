@@ -314,7 +314,7 @@ Current local test result on 2026-08-22 after repeated PCI reset/recovery:
 
 ```text
 attempts_requested: 100
-timeout_ms_per_attempt: 500
+timeout_ms_per_attempt: 2000
 packet: 0x00000800 0x00000001
 attempts_run: 100
 result: -110
@@ -323,6 +323,11 @@ irq_delta: 0
 irq_count_after: 0
 mailbox_030_irq_status_after: 0x00000000
 ```
+
+The 2000 ms per-attempt timeout is taken from the ARM Linux driver
+`MZ0380_HwInitialize`: it passes `20000000` 100 ns units to
+`MZ0380_SendVendorCommand_P5` for command `0x01`, and
+`MZ0380_WaitInterruptComplete` divides that by `10000` before waiting.
 
 The same result happened with MSI/auto IRQ selection, forced legacy INTx, and
 bus mastering both disabled and enabled. Public VFIO reports for `12ab:0380`

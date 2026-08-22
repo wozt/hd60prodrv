@@ -256,9 +256,9 @@ static uint preinit_command1_attempts = 100;
 module_param(preinit_command1_attempts, uint, 0444);
 MODULE_PARM_DESC(preinit_command1_attempts, "Number of Windows-style command 0x01 pre-init attempts");
 
-static uint preinit_command1_timeout_ms = 500;
+static uint preinit_command1_timeout_ms = 2000;
 module_param(preinit_command1_timeout_ms, uint, 0444);
-MODULE_PARM_DESC(preinit_command1_timeout_ms, "Timeout for each Windows-style command 0x01 pre-init attempt");
+MODULE_PARM_DESC(preinit_command1_timeout_ms, "Timeout for each Windows-style command 0x01 pre-init attempt; ARM MZ0380_HwInitialize uses 20000000 100ns units (2s)");
 
 static bool allow_fw_status_command10;
 module_param(allow_fw_status_command10, bool, 0444);

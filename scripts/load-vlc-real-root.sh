@@ -45,7 +45,7 @@ DBG="/sys/kernel/debug/hd60prodrv/0000:22:00.0"
 if [ "${INIT_FIRST:-1}" != "0" ]; then
 	echo
 	echo "== preinit_command1 =="
-	timeout "${PREINIT_TIMEOUT:-65s}" cat "$DBG/preinit_command1" | tee "$TMPDIR/preinit.txt"
+	timeout "${PREINIT_TIMEOUT:-230s}" cat "$DBG/preinit_command1" | tee "$TMPDIR/preinit.txt"
 
 	if grep -q '^result: 0$' "$TMPDIR/preinit.txt"; then
 		echo

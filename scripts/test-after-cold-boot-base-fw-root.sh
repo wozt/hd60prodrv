@@ -47,7 +47,7 @@ cat "$DBG/windows_preinit_state"
 
 echo
 echo "== preinit_command1 =="
-timeout 65s cat "$DBG/preinit_command1" | tee "$TMPDIR/preinit.txt"
+timeout "${PREINIT_TIMEOUT:-230s}" cat "$DBG/preinit_command1" | tee "$TMPDIR/preinit.txt"
 
 echo
 echo "== preinit summary =="

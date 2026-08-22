@@ -23,7 +23,7 @@ echo "== windows_preinit_state before =="
 cat "$DBG/windows_preinit_state"
 echo
 echo "== preinit_command1 =="
-timeout 65s cat "$DBG/preinit_command1"
+timeout "${PREINIT_TIMEOUT:-230s}" cat "$DBG/preinit_command1"
 echo
 echo "== windows_preinit_state after preinit =="
 cat "$DBG/windows_preinit_state"

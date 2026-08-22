@@ -19,6 +19,7 @@
 #include <linux/delay.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/workqueue.h>
 #include <linux/videodev2.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-fh.h>
@@ -51,7 +52,10 @@
 #define HD60PRO_REG_IRQ_ACK_SIDEBAND	0x0dc
 #define HD60PRO_REG_IRQ_ACK_DOORBELL	0x400
 #define HD60PRO_IRQ_MBOX_COMPLETE	BIT(11)
-#define HD60PRO_IRQ_DMA_FRAME		BIT(0)
+#define HD60PRO_IRQ_DMA_FRAME_LEGACY	BIT(0)
+#define HD60PRO_IRQ_DMA_FRAME_ARM	BIT(10)
+#define HD60PRO_IRQ_DMA_FRAME_DEFAULT	(HD60PRO_IRQ_DMA_FRAME_LEGACY | \
+					 HD60PRO_IRQ_DMA_FRAME_ARM)
 /* BAR0 DMA frame registers (from LXV4L2D_MZ0380.ko decompilation) */
 #define HD60PRO_REG_DMA_FIELD_FLAGS	0x040
 #define HD60PRO_REG_DMA_BUF_IDX	0x044
@@ -81,8 +85,8 @@
 #define HD60PRO_MBOX_CMD_I2C_RAW	0x20
 #define HD60PRO_MBOX_CMD_SELECTOR_READ	0x1e
 #define HD60PRO_MBOX_CMD_I2C_WRITE_EXT	0x1d
-#define HD60PRO_MBOX_CMD_LOGO_PREPARE	0x60
-#define HD60PRO_MBOX_CMD_LOGO_COMMIT	0x61
+#define HD60PRO_MBOX_CMD_DOWNLOAD_BASE_FW_PREPARE	0x0e
+#define HD60PRO_MBOX_CMD_DOWNLOAD_BASE_FW_COMMIT	0x0f
 #define HD60PRO_MBOX_CMD_DOWNLOAD_FW_PREPARE	0x0b
 #define HD60PRO_MBOX_CMD_DOWNLOAD_FW_COMMIT	0x0c
 #define HD60PRO_MBOX_CMD_GET_VERSION	0x1c
@@ -90,10 +94,9 @@
 #define HD60PRO_MBOX_POLL_US		1000
 #define HD60PRO_MBOX_TIMEOUT_US		500000
 #define HD60PRO_MBOX_ASYNC_TIMEOUT_MS	5000
+#define HD60PRO_BASE_FW_COMMIT_TIMEOUT_MS	180000
 #define HD60PRO_VISIBLE_FW_COMMIT_TIMEOUT_MS	60000
 #define HD60PRO_FW_WINDOW_OFFSET	0x60
-#define HD60PRO_LOGO_PAYLOAD_SIZE	0x25800
-#define HD60PRO_LOGO_DESCRIPTOR		0x00f00140
 #define HD60PRO_DMA_DESC_BYTES		0x1000
 #define HD60PRO_HOST_DESC_MAGIC		0x48503630 /* "HP60" */
 #define HD60PRO_HOST_DESC_VERSION	1
@@ -221,9 +224,13 @@ static bool request_irq_vector;
 module_param(request_irq_vector, bool, 0444);
 MODULE_PARM_DESC(request_irq_vector, "Request one IRQ vector for diagnostics; keep off until interrupt ack registers are known");
 
-static bool enable_v4l2;
+static char *irq_mode = "auto";
+module_param(irq_mode, charp, 0444);
+MODULE_PARM_DESC(irq_mode, "IRQ allocation mode when request_irq_vector=1: auto, intx, msi, or msix");
+
+static bool enable_v4l2 = true;
 module_param(enable_v4l2, bool, 0444);
-MODULE_PARM_DESC(enable_v4l2, "Register a diagnostic V4L2 node without streaming support");
+MODULE_PARM_DESC(enable_v4l2, "Register the V4L2 capture node; disable only for low-level PCI diagnostics");
 
 static bool allow_mailbox_writes;
 module_param(allow_mailbox_writes, bool, 0444);
@@ -233,17 +240,29 @@ static bool allow_firmware_load;
 module_param(allow_firmware_load, bool, 0444);
 MODULE_PARM_DESC(allow_firmware_load, "Allow experimental firmware download sequence from root-only debugfs files");
 
+static char *firmware_load_mode = "full";
+module_param(firmware_load_mode, charp, 0444);
+MODULE_PARM_DESC(firmware_load_mode, "Firmware download mode for firmware_load: full uses Windows 0x0b/0x0c, base uses 0x0e/0x0f");
+
+static uint firmware_base_selector = 1;
+module_param(firmware_base_selector, uint, 0444);
+MODULE_PARM_DESC(firmware_base_selector, "Selector dword for Windows base firmware prepare command 0x0e");
+
 static bool allow_preinit_command1;
 module_param(allow_preinit_command1, bool, 0444);
 MODULE_PARM_DESC(allow_preinit_command1, "Allow experimental Windows pre-init mailbox command 0x01");
 
+static uint preinit_command1_attempts = 100;
+module_param(preinit_command1_attempts, uint, 0444);
+MODULE_PARM_DESC(preinit_command1_attempts, "Number of Windows-style command 0x01 pre-init attempts");
+
+static uint preinit_command1_timeout_ms = 500;
+module_param(preinit_command1_timeout_ms, uint, 0444);
+MODULE_PARM_DESC(preinit_command1_timeout_ms, "Timeout for each Windows-style command 0x01 pre-init attempt");
+
 static bool allow_fw_status_command10;
 module_param(allow_fw_status_command10, bool, 0444);
 MODULE_PARM_DESC(allow_fw_status_command10, "Allow experimental Windows firmware status mailbox command 0x0a");
-
-static bool allow_gpio_command17;
-module_param(allow_gpio_command17, bool, 0444);
-MODULE_PARM_DESC(allow_gpio_command17, "Allow experimental Windows GPIO mailbox command 0x17");
 
 static bool allow_gpio17_sequence;
 module_param(allow_gpio17_sequence, bool, 0444);
@@ -252,22 +271,6 @@ MODULE_PARM_DESC(allow_gpio17_sequence, "Allow experimental Windows generic GPIO
 static bool allow_i2c_read_command1a;
 module_param(allow_i2c_read_command1a, bool, 0444);
 MODULE_PARM_DESC(allow_i2c_read_command1a, "Allow experimental Windows I2C-like read mailbox command 0x1a");
-
-static bool allow_logo_upload;
-module_param(allow_logo_upload, bool, 0444);
-MODULE_PARM_DESC(allow_logo_upload, "Allow experimental Windows logo/status payload upload commands 0x60/0x61");
-
-static bool allow_cmd1d_write;
-module_param(allow_cmd1d_write, bool, 0444);
-MODULE_PARM_DESC(allow_cmd1d_write, "Allow experimental Windows command 0x1d byte writes after logo upload");
-
-static bool allow_post_logo_pipeline;
-module_param(allow_post_logo_pipeline, bool, 0444);
-MODULE_PARM_DESC(allow_post_logo_pipeline, "Allow experimental minimal Windows post-logo pipeline command 0x1b sequence");
-
-static bool allow_capture_88_writes;
-module_param(allow_capture_88_writes, bool, 0444);
-MODULE_PARM_DESC(allow_capture_88_writes, "Allow experimental Windows capture chip 0x88 preset writes after pipeline-ready init");
 
 static bool allow_unsafe_visible_fw_prepare;
 module_param(allow_unsafe_visible_fw_prepare, bool, 0444);
@@ -287,7 +290,49 @@ MODULE_PARM_DESC(synthetic_v4l2, "Complete V4L2 buffers with black YUYV frames u
 
 static bool allow_dma_capture;
 module_param(allow_dma_capture, bool, 0444);
-MODULE_PARM_DESC(allow_dma_capture, "Enable real DMA/MMIO frame capture: send stream-start cmd 0x06 and deliver frames from BAR0 on IRQ");
+MODULE_PARM_DESC(allow_dma_capture, "Enable experimental real DMA frame delivery from firmware IRQs");
+
+static bool send_stream_start_cmd06;
+module_param(send_stream_start_cmd06, bool, 0444);
+MODULE_PARM_DESC(send_stream_start_cmd06, "Also send legacy/unknown mailbox cmd 0x06 after 0x29+0x2a+0x02 when real DMA capture starts");
+
+static bool allow_stream_extra_commands;
+module_param(allow_stream_extra_commands, bool, 0444);
+MODULE_PARM_DESC(allow_stream_extra_commands, "Allow explicit experimental Windows 0x2d/0x31 stream-extra packets");
+
+static bool send_stream_extra_commands;
+module_param(send_stream_extra_commands, bool, 0444);
+MODULE_PARM_DESC(send_stream_extra_commands, "Send configured stream_extra_* packets during V4L2 real-DMA startup after 0x29/0x2a");
+
+static uint stream_extra_primary_2d[12];
+static int stream_extra_primary_2d_count;
+module_param_array(stream_extra_primary_2d, uint,
+		   &stream_extra_primary_2d_count, 0444);
+MODULE_PARM_DESC(stream_extra_primary_2d, "Raw 12-dword primary Windows cmd 0x2d packet, including 0x800 doorbell");
+
+static uint stream_extra_secondary_2d[12];
+static int stream_extra_secondary_2d_count;
+module_param_array(stream_extra_secondary_2d, uint,
+		   &stream_extra_secondary_2d_count, 0444);
+MODULE_PARM_DESC(stream_extra_secondary_2d, "Raw 12-dword secondary Windows cmd 0x2d packet, including 0x800 doorbell");
+
+static uint stream_extra_final_31[7];
+static int stream_extra_final_31_count;
+module_param_array(stream_extra_final_31, uint, &stream_extra_final_31_count,
+		   0444);
+MODULE_PARM_DESC(stream_extra_final_31, "Raw 7-dword Windows cmd 0x31 packet, including 0x800 doorbell");
+
+static uint dma_frame_irq_mask = HD60PRO_IRQ_DMA_FRAME_DEFAULT;
+module_param(dma_frame_irq_mask, uint, 0444);
+MODULE_PARM_DESC(dma_frame_irq_mask, "IRQ status bits treated as frame-ready; default accepts BIT0 and firmware ARM BIT10");
+
+static uint real_dma_timeout_ms = 2000;
+module_param(real_dma_timeout_ms, uint, 0644);
+MODULE_PARM_DESC(real_dma_timeout_ms, "Timeout before queued V4L2 buffers are completed with error when real DMA produces no frames");
+
+static uint real_dma_cmd_timeout_ms = 3000;
+module_param(real_dma_cmd_timeout_ms, uint, 0644);
+MODULE_PARM_DESC(real_dma_cmd_timeout_ms, "Per-mailbox-command timeout used by V4L2 real DMA stream start");
 
 static bool force_32bit_dma;
 module_param(force_32bit_dma, bool, 0444);
@@ -358,6 +403,7 @@ struct hd60pro_dev {
 	u32 pending_frame_status;
 	u32 dma_frame_count;
 	struct tasklet_struct frame_tasklet;
+	struct delayed_work stream_timeout_work;
 	bool dma_capture_active;
 };
 
@@ -414,6 +460,24 @@ MODULE_DEVICE_TABLE(pci, hd60pro_pci_ids);
 
 static unsigned int hd60pro_frame_size(void);
 
+static void hd60pro_ack_irq_status(struct hd60pro_dev *hd, void __iomem *base,
+				   u32 status)
+{
+	if (status & HD60PRO_IRQ_MBOX_COMPLETE)
+		hd->mailbox_irq_count++;
+	if (status & ~HD60PRO_IRQ_MBOX_COMPLETE)
+		hd->non_mbox_irq_count++;
+
+	hd->last_irq_status = status;
+	hd->cum_irq_status |= status;
+	hd->irq_count++;
+
+	iowrite32(2, hd->bar5 + HD60PRO_REG_IRQ_ACK_SIDEBAND);
+	iowrite32(0, base + HD60PRO_REG_IRQ_STATUS);
+	iowrite32(HD60PRO_REG_IRQ_ACK_DOORBELL,
+		  base + HD60PRO_REG_DOORBELL);
+}
+
 static irqreturn_t hd60pro_irq(int irq, void *data)
 {
 	struct hd60pro_dev *hd = data;
@@ -427,30 +491,19 @@ static irqreturn_t hd60pro_irq(int irq, void *data)
 	if (!status || status == U32_MAX)
 		return IRQ_NONE;
 
-	hd->last_irq_status = status;
-	hd->cum_irq_status |= status;
-	hd->irq_count++;
-	if (status & HD60PRO_IRQ_MBOX_COMPLETE)
-		hd->mailbox_irq_count++;
-	if (status & ~HD60PRO_IRQ_MBOX_COMPLETE)
-		hd->non_mbox_irq_count++;
-
 	/*
 	 * IRQ ack sequence from LXV4L2D_MZ0380.ko decompilation:
 	 *   1. write BAR5+0xdc = 2  (sideband ack)
 	 *   2. write BAR0+0x30 = 0  (clear status)
 	 *   3. write BAR0+0x00 = 0x400 (doorbell ack)
 	 */
-	iowrite32(2, hd->bar5 + HD60PRO_REG_IRQ_ACK_SIDEBAND);
-	iowrite32(0, base + HD60PRO_REG_IRQ_STATUS);
-	iowrite32(HD60PRO_REG_IRQ_ACK_DOORBELL,
-		  base + HD60PRO_REG_DOORBELL);
+	hd60pro_ack_irq_status(hd, base, status);
 
 	/*
-	 * Bit 0 = DMA frame ready. Pass status to tasklet for processing.
-	 * The tasklet reads BAR0[0x44] for buffer index and handles delivery.
+	 * Firmware frame/event IRQ. Pass status to the tasklet; it reads
+	 * BAR0[0x44] for the active buffer index and handles delivery.
 	 */
-	if ((status & HD60PRO_IRQ_DMA_FRAME) && hd->dma_capture_active) {
+	if ((status & dma_frame_irq_mask) && hd->dma_capture_active) {
 		spin_lock(&hd->irq_lock);
 		hd->pending_frame_status |= status;
 		spin_unlock(&hd->irq_lock);
@@ -467,6 +520,20 @@ static bool hd60pro_mailbox_dead(void __iomem *base)
 	       ioread32(base + 0x00c) == U32_MAX &&
 	       ioread32(base + 0x02c) == U32_MAX &&
 	       ioread32(base + 0x030) == U32_MAX;
+}
+
+static int hd60pro_irq_flags(void)
+{
+	if (sysfs_streq(irq_mode, "auto"))
+		return PCI_IRQ_MSI | PCI_IRQ_MSIX | PCI_IRQ_INTX;
+	if (sysfs_streq(irq_mode, "intx"))
+		return PCI_IRQ_INTX;
+	if (sysfs_streq(irq_mode, "msi"))
+		return PCI_IRQ_MSI;
+	if (sysfs_streq(irq_mode, "msix"))
+		return PCI_IRQ_MSIX;
+
+	return -EINVAL;
 }
 
 static int hd60pro_mailbox_send_locked(struct hd60pro_dev *hd,
@@ -533,7 +600,9 @@ static int hd60pro_mailbox_send_async_locked(struct hd60pro_dev *hd,
 	void __iomem *base = hd60pro_mailbox_base(hd);
 	u32 irq_before = hd->irq_count;
 	u32 done = 0;
-	unsigned int waited;
+	u32 status = 0;
+	unsigned long deadline;
+	bool completed = false;
 	unsigned int i;
 
 	if (!allow_mailbox_writes)
@@ -547,15 +616,28 @@ static int hd60pro_mailbox_send_async_locked(struct hd60pro_dev *hd,
 		iowrite32(packet[i], base + i * sizeof(u32));
 	iowrite32(packet[0], base + HD60PRO_REG_DOORBELL);
 
-	for (waited = 0; waited < timeout_ms; waited++) {
+	deadline = jiffies + msecs_to_jiffies(timeout_ms ? timeout_ms : 1);
+	while (time_before(jiffies, deadline)) {
 		done = ioread32(base + HD60PRO_REG_MBOX_COMPLETE);
 		if (done == U32_MAX)
 			return -ENODEV;
-		if (done & BIT(0))
+		if (done & BIT(0)) {
+			completed = true;
 			break;
-		if (hd->irq_count != irq_before)
+		}
+		status = ioread32(base + HD60PRO_REG_IRQ_STATUS);
+		if (status == U32_MAX)
+			return -ENODEV;
+		if (status & HD60PRO_IRQ_MBOX_COMPLETE) {
+			hd60pro_ack_irq_status(hd, base, status);
+			completed = true;
 			break;
-		msleep(1);
+		}
+		if (hd->irq_count != irq_before) {
+			completed = true;
+			break;
+		}
+		usleep_range(1000, 2000);
 	}
 
 	if (completion)
@@ -563,78 +645,101 @@ static int hd60pro_mailbox_send_async_locked(struct hd60pro_dev *hd,
 	if (irq_delta)
 		*irq_delta = hd->irq_count - irq_before;
 
-	if (waited >= timeout_ms)
+	if (!completed)
 		return -ETIMEDOUT;
 
 	return 0;
 }
 
-static int hd60pro_mailbox_send_logo_prepare_locked(struct hd60pro_dev *hd,
-						    const u32 *packet,
-						    unsigned int dwords,
-						    unsigned int timeout_ms,
-						    u32 *bar5_window_start,
-						    u32 *bar5_window_end)
+static bool hd60pro_stream_extra_packet_valid(const uint *packet, int count,
+					      u32 cmd, unsigned int expected)
 {
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u32 expected_start = (u32)pci_resource_start(hd->pdev, HD60PRO_BAR0) +
-			     HD60PRO_FW_WINDOW_OFFSET;
-	u32 expected_end = expected_start + (HD60PRO_LOGO_PAYLOAD_SIZE * 3) - 1;
-	unsigned int waited;
-	unsigned int i;
-	u32 start = 0;
-	u32 end = 0;
-
-	if (!allow_mailbox_writes)
-		return -EPERM;
-	if (!base || !hd->bar5 || dwords < 2)
-		return -ENODEV;
-	if (hd60pro_mailbox_dead(base))
-		return -ENODEV;
-
-	for (i = 1; i < dwords; i++)
-		iowrite32(packet[i], base + i * sizeof(u32));
-	iowrite32(packet[0], base + HD60PRO_REG_DOORBELL);
-
-	for (waited = 0; waited < timeout_ms; waited++) {
-		start = ioread32(hd->bar5 + 0x040);
-		end = ioread32(hd->bar5 + 0x048);
-		if (start == U32_MAX && end == U32_MAX)
-			return -ENODEV;
-		if (start == expected_start && end == expected_end)
-			break;
-		msleep(1);
-	}
-
-	if (bar5_window_start)
-		*bar5_window_start = start;
-	if (bar5_window_end)
-		*bar5_window_end = end;
-
-	if (waited >= timeout_ms)
-		return -ETIMEDOUT;
-
-	return 0;
+	if (count == 0)
+		return false;
+	if (count != expected)
+		return false;
+	if (packet[0] != HD60PRO_MBOX_DOORBELL)
+		return false;
+	if (packet[1] != cmd)
+		return false;
+	return true;
 }
 
-static u32 hd60pro_windows_challenge_hash(const u8 bytes[4])
+static int hd60pro_send_stream_extra_packet_locked(struct hd60pro_dev *hd,
+						   const char *label,
+						   const uint *packet,
+						   int count, u32 cmd,
+						   unsigned int expected,
+						   struct seq_file *s)
 {
-	static const u32 constants[] = {
-		0xa539c75a,
-		0x9f28a543,
-		0x7b6324c5,
-		0xf1029554,
-	};
-	u32 value = 0x12345678;
-	u32 constant = constants[bytes[0] & 3];
-	unsigned int i;
+	u32 completion = 0;
+	u32 irq_delta = 0;
+	int ret;
 
-	for (i = 0; i < 4; i++) {
-		value = ((value << 8) ^ bytes[i]) ^ constant;
-		value ^= (value >> 8) | (value << 24);
+	if (!hd60pro_stream_extra_packet_valid(packet, count, cmd, expected)) {
+		if (s) {
+			seq_printf(s,
+				   "%s: skipped count=%d expected=%u cmd=0x%02x\n",
+				   label, count, expected, cmd);
+		}
+		return 0;
 	}
 
-	return value;
+	iowrite32(0, hd->bar0 + HD60PRO_REG_MBOX_COMPLETE);
+	ret = hd60pro_mailbox_send_async_locked(hd, packet, count,
+						real_dma_cmd_timeout_ms,
+						&completion, &irq_delta);
+	if (s) {
+		seq_printf(s, "%s: ret=%d irq_delta=%u completion=0x%08x\n",
+			   label, ret, irq_delta, completion);
+	} else {
+		dev_info(&hd->pdev->dev,
+			 "stream extra %s: ret=%d irq_delta=%u completion=0x%08x\n",
+			 label, ret, irq_delta, completion);
+	}
+
+	if (ret == -ETIMEDOUT)
+		return 0;
+	return ret;
+}
+
+static int hd60pro_send_stream_extra_packets_locked(struct hd60pro_dev *hd,
+						    struct seq_file *s)
+{
+	int ret;
+
+	if (!allow_stream_extra_commands) {
+		if (s)
+			seq_puts(s, "blocked; reload with allow_stream_extra_commands=1\n");
+		return 0;
+	}
+	if (!allow_mailbox_writes) {
+		if (s)
+			seq_puts(s, "blocked; reload with allow_mailbox_writes=1\n");
+		return 0;
+	}
+	if (!hd->bar0) {
+		if (s)
+			seq_puts(s, "blocked; BAR0 mailbox is not mapped\n");
+		return -ENODEV;
+	}
+
+	ret = hd60pro_send_stream_extra_packet_locked(hd, "primary_0x2d",
+						     stream_extra_primary_2d,
+						     stream_extra_primary_2d_count,
+						     0x2d, 12, s);
+	if (ret)
+		return ret;
+	ret = hd60pro_send_stream_extra_packet_locked(hd, "secondary_0x2d",
+						     stream_extra_secondary_2d,
+						     stream_extra_secondary_2d_count,
+						     0x2d, 12, s);
+	if (ret)
+		return ret;
+	return hd60pro_send_stream_extra_packet_locked(hd, "final_0x31",
+						      stream_extra_final_31,
+						      stream_extra_final_31_count,
+						      0x31, 7, s);
 }
 
 static int hd60pro_fw_version_show(struct seq_file *s, void *unused)
@@ -696,10 +801,23 @@ static int hd60pro_preinit_command1_show(struct seq_file *s, void *unused)
 	u32 bar5_ref0;
 	u32 bar5_ref1;
 	u32 mbox_irq_status;
+	u32 first_nonzero_irq_status = 0;
+	u32 first_completion_change = 0;
+	u32 final_completion = 0;
+	u32 final_arg0 = 0;
+	u32 final_arg1 = 0;
+	unsigned int first_nonzero_irq_attempt = 0;
+	unsigned int first_completion_change_attempt = 0;
+	unsigned int attempts = preinit_command1_attempts;
+	unsigned int timeout_ms = preinit_command1_timeout_ms;
+	unsigned int attempt;
+	unsigned int attempts_run = 0;
 	int ret;
 
 	seq_puts(s, "windows_preinit: command 0x01 async path before visible firmware download\n");
 	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
+	seq_printf(s, "attempts_requested: %u\n", attempts);
+	seq_printf(s, "timeout_ms_per_attempt: %u\n", timeout_ms);
 	bar5_ref0 = hd->bar5 ? ioread32(hd->bar5 + 0x030) : U32_MAX;
 	bar5_ref1 = hd->bar5 ? ioread32(hd->bar5 + 0x038) : U32_MAX;
 	mbox_irq_status = base ? ioread32(base + HD60PRO_REG_IRQ_STATUS) : U32_MAX;
@@ -729,22 +847,64 @@ static int hd60pro_preinit_command1_show(struct seq_file *s, void *unused)
 		return 0;
 	}
 
+	if (!attempts)
+		attempts = 1;
+	if (!timeout_ms)
+		timeout_ms = 1;
+
 	mutex_lock(&hd->mailbox_lock);
-	iowrite32(2, hd->bar5 + HD60PRO_REG_IRQ_ACK_SIDEBAND);
-	iowrite32(0, base + HD60PRO_REG_IRQ_STATUS);
-	iowrite32(HD60PRO_REG_IRQ_ACK_DOORBELL, base + HD60PRO_REG_DOORBELL);
-	iowrite32((u32)pci_resource_start(hd->pdev, HD60PRO_BAR0) + 0x4,
-		  hd->bar5 + 0x030);
-	iowrite32((u32)pci_resource_start(hd->pdev, HD60PRO_BAR0) +
-		  HD60PRO_FW_WINDOW_OFFSET - 0x1, hd->bar5 + 0x038);
-	ret = hd60pro_mailbox_send_async_locked(hd, packet, ARRAY_SIZE(packet),
-						5000, &completion, &irq_delta);
+	for (attempt = 0; attempt < attempts; attempt++) {
+		iowrite32(2, hd->bar5 + HD60PRO_REG_IRQ_ACK_SIDEBAND);
+		iowrite32(0, base + HD60PRO_REG_IRQ_STATUS);
+		iowrite32(HD60PRO_REG_IRQ_ACK_DOORBELL,
+			  base + HD60PRO_REG_DOORBELL);
+		iowrite32((u32)pci_resource_start(hd->pdev, HD60PRO_BAR0) + 0x4,
+			  hd->bar5 + 0x030);
+		iowrite32((u32)pci_resource_start(hd->pdev, HD60PRO_BAR0) +
+			  HD60PRO_FW_WINDOW_OFFSET - 0x1, hd->bar5 + 0x038);
+		ret = hd60pro_mailbox_send_async_locked(hd, packet,
+							ARRAY_SIZE(packet),
+							timeout_ms, &completion,
+							&irq_delta);
+		attempts_run = attempt + 1;
+		mbox_irq_status = ioread32(base + HD60PRO_REG_IRQ_STATUS);
+		final_completion = ioread32(base + HD60PRO_REG_MBOX_COMPLETE);
+		if (!first_nonzero_irq_status && mbox_irq_status &&
+		    mbox_irq_status != U32_MAX) {
+			first_nonzero_irq_status = mbox_irq_status;
+			first_nonzero_irq_attempt = attempts_run;
+		}
+		if (!first_completion_change &&
+		    final_completion != 0xcc800000 &&
+		    final_completion != U32_MAX) {
+			first_completion_change = final_completion;
+			first_completion_change_attempt = attempts_run;
+		}
+		if (!ret)
+			break;
+	}
 	mbox_irq_status = ioread32(base + HD60PRO_REG_IRQ_STATUS);
+	final_completion = ioread32(base + HD60PRO_REG_MBOX_COMPLETE);
+	final_arg0 = ioread32(base + 0x008);
+	final_arg1 = ioread32(base + 0x00c);
 	mutex_unlock(&hd->mailbox_lock);
 
 	seq_printf(s, "packet: 0x%08x 0x%08x\n", packet[0], packet[1]);
+	seq_printf(s, "attempts_run: %u\n", attempts_run);
 	seq_printf(s, "result: %d\n", ret);
 	seq_printf(s, "completion: 0x%08x\n", completion);
+	seq_printf(s, "final_completion_bar0_02c: 0x%08x\n",
+		   final_completion);
+	seq_printf(s, "final_arg0_bar0_008: 0x%08x\n", final_arg0);
+	seq_printf(s, "final_arg1_bar0_00c: 0x%08x\n", final_arg1);
+	seq_printf(s, "first_nonzero_irq_status_attempt: %u\n",
+		   first_nonzero_irq_attempt);
+	seq_printf(s, "first_nonzero_irq_status: 0x%08x\n",
+		   first_nonzero_irq_status);
+	seq_printf(s, "first_completion_change_attempt: %u\n",
+		   first_completion_change_attempt);
+	seq_printf(s, "first_completion_change: 0x%08x\n",
+		   first_completion_change);
 	seq_printf(s, "irq_delta: %u\n", irq_delta);
 	seq_printf(s, "irq_count_after: %u\n", hd->irq_count);
 	seq_printf(s, "mailbox_030_irq_status_after: 0x%08x\n",
@@ -801,11 +961,15 @@ static int hd60pro_fw_status_command10_show(struct seq_file *s, void *unused)
 	ret = hd60pro_mailbox_send_async_locked(hd, packet, ARRAY_SIZE(packet),
 						HD60PRO_MBOX_ASYNC_TIMEOUT_MS,
 						&completion, &irq_delta);
-	for (waited_ms = 0; waited_ms < HD60PRO_MBOX_ASYNC_TIMEOUT_MS; waited_ms++) {
-		marker = ioread32(base + HD60PRO_REG_MBOX_COMPLETE);
-		if (marker == 0xaaaaaaaa || marker == U32_MAX)
-			break;
-		msleep(1);
+	marker = ioread32(base + HD60PRO_REG_MBOX_COMPLETE);
+	waited_ms = 0;
+	if (!ret) {
+		for (waited_ms = 0; waited_ms < HD60PRO_MBOX_ASYNC_TIMEOUT_MS; waited_ms++) {
+			marker = ioread32(base + HD60PRO_REG_MBOX_COMPLETE);
+			if (marker == 0xaaaaaaaa || marker == U32_MAX)
+				break;
+			msleep(1);
+		}
 	}
 	status0 = ioread32(base + 0x008);
 	status1 = ioread32(base + 0x00c);
@@ -818,6 +982,7 @@ static int hd60pro_fw_status_command10_show(struct seq_file *s, void *unused)
 	seq_printf(s, "completion: 0x%08x\n", completion);
 	seq_printf(s, "windows_marker_after_wait: 0x%08x\n", marker);
 	seq_printf(s, "windows_marker_wait_ms: %u\n", waited_ms);
+	seq_printf(s, "marker_wait_skipped_after_async_error: %d\n", ret != 0);
 	seq_printf(s, "completion_matches_windows_marker: %d\n",
 		   marker == 0xaaaaaaaa);
 	seq_printf(s, "irq_delta: %u\n", irq_delta);
@@ -876,240 +1041,6 @@ static int hd60pro_windows_init_plan_show(struct seq_file *s, void *unused)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(hd60pro_windows_init_plan);
-
-static int hd60pro_gpio17_line0_show(struct seq_file *s, void *unused)
-{
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u32 packet[4] = {
-		HD60PRO_MBOX_DOORBELL,
-		HD60PRO_MBOX_CMD_GPIO_SET,
-		BIT(0),
-		BIT(0),
-	};
-	u32 completion = 0;
-	u32 status0;
-	u32 status1;
-	u32 status2;
-	int ret;
-
-	seq_puts(s, "windows_gpio17_line0: first generic post-version GPIO command\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-	seq_printf(s, "planned_packet: 0x%08x 0x%08x 0x%08x 0x%08x\n",
-		   packet[0], packet[1], packet[2], packet[3]);
-
-	if (!allow_gpio_command17) {
-		seq_puts(s, "blocked; reload with allow_gpio_command17=1 allow_mailbox_writes=1 after validated preinit/status to send this command\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x02c) != 0xaaaaaaaa ||
-	    ioread32(base + 0x008) != 1 ||
-	    ioread32(base + 0x00c) != 11) {
-		seq_puts(s, "blocked; firmware status marker/version is not in the validated 0x0a state\n");
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	ret = hd60pro_mailbox_send_locked(hd, packet, ARRAY_SIZE(packet),
-					  HD60PRO_MBOX_TIMEOUT_US,
-					  &completion);
-	status0 = ioread32(base + 0x008);
-	status1 = ioread32(base + 0x00c);
-	status2 = ioread32(base + 0x010);
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "packet: 0x%08x 0x%08x 0x%08x 0x%08x\n",
-		   packet[0], packet[1], packet[2], packet[3]);
-	seq_printf(s, "result: %d\n", ret);
-	seq_printf(s, "completion: 0x%08x\n", completion);
-	seq_printf(s, "status_bar_%s_0x08: 0x%08x\n",
-		   hd60pro_mailbox_bar_name(), status0);
-	seq_printf(s, "status_bar_%s_0x0c: 0x%08x\n",
-		   hd60pro_mailbox_bar_name(), status1);
-	seq_printf(s, "status_bar_%s_0x10: 0x%08x\n",
-		   hd60pro_mailbox_bar_name(), status2);
-
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_gpio17_line0);
-
-static int hd60pro_gpio17_generic_sequence_show(struct seq_file *s,
-						void *unused)
-{
-	static const struct {
-		u8 line;
-		u8 value;
-	} steps[] = {
-		{ 0, 1 },
-		{ 1, 0 },
-		{ 2, 0 },
-		{ 6, 1 },
-		{ 8, 0 },
-		{ 9, 0 },
-		{ 10, 0 },
-		{ 11, 0 },
-	};
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	unsigned int i;
-	int ret = 0;
-
-	seq_puts(s, "windows_gpio17_generic_sequence: post-version generic GPIO sequence\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_gpio17_sequence) {
-		seq_puts(s, "blocked; reload with allow_gpio17_sequence=1 allow_mailbox_writes=1 after validated preinit/status to send this sequence\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x02c) != 0xaaaaaaaa ||
-	    ioread32(base + 0x008) != 1 ||
-	    ioread32(base + 0x00c) != 11) {
-		seq_puts(s, "blocked; firmware status marker/version is not in the validated 0x0a state\n");
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	for (i = 0; i < ARRAY_SIZE(steps); i++) {
-		u32 mask = BIT(steps[i].line);
-		u32 value = steps[i].value ? mask : 0;
-		u32 packet[4] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_GPIO_SET,
-			mask,
-			value,
-		};
-		u32 completion = 0;
-
-		ret = hd60pro_mailbox_send_locked(hd, packet,
-						  ARRAY_SIZE(packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		seq_printf(s,
-			   "step%u_line%u_value%u packet=0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-			   i, steps[i].line, steps[i].value,
-			   packet[0], packet[1], packet[2], packet[3],
-			   ret, completion, ioread32(base + 0x008),
-			   ioread32(base + 0x00c), ioread32(base + 0x010));
-		if (ret)
-			break;
-		if (hd60pro_mailbox_dead(base)) {
-			ret = -ENODEV;
-			seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-			break;
-		}
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "result: %d\n", ret);
-
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_gpio17_generic_sequence);
-
-static int hd60pro_i2c1a_c0_dc_db_show(struct seq_file *s, void *unused)
-{
-	static const u8 regs[] = { 0xdc, 0xdb };
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u32 values[ARRAY_SIZE(regs)] = { 0 };
-	unsigned int i;
-	int ret = 0;
-
-	seq_puts(s, "windows_i2c1a_c0_dc_db: first reads after generic GPIO sequence\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_i2c_read_command1a) {
-		seq_puts(s, "blocked; reload with allow_i2c_read_command1a=1 allow_mailbox_writes=1 after validated preinit/status/gpio17 sequence to send these reads\n");
-		seq_puts(s, "planned packets: [0x800,0x1a,0xc0,0xdc,0], [0x800,0x1a,0xc0,0xdb,0]\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_GPIO_SET ||
-	    ioread32(base + 0x008) != BIT(11) ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; last mailbox state does not look like the completed generic GPIO17 sequence\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	for (i = 0; i < ARRAY_SIZE(regs); i++) {
-		u32 packet[5] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_I2C_READ8,
-			0xc0,
-			regs[i],
-			0,
-		};
-		u32 completion = 0;
-
-		ret = hd60pro_mailbox_send_locked(hd, packet,
-						  ARRAY_SIZE(packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		values[i] = ioread32(base + 0x010);
-		seq_printf(s,
-			   "read%u_bus0xc0_reg0x%02x packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x value_bar0_010=0x%08x bar0_008=0x%08x bar0_00c=0x%08x\n",
-			   i, regs[i], packet[0], packet[1], packet[2],
-			   packet[3], packet[4], ret, completion, values[i],
-			   ioread32(base + 0x008), ioread32(base + 0x00c));
-		if (ret)
-			break;
-		if (hd60pro_mailbox_dead(base)) {
-			ret = -ENODEV;
-			seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-			break;
-		}
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "windows_condition_reg_dc_eq_0x05_and_reg_db_eq_0x32: %d\n",
-		   (values[0] & 0xff) == 0x05 && (values[1] & 0xff) == 0x32);
-	seq_printf(s, "result: %d\n", ret);
-
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_i2c1a_c0_dc_db);
 
 /*
  * hdmi_probe: read HDMI chip 0xc0 status registers via cmd 0x1a without
@@ -3181,4024 +3112,6 @@ static int hd60pro_mst3367_hpd_on_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(hd60pro_mst3367_hpd_on);
 
-static int hd60pro_logo_upload_plan_show(struct seq_file *s, void *unused)
-{
-	static const struct {
-		const char *name;
-		const char *firmware;
-		u32 selector;
-		u64 windows_source_va;
-	} logos[] = {
-		{
-			.name = "no_signal",
-			.firmware = "hd60prodrv/logo-selector-100.bin",
-			.selector = 0x100,
-			.windows_source_va = 0x140319040ULL,
-		},
-		{
-			.name = "hdcp",
-			.firmware = "hd60prodrv/logo-selector-200.bin",
-			.selector = 0x200,
-			.windows_source_va = 0x1402f3840ULL,
-		},
-		{
-			.name = "still",
-			.firmware = "hd60prodrv/logo-selector-300.bin",
-			.selector = 0x300,
-			.windows_source_va = 0x140319040ULL,
-		},
-	};
-	struct hd60pro_dev *hd = s->private;
-	resource_size_t len = hd60pro_mailbox_len(hd);
-	unsigned int i;
-
-	seq_puts(s, "windows_logo_upload_plan_after_i2c_branch_false\n");
-	seq_puts(s, "hardware_written: 0\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-	seq_printf(s, "copy_offset: 0x%x\n", HD60PRO_FW_WINDOW_OFFSET);
-	seq_printf(s, "payload_size: 0x%x\n", HD60PRO_LOGO_PAYLOAD_SIZE);
-	seq_printf(s, "required_window_bytes: 0x%x\n",
-		   HD60PRO_FW_WINDOW_OFFSET + HD60PRO_LOGO_PAYLOAD_SIZE);
-	seq_printf(s, "selected_aperture_len: %pa\n", &len);
-	seq_printf(s, "aperture_fits_selected_mailbox_bar: %d\n",
-		   HD60PRO_FW_WINDOW_OFFSET + HD60PRO_LOGO_PAYLOAD_SIZE <= len);
-	seq_puts(s, "windows_prepare_packet_shape: [0x800,0x60,selector,0x25800,0x00f00140], flags=1\n");
-	seq_puts(s, "windows_commit_packet_shape: [0x800,0x61,1], flags=1, then sleep 100ms and require BAR0+0x08 == 0\n");
-	seq_puts(s, "note: this file is read-only; it only checks extracted payload availability\n");
-
-	for (i = 0; i < ARRAY_SIZE(logos); i++) {
-		const struct firmware *fw;
-		int ret;
-
-		ret = request_firmware(&fw, logos[i].firmware, &hd->pdev->dev);
-		seq_printf(s,
-			   "%s selector=0x%03x firmware=%s windows_source_va=0x%llx prepare=[0x%08x,0x%08x,0x%08x,0x%08x,0x%08x] commit=[0x%08x,0x%08x,0x%08x] available=%d",
-			   logos[i].name, logos[i].selector, logos[i].firmware,
-			   logos[i].windows_source_va, HD60PRO_MBOX_DOORBELL,
-			   HD60PRO_MBOX_CMD_LOGO_PREPARE, logos[i].selector,
-			   HD60PRO_LOGO_PAYLOAD_SIZE, HD60PRO_LOGO_DESCRIPTOR,
-			   HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_LOGO_COMMIT,
-			   1, ret == 0);
-		if (ret) {
-			seq_printf(s, " request_firmware_result=%d\n", ret);
-			continue;
-		}
-		seq_printf(s, " size=%zu size_ok=%d first8=%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x\n",
-			   fw->size, fw->size == HD60PRO_LOGO_PAYLOAD_SIZE,
-			   fw->size > 0 ? fw->data[0] : 0,
-			   fw->size > 1 ? fw->data[1] : 0,
-			   fw->size > 2 ? fw->data[2] : 0,
-			   fw->size > 3 ? fw->data[3] : 0,
-			   fw->size > 4 ? fw->data[4] : 0,
-			   fw->size > 5 ? fw->data[5] : 0,
-			   fw->size > 6 ? fw->data[6] : 0,
-			   fw->size > 7 ? fw->data[7] : 0);
-		release_firmware(fw);
-	}
-
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_logo_upload_plan);
-
-static int hd60pro_logo_upload_one(struct hd60pro_dev *hd, struct seq_file *s,
-				   const char *label, const char *firmware,
-				   u32 selector)
-{
-	const struct firmware *fw;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u32 prepare_packet[5] = {
-		HD60PRO_MBOX_DOORBELL,
-		HD60PRO_MBOX_CMD_LOGO_PREPARE,
-		selector,
-		HD60PRO_LOGO_PAYLOAD_SIZE,
-		HD60PRO_LOGO_DESCRIPTOR,
-	};
-	u32 commit_packet[3] = {
-		HD60PRO_MBOX_DOORBELL,
-		HD60PRO_MBOX_CMD_LOGO_COMMIT,
-		1,
-	};
-	u32 prepare_completion;
-	u32 commit_completion = 0;
-	u32 commit_irq_delta = 0;
-	u32 prepare_window_start = 0;
-	u32 prepare_window_end = 0;
-	u32 status0;
-	u32 status1;
-	u32 status2;
-	unsigned int success_wait_ms = 0;
-	int ret;
-
-	ret = request_firmware(&fw, firmware, &hd->pdev->dev);
-	if (ret) {
-		seq_printf(s, "%s request_firmware_result=%d firmware=%s\n",
-			   label, ret, firmware);
-		return ret;
-	}
-
-	if (fw->size != HD60PRO_LOGO_PAYLOAD_SIZE) {
-		seq_printf(s, "%s payload_size_mismatch=%zu expected=%u firmware=%s\n",
-			   label, fw->size, HD60PRO_LOGO_PAYLOAD_SIZE,
-			   firmware);
-		release_firmware(fw);
-		return -EINVAL;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	ret = hd60pro_mailbox_send_logo_prepare_locked(hd, prepare_packet,
-						       ARRAY_SIZE(prepare_packet),
-						       HD60PRO_MBOX_ASYNC_TIMEOUT_MS,
-						       &prepare_window_start,
-						       &prepare_window_end);
-	prepare_completion = ioread32(base + HD60PRO_REG_MBOX_COMPLETE);
-	if (ret)
-		goto out_unlock;
-
-	memcpy_toio(base + HD60PRO_FW_WINDOW_OFFSET, fw->data, fw->size);
-	wmb();
-
-	ret = hd60pro_mailbox_send_async_locked(hd, commit_packet,
-						ARRAY_SIZE(commit_packet),
-						HD60PRO_VISIBLE_FW_COMMIT_TIMEOUT_MS,
-						&commit_completion,
-						&commit_irq_delta);
-	for (success_wait_ms = 0; success_wait_ms < 100; success_wait_ms++) {
-		status0 = ioread32(base + 0x008);
-		if (status0 == 0 || status0 == U32_MAX)
-			break;
-		msleep(1);
-	}
-
-out_unlock:
-	status0 = ioread32(base + 0x008);
-	status1 = ioread32(base + 0x00c);
-	status2 = ioread32(base + 0x010);
-	mutex_unlock(&hd->mailbox_lock);
-	release_firmware(fw);
-
-	seq_printf(s, "%s selector=0x%03x firmware=%s prepare_result=%d prepare_completion=0x%08x window_start=0x%08x window_end=0x%08x commit_completion=0x%08x commit_irq_delta=%u post_commit_wait_ms=%u bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-		   label, selector, firmware, ret, prepare_completion,
-		   prepare_window_start, prepare_window_end, commit_completion,
-		   commit_irq_delta, success_wait_ms, status0, status1,
-		   status2);
-
-	return ret;
-}
-
-static int hd60pro_logo_upload_selector100_show(struct seq_file *s,
-						void *unused)
-{
-	struct hd60pro_dev *hd = s->private;
-	const struct firmware *fw;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	resource_size_t len = hd60pro_mailbox_len(hd);
-	u32 prepare_packet[5] = {
-		HD60PRO_MBOX_DOORBELL,
-		HD60PRO_MBOX_CMD_LOGO_PREPARE,
-		0x100,
-		HD60PRO_LOGO_PAYLOAD_SIZE,
-		HD60PRO_LOGO_DESCRIPTOR,
-	};
-	u32 commit_packet[3] = {
-		HD60PRO_MBOX_DOORBELL,
-		HD60PRO_MBOX_CMD_LOGO_COMMIT,
-		1,
-	};
-	u32 prepare_completion = 0;
-	u32 commit_completion = 0;
-	u32 commit_irq_delta = 0;
-	u32 prepare_window_start = 0;
-	u32 prepare_window_end = 0;
-	u32 status0;
-	u32 status1;
-	u32 status2;
-	unsigned int success_wait_ms = 0;
-	int ret;
-
-	seq_puts(s, "windows_logo_upload_selector100_no_signal\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-	seq_printf(s, "firmware: hd60prodrv/logo-selector-100.bin\n");
-	seq_printf(s, "prepare_packet: 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x\n",
-		   prepare_packet[0], prepare_packet[1], prepare_packet[2],
-		   prepare_packet[3], prepare_packet[4]);
-	seq_printf(s, "commit_packet: 0x%08x 0x%08x 0x%08x\n",
-		   commit_packet[0], commit_packet[1], commit_packet[2]);
-
-	if (!allow_logo_upload) {
-		seq_puts(s, "blocked; reload with allow_logo_upload=1 allow_mailbox_writes=1 request_irq_vector=1 after validated preinit/status/gpio/i2c sequence\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (hd->irq < 0) {
-		seq_puts(s, "disabled; request_irq_vector=1 is required for the async commit command 0x61\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (HD60PRO_FW_WINDOW_OFFSET + HD60PRO_LOGO_PAYLOAD_SIZE > len) {
-		seq_puts(s, "blocked; selected mailbox BAR aperture is too small\n");
-		seq_printf(s, "required_window_bytes: 0x%x\n",
-			   HD60PRO_FW_WINDOW_OFFSET + HD60PRO_LOGO_PAYLOAD_SIZE);
-		seq_printf(s, "selected_aperture_len: %pa\n", &len);
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_I2C_READ8 ||
-	    ioread32(base + 0x00c) != 0xdb ||
-	    ioread32(base + 0x010) != 0 ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; last mailbox state does not look like the completed 0xc0:0xdb I2C read with zero result\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	ret = request_firmware(&fw, "hd60prodrv/logo-selector-100.bin",
-			       &hd->pdev->dev);
-	if (ret) {
-		seq_printf(s, "request_firmware_result: %d\n", ret);
-		return 0;
-	}
-
-	if (fw->size != HD60PRO_LOGO_PAYLOAD_SIZE) {
-		seq_printf(s, "blocked; payload size mismatch: %zu\n", fw->size);
-		release_firmware(fw);
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	ret = hd60pro_mailbox_send_logo_prepare_locked(hd, prepare_packet,
-						       ARRAY_SIZE(prepare_packet),
-						       HD60PRO_MBOX_ASYNC_TIMEOUT_MS,
-						       &prepare_window_start,
-						       &prepare_window_end);
-	prepare_completion = ioread32(base + HD60PRO_REG_MBOX_COMPLETE);
-	seq_printf(s, "prepare_result: %d\n", ret);
-	seq_printf(s, "prepare_completion: 0x%08x\n", prepare_completion);
-	seq_printf(s, "prepare_bar5_window_start_0x40: 0x%08x\n",
-		   prepare_window_start);
-	seq_printf(s, "prepare_bar5_window_end_0x48: 0x%08x\n",
-		   prepare_window_end);
-	if (ret)
-		goto out_unlock;
-
-	memcpy_toio(base + HD60PRO_FW_WINDOW_OFFSET, fw->data, fw->size);
-	wmb();
-	seq_printf(s, "copied_bytes: %zu\n", fw->size);
-
-	ret = hd60pro_mailbox_send_async_locked(hd, commit_packet,
-						ARRAY_SIZE(commit_packet),
-						HD60PRO_VISIBLE_FW_COMMIT_TIMEOUT_MS,
-						&commit_completion,
-						&commit_irq_delta);
-		seq_printf(s, "commit_result: %d\n", ret);
-		seq_printf(s, "commit_completion: 0x%08x\n", commit_completion);
-		seq_printf(s, "commit_irq_delta: %u\n", commit_irq_delta);
-		for (success_wait_ms = 0; success_wait_ms < 100;
-		     success_wait_ms++) {
-			status0 = ioread32(base + 0x008);
-			if (status0 == 0 || status0 == U32_MAX)
-				break;
-			msleep(1);
-		}
-		seq_printf(s, "post_commit_status0_wait_ms: %u\n",
-			   success_wait_ms);
-
-out_unlock:
-	status0 = ioread32(base + 0x008);
-	status1 = ioread32(base + 0x00c);
-	status2 = ioread32(base + 0x010);
-	mutex_unlock(&hd->mailbox_lock);
-	release_firmware(fw);
-
-	seq_printf(s, "status_bar_%s_0x08: 0x%08x\n",
-		   hd60pro_mailbox_bar_name(), status0);
-	seq_printf(s, "status_bar_%s_0x0c: 0x%08x\n",
-		   hd60pro_mailbox_bar_name(), status1);
-	seq_printf(s, "status_bar_%s_0x10: 0x%08x\n",
-		   hd60pro_mailbox_bar_name(), status2);
-	seq_printf(s, "windows_success_condition_bar_%s_0x08_eq_0: %d\n",
-		   hd60pro_mailbox_bar_name(), status0 == 0);
-	seq_printf(s, "result: %d\n", ret);
-
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_logo_upload_selector100);
-
-static int hd60pro_logo_upload_all_show(struct seq_file *s, void *unused)
-{
-	static const struct {
-		const char *name;
-		const char *firmware;
-		u32 selector;
-	} logos[] = {
-		{ "no_signal", "hd60prodrv/logo-selector-100.bin", 0x100 },
-		{ "hdcp", "hd60prodrv/logo-selector-200.bin", 0x200 },
-		{ "still", "hd60prodrv/logo-selector-300.bin", 0x300 },
-	};
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	resource_size_t len = hd60pro_mailbox_len(hd);
-	unsigned int i;
-	int final_ret = 0;
-
-	seq_puts(s, "windows_logo_upload_all_three_status_images\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-	seq_puts(s, "note: Windows HwInitialize calls all three logo functions and does not branch on their return values\n");
-
-	if (!allow_logo_upload) {
-		seq_puts(s, "blocked; reload with allow_logo_upload=1 allow_mailbox_writes=1 request_irq_vector=1 after validated preinit/status/gpio/i2c sequence\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (hd->irq < 0) {
-		seq_puts(s, "disabled; request_irq_vector=1 is required for async commands\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (HD60PRO_FW_WINDOW_OFFSET + HD60PRO_LOGO_PAYLOAD_SIZE > len) {
-		seq_puts(s, "blocked; selected mailbox BAR aperture is too small\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_I2C_READ8 ||
-	    ioread32(base + 0x00c) != 0xdb ||
-	    ioread32(base + 0x010) != 0 ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; last mailbox state does not look like the completed 0xc0:0xdb I2C read with zero result\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	for (i = 0; i < ARRAY_SIZE(logos); i++) {
-		const struct firmware *fw;
-		u32 prepare_packet[5] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_LOGO_PREPARE,
-			logos[i].selector,
-			HD60PRO_LOGO_PAYLOAD_SIZE,
-			HD60PRO_LOGO_DESCRIPTOR,
-		};
-		u32 commit_packet[3] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_LOGO_COMMIT,
-			1,
-		};
-		u32 prepare_completion;
-		u32 commit_completion = 0;
-		u32 commit_irq_delta = 0;
-		u32 prepare_window_start = 0;
-		u32 prepare_window_end = 0;
-		u32 status0;
-		u32 status1;
-		u32 status2;
-		unsigned int success_wait_ms;
-		int ret;
-
-		seq_printf(s, "logo%u_%s selector=0x%03x firmware=%s\n",
-			   i, logos[i].name, logos[i].selector,
-			   logos[i].firmware);
-		ret = request_firmware(&fw, logos[i].firmware, &hd->pdev->dev);
-		if (ret) {
-			seq_printf(s, "request_firmware_result: %d\n", ret);
-			final_ret = ret;
-			break;
-		}
-		if (fw->size != HD60PRO_LOGO_PAYLOAD_SIZE) {
-			seq_printf(s, "payload_size_mismatch: %zu\n", fw->size);
-			release_firmware(fw);
-			final_ret = -EINVAL;
-			break;
-		}
-
-		mutex_lock(&hd->mailbox_lock);
-		ret = hd60pro_mailbox_send_logo_prepare_locked(hd,
-							       prepare_packet,
-							       ARRAY_SIZE(prepare_packet),
-							       HD60PRO_MBOX_ASYNC_TIMEOUT_MS,
-							       &prepare_window_start,
-							       &prepare_window_end);
-		prepare_completion = ioread32(base + HD60PRO_REG_MBOX_COMPLETE);
-		seq_printf(s, "prepare_result: %d completion=0x%08x window_start=0x%08x window_end=0x%08x\n",
-			   ret, prepare_completion, prepare_window_start,
-			   prepare_window_end);
-		if (ret) {
-			mutex_unlock(&hd->mailbox_lock);
-			release_firmware(fw);
-			final_ret = ret;
-			break;
-		}
-
-		memcpy_toio(base + HD60PRO_FW_WINDOW_OFFSET, fw->data, fw->size);
-		wmb();
-		seq_printf(s, "copied_bytes: %zu\n", fw->size);
-
-		ret = hd60pro_mailbox_send_async_locked(hd, commit_packet,
-							ARRAY_SIZE(commit_packet),
-							HD60PRO_VISIBLE_FW_COMMIT_TIMEOUT_MS,
-							&commit_completion,
-							&commit_irq_delta);
-		seq_printf(s, "commit_result: %d completion=0x%08x irq_delta=%u\n",
-			   ret, commit_completion, commit_irq_delta);
-		for (success_wait_ms = 0; success_wait_ms < 100;
-		     success_wait_ms++) {
-			status0 = ioread32(base + 0x008);
-			if (status0 == 0 || status0 == U32_MAX)
-				break;
-			msleep(1);
-		}
-		status0 = ioread32(base + 0x008);
-		status1 = ioread32(base + 0x00c);
-		status2 = ioread32(base + 0x010);
-		mutex_unlock(&hd->mailbox_lock);
-		release_firmware(fw);
-
-		seq_printf(s, "post_commit_wait_ms=%u status0=0x%08x status1=0x%08x status2=0x%08x success_eq0=%d\n",
-			   success_wait_ms, status0, status1, status2,
-			   status0 == 0);
-		if (ret) {
-			final_ret = ret;
-			break;
-		}
-		if (hd60pro_mailbox_dead(base)) {
-			final_ret = -ENODEV;
-			seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-			break;
-		}
-	}
-
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_logo_upload_all);
-
-static int hd60pro_pre_28548c_logo_uploads_local_show(struct seq_file *s,
-						      void *unused)
-{
-	static const struct {
-		const char *label;
-		const char *firmware;
-		u32 selector;
-		const char *source;
-	} uploads[] = {
-		{
-			.label = "call_140276624_selector100",
-			.firmware = "hd60prodrv/logo-selector-100.bin",
-			.selector = 0x100,
-			.source = "copy source VA 0x140319040",
-		},
-		{
-			.label = "call_140276a28_selector200",
-			.firmware = "hd60prodrv/logo-selector-200.bin",
-			.selector = 0x200,
-			.source = "copy source VA 0x1402f3840",
-		},
-		{
-			.label = "call_140276dbc_selector300",
-			.firmware = "hd60prodrv/logo-selector-300.bin",
-			.selector = 0x300,
-			.source = "copy source VA 0x140319040",
-		},
-	};
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	resource_size_t len = hd60pro_mailbox_len(hd);
-	unsigned int i;
-	int final_ret = 0;
-
-	seq_puts(s, "windows_pre_28548c_logo_uploads_local\n");
-	seq_puts(s, "source: e60MZ0380.X64.SYS calls 0x140276624, 0x140276a28, 0x140276dbc immediately before 0x14028548c in the A3 setup path\n");
-	seq_puts(s, "local branch: PCI/context bytes 0x0e/0x0f are treated as zero; helper conversion inputs are logged but the actual device copy uses the three extracted 0x25800-byte payloads\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_logo_upload) {
-		seq_puts(s, "blocked; reload with allow_logo_upload=1 allow_mailbox_writes=1 request_irq_vector=1\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (hd->irq < 0) {
-		seq_puts(s, "disabled; request_irq_vector=1 is required for async commands\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (HD60PRO_FW_WINDOW_OFFSET + HD60PRO_LOGO_PAYLOAD_SIZE > len) {
-		seq_puts(s, "blocked; selected mailbox BAR aperture is too small\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	    ioread32(base + 0x02c) == 1) {
-		seq_puts(s, "already_completed: post-logo pipeline has already started\n");
-		return 0;
-	}
-
-	if (!((ioread32(base + 0x004) == HD60PRO_MBOX_CMD_I2C_READ8 &&
-	       ioread32(base + 0x00c) == 0xdb &&
-	       ioread32(base + 0x010) == 0 &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_LOGO_COMMIT &&
-	       ioread32(base + 0x008) == 1 &&
-	       ioread32(base + 0x00c) == HD60PRO_LOGO_PAYLOAD_SIZE &&
-	       ioread32(base + 0x010) == HD60PRO_LOGO_DESCRIPTOR &&
-	       ioread32(base + 0x02c) == 1))) {
-		seq_puts(s, "blocked; last mailbox state is neither completed I2C zero read nor completed logo commit\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	for (i = 0; i < ARRAY_SIZE(uploads); i++) {
-		int ret;
-
-		seq_printf(s, "%s: %s\n", uploads[i].label,
-			   uploads[i].source);
-		ret = hd60pro_logo_upload_one(hd, s, uploads[i].label,
-					      uploads[i].firmware,
-					      uploads[i].selector);
-		if (ret) {
-			final_ret = ret;
-			break;
-		}
-		if (hd60pro_mailbox_dead(base)) {
-			final_ret = -ENODEV;
-			seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-			break;
-		}
-	}
-
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_pre_28548c_logo_uploads_local);
-
-static int hd60pro_post_logo_plan_show(struct seq_file *s, void *unused)
-{
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-
-	seq_puts(s, "windows_post_logo_plan\n");
-	seq_puts(s, "source: e60MZ0380.X64.SYS 0x14027a498..0x14027a52f\n");
-	seq_puts(s, "after logo uploads Windows calls:\n");
-	seq_puts(s, "  0x14028548c: video/pipeline mode config using context 0x73a8/0x73b8/0x73bc/0x73c0\n");
-	seq_puts(s, "    local 1cfa:0006/default path decoded so far: helper 0x14028658c sends [0x800,0x1b,0x9c,0x00,0x02] if bank changed, then [0x800,0x1b,0x9c,0x18,0x00]\n");
-	seq_puts(s, "  0x140286734: long sensor/decoder config path, called with edx=0 r8d=1\n");
-	seq_puts(s, "  0x140287224: long color/scaler config path, called with edx=1 r8d=1\n");
-	seq_puts(s, "  0x140287b54: packet [0x800,0x1d,0xa2,0x11,<low byte of context+0x1d0b0>,1]\n");
-	seq_puts(s, "  0x140287b54: packet [0x800,0x1d,0xa2,0x12,0x5a,1]\n");
-	seq_puts(s, "  0x140287b54: packet [0x800,0x1d,0xa2,0x10,0x5a,1]\n");
-	seq_puts(s, "context+0x1d0b0 default: init path loads a registry/config value with default 0; setter stores value|0x80000000, but this call uses only the low byte\n");
-	seq_puts(s, "linux test assumption for first 0x1d write: value 0x00\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-	if (base) {
-		seq_printf(s, "current_bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "current_bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "current_bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "current_bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "current_bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-	}
-
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_plan);
-
-static int hd60pro_post_logo_pipeline_28548c_min_show(struct seq_file *s,
-						      void *unused)
-{
-	static const struct {
-		const char *name;
-		u32 reg;
-		u32 value;
-	} writes[] = {
-		{ "select_bank_2_if_needed", 0x00, 0x02 },
-		{ "local_mode_edx0_value0", 0x18, 0x00 },
-	};
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	unsigned int i;
-	int final_ret = 0;
-
-	seq_puts(s, "windows_post_logo_pipeline_28548c_min\n");
-	seq_puts(s, "source: e60MZ0380.X64.SYS 0x140285435..0x140285461 via helper 0x14028658c\n");
-	seq_puts(s, "local assumptions: context+0x73a8=0, function edx=0, PCI config bytes 0x0e/0x0f do not take alternate branch\n");
-	seq_puts(s, "planned packets: [0x800,0x1b,0x9c,0x00,0x02], [0x800,0x1b,0x9c,0x18,0x00]\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_post_logo_pipeline) {
-		seq_puts(s, "blocked; reload with allow_post_logo_pipeline=1 allow_mailbox_writes=1 after validated logo_upload_all\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_LOGO_COMMIT ||
-	    ioread32(base + 0x008) != 1 ||
-	    ioread32(base + 0x00c) != HD60PRO_LOGO_PAYLOAD_SIZE ||
-	    ioread32(base + 0x010) != HD60PRO_LOGO_DESCRIPTOR ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; last mailbox state does not look like completed logo_upload_all commit\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	for (i = 0; i < ARRAY_SIZE(writes); i++) {
-		u32 packet[5] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-			0x9c,
-			writes[i].reg,
-			writes[i].value,
-		};
-		u32 completion = 0;
-		u32 status0;
-		u32 status1;
-		u32 status2;
-		int ret;
-
-		ret = hd60pro_mailbox_send_locked(hd, packet, ARRAY_SIZE(packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		status0 = ioread32(base + 0x008);
-		status1 = ioread32(base + 0x00c);
-		status2 = ioread32(base + 0x010);
-		seq_printf(s, "write%u_%s packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-			   i, writes[i].name, packet[0], packet[1], packet[2],
-			   packet[3], packet[4], ret, completion, status0,
-			   status1, status2);
-		if (ret) {
-			final_ret = ret;
-			break;
-		}
-		if (hd60pro_mailbox_dead(base)) {
-			final_ret = -ENODEV;
-			seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-			break;
-		}
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_pipeline_28548c_min);
-
-static bool hd60pro_24dc28_state_at_or_after(void __iomem *base,
-					     unsigned int stage);
-
-static int hd60pro_post_logo_pipeline_24dc28_head_local_show(struct seq_file *s,
-							     void *unused)
-{
-	static const struct {
-		const char *name;
-		u32 packet[5];
-		u8 words;
-		u16 sleep_ms;
-	} steps[] = {
-		{
-			.name = "gpio15_alt_line9_value1",
-			.packet = {
-				HD60PRO_MBOX_DOORBELL,
-				HD60PRO_MBOX_CMD_GPIO_ALT_SET,
-				BIT(9),
-				BIT(9),
-				0,
-			},
-			.words = 4,
-			.sleep_ms = 50,
-		},
-		{
-			.name = "gpio15_alt_line9_value0",
-			.packet = {
-				HD60PRO_MBOX_DOORBELL,
-				HD60PRO_MBOX_CMD_GPIO_ALT_SET,
-				BIT(9),
-				0,
-				0,
-			},
-			.words = 4,
-			.sleep_ms = 50,
-		},
-		{
-			.name = "gpio15_alt_line9_value1_again",
-			.packet = {
-				HD60PRO_MBOX_DOORBELL,
-				HD60PRO_MBOX_CMD_GPIO_ALT_SET,
-				BIT(9),
-				BIT(9),
-				0,
-			},
-			.words = 4,
-			.sleep_ms = 50,
-		},
-		{
-			.name = "gpio15_alt_line8_value0",
-			.packet = {
-				HD60PRO_MBOX_DOORBELL,
-				HD60PRO_MBOX_CMD_GPIO_ALT_SET,
-				BIT(8),
-				0,
-				0,
-			},
-			.words = 4,
-			.sleep_ms = 50,
-		},
-		{
-			.name = "select_bank0_for_9c",
-			.packet = {
-				HD60PRO_MBOX_DOORBELL,
-				HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-				0x9c,
-				0x00,
-				0x00,
-			},
-			.words = 5,
-			.sleep_ms = 0,
-		},
-		{
-			.name = "write_9c_13_head_value8",
-			.packet = {
-				HD60PRO_MBOX_DOORBELL,
-				HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-				0x9c,
-				0x13,
-				0x08,
-			},
-			.words = 5,
-			.sleep_ms = 0,
-		},
-	};
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	unsigned int i;
-	int final_ret = 0;
-
-	seq_puts(s, "windows_post_logo_pipeline_24dc28_head_local\n");
-	seq_puts(s, "source: beginning of e60MZ0380.X64.SYS 0x14024dc28, called by true local 0x14028548c before 88:03=a7\n");
-	seq_puts(s, "local assumptions: PCI config byte 0x0e is not 0x55/0xc5, so the fourth GPIO-alt command is line8=0\n");
-	seq_puts(s, "planned packets: GPIO15-alt line9 1/0/1 with 50 ms sleeps, line8=0, then 9c:00=0 and 9c:13=8\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_post_logo_pipeline) {
-		seq_puts(s, "blocked; reload with allow_post_logo_pipeline=1 allow_mailbox_writes=1 after validated post_logo_pipeline_28548c_min\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (hd60pro_24dc28_state_at_or_after(base, 1)) {
-		seq_puts(s, "already_completed: head or later 24dc28 state observed\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	    ioread32(base + 0x008) == 0x4e &&
-	    ioread32(base + 0x00c) == 0x13 &&
-	    ioread32(base + 0x010) == 0x08 &&
-	    ioread32(base + 0x02c) == 1) {
-		seq_puts(s, "already_completed: final head state bank0 9c:13=8 observed\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_PIPELINE_WRITE ||
-	    ioread32(base + 0x008) != 0x4e ||
-	    ioread32(base + 0x00c) != 0x18 ||
-	    ioread32(base + 0x010) != 0x00 ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; last mailbox state does not look like completed post_logo_pipeline_28548c_min\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	for (i = 0; i < ARRAY_SIZE(steps); i++) {
-		u32 completion = 0;
-		int ret;
-
-		ret = hd60pro_mailbox_send_locked(hd, steps[i].packet,
-						  steps[i].words,
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		seq_printf(s, "%s packet=", steps[i].name);
-		if (steps[i].words == 4)
-			seq_printf(s, "0x%08x,0x%08x,0x%08x,0x%08x",
-				   steps[i].packet[0], steps[i].packet[1],
-				   steps[i].packet[2], steps[i].packet[3]);
-		else
-			seq_printf(s, "0x%08x,0x%08x,0x%08x,0x%08x,0x%08x",
-				   steps[i].packet[0], steps[i].packet[1],
-				   steps[i].packet[2], steps[i].packet[3],
-				   steps[i].packet[4]);
-		seq_printf(s, " result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-			   ret, completion, ioread32(base + 0x008),
-			   ioread32(base + 0x00c), ioread32(base + 0x010));
-		if (ret) {
-			final_ret = ret;
-			break;
-		}
-		if (hd60pro_mailbox_dead(base)) {
-			final_ret = -ENODEV;
-			seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-			break;
-		}
-		if (steps[i].sleep_ms)
-			msleep(steps[i].sleep_ms);
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_pipeline_24dc28_head_local);
-
-static bool hd60pro_24dc28_state_at_or_after(void __iomem *base,
-					     unsigned int stage)
-{
-	u32 cmd = ioread32(base + 0x004);
-	u32 status = ioread32(base + 0x008);
-	u32 reg = ioread32(base + 0x00c);
-	u32 value = ioread32(base + 0x010);
-	u32 completion = ioread32(base + 0x02c);
-
-	if (cmd != HD60PRO_MBOX_CMD_PIPELINE_WRITE || completion != 1)
-		return false;
-
-	if (status == 0x44 && stage <= 7 && reg == 0x03)
-		return true;
-
-	if (status != 0x4e)
-		return false;
-
-	if (stage <= 1 && reg == 0x19 && value == 0x02)
-		return true;
-	if (stage <= 2 && reg == 0x08 && value == 0x03)
-		return true;
-	if (stage <= 3 && reg == 0xb4)
-		return true;
-	if (stage <= 4 && reg == 0x2e && value == 0xa1)
-		return true;
-	if (stage <= 5 && reg == 0xb7 && value == 0x00)
-		return true;
-	if (stage <= 6 && reg == 0x00)
-		return true;
-	if (stage <= 7 && reg == 0xcf)
-		return true;
-	if (stage <= 7 && reg == 0x1f)
-		return true;
-	if (stage <= 7 && reg == 0xa9)
-		return true;
-
-	return false;
-}
-
-static int hd60pro_post_logo_pipeline_24dc28_table1_local_show(struct seq_file *s,
-							       void *unused)
-{
-	static const struct {
-		const char *name;
-		u32 reg;
-		u32 value;
-	} writes[] = {
-		{ "write_9c_41_6f", 0x41, 0x6f },
-		{ "write_9c_b8_00", 0xb8, 0x00 },
-		{ "select_bank1_for_9c", 0x00, 0x01 },
-		{ "write_9c_0f_bank1_02", 0x0f, 0x02 },
-		{ "write_9c_16_bank1_30", 0x16, 0x30 },
-		{ "select_bank0_for_9c", 0x00, 0x00 },
-		{ "write_9c_64_02", 0x64, 0x02 },
-		{ "write_9c_65_ff", 0x65, 0xff },
-		{ "write_9c_66_00", 0x66, 0x00 },
-		{ "write_9c_67_02", 0x67, 0x02 },
-		{ "select_bank1_for_local_17_18_19", 0x00, 0x01 },
-		{ "write_9c_17_local_02", 0x17, 0x02 },
-		{ "write_9c_18_local_02", 0x18, 0x02 },
-		{ "write_9c_19_local_02", 0x19, 0x02 },
-	};
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	unsigned int i;
-	int final_ret = 0;
-
-	seq_puts(s, "windows_post_logo_pipeline_24dc28_table1_local\n");
-	seq_puts(s, "source: first deterministic table slice of e60MZ0380.X64.SYS 0x14024dc28 after head 9c:13=8\n");
-	seq_puts(s, "local assumptions: context+0x81d8=0 path writes bank1 9c:17/18/19=2; read/modify blocks after 9c:1a are not sent here\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_post_logo_pipeline) {
-		seq_puts(s, "blocked; reload with allow_post_logo_pipeline=1 allow_mailbox_writes=1 after validated post_logo_pipeline_24dc28_head_local\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (hd60pro_24dc28_state_at_or_after(base, 1)) {
-		seq_puts(s, "already_completed: table1 or later 24dc28 state observed\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_PIPELINE_WRITE ||
-	    ioread32(base + 0x008) != 0x4e ||
-	    ioread32(base + 0x00c) != 0x13 ||
-	    ioread32(base + 0x010) != 0x08 ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; last mailbox state does not look like completed post_logo_pipeline_24dc28_head_local\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	for (i = 0; i < ARRAY_SIZE(writes); i++) {
-		u32 packet[5] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-			0x9c,
-			writes[i].reg,
-			writes[i].value,
-		};
-		u32 completion = 0;
-		int ret;
-
-		ret = hd60pro_mailbox_send_locked(hd, packet, ARRAY_SIZE(packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		seq_printf(s, "%s packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-			   writes[i].name, packet[0], packet[1], packet[2],
-			   packet[3], packet[4], ret, completion,
-			   ioread32(base + 0x008), ioread32(base + 0x00c),
-			   ioread32(base + 0x010));
-		if (ret) {
-			final_ret = ret;
-			break;
-		}
-		if (hd60pro_mailbox_dead(base)) {
-			final_ret = -ENODEV;
-			seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-			break;
-		}
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_pipeline_24dc28_table1_local);
-
-static int hd60pro_post_logo_pipeline_24dc28_table2_local_show(struct seq_file *s,
-							       void *unused)
-{
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u32 read2a = 0;
-	u32 value2a;
-	int final_ret = 0;
-
-	seq_puts(s, "windows_post_logo_pipeline_24dc28_table2_local\n");
-	seq_puts(s, "source: e60MZ0380.X64.SYS 0x14024df64..0x14024dfc9, continuation after local/default 9c:19=2\n");
-	seq_puts(s, "planned packets: bank1 9c:1a=0x50, read bank1 9c:2a, write 9c:2a|7, then bank2 9c:08=3\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_post_logo_pipeline) {
-		seq_puts(s, "blocked; reload with allow_post_logo_pipeline=1 allow_mailbox_writes=1 after validated post_logo_pipeline_24dc28_table1_local\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (hd60pro_24dc28_state_at_or_after(base, 2)) {
-		seq_puts(s, "already_completed: table2 or later 24dc28 state observed\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_PIPELINE_WRITE ||
-	    ioread32(base + 0x008) != 0x4e ||
-	    ioread32(base + 0x00c) != 0x19 ||
-	    ioread32(base + 0x010) != 0x02 ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; last mailbox state does not look like completed post_logo_pipeline_24dc28_table1_local\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	{
-		u32 completion = 0;
-		u32 bank1_packet[5] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-			0x9c,
-			0x00,
-			0x01,
-		};
-		u32 write1a_packet[5] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-			0x9c,
-			0x1a,
-			0x50,
-		};
-		u32 read2a_packet[5] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_I2C_READ8,
-			0x9c,
-			0x2a,
-			0,
-		};
-		u32 bank2_packet[5] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-			0x9c,
-			0x00,
-			0x02,
-		};
-		u32 write08_packet[5] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-			0x9c,
-			0x08,
-			0x03,
-		};
-		int ret;
-
-		ret = hd60pro_mailbox_send_locked(hd, bank1_packet,
-						  ARRAY_SIZE(bank1_packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		seq_printf(s, "select_bank1 packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-			   bank1_packet[0], bank1_packet[1], bank1_packet[2],
-			   bank1_packet[3], bank1_packet[4], ret, completion,
-			   ioread32(base + 0x008), ioread32(base + 0x00c),
-			   ioread32(base + 0x010));
-		if (ret) {
-			final_ret = ret;
-			goto out_unlock;
-		}
-
-		ret = hd60pro_mailbox_send_locked(hd, write1a_packet,
-						  ARRAY_SIZE(write1a_packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		seq_printf(s, "write_9c_1a_bank1_50 packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-			   write1a_packet[0], write1a_packet[1],
-			   write1a_packet[2], write1a_packet[3],
-			   write1a_packet[4], ret, completion,
-			   ioread32(base + 0x008), ioread32(base + 0x00c),
-			   ioread32(base + 0x010));
-		if (ret) {
-			final_ret = ret;
-			goto out_unlock;
-		}
-
-		ret = hd60pro_mailbox_send_locked(hd, read2a_packet,
-						  ARRAY_SIZE(read2a_packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		read2a = ioread32(base + 0x010);
-		value2a = (read2a | 0x07) & 0xff;
-		seq_printf(s, "read_9c_2a_bank1 packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x value=0x%08x value_or_07=0x%02x bar0_008=0x%08x bar0_00c=0x%08x\n",
-			   read2a_packet[0], read2a_packet[1],
-			   read2a_packet[2], read2a_packet[3],
-			   read2a_packet[4], ret, completion, read2a,
-			   value2a, ioread32(base + 0x008),
-			   ioread32(base + 0x00c));
-		if (ret) {
-			final_ret = ret;
-			goto out_unlock;
-		}
-
-		{
-			u32 write2a_packet[5] = {
-				HD60PRO_MBOX_DOORBELL,
-				HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-				0x9c,
-				0x2a,
-				value2a,
-			};
-
-			ret = hd60pro_mailbox_send_locked(hd, write2a_packet,
-							  ARRAY_SIZE(write2a_packet),
-							  HD60PRO_MBOX_TIMEOUT_US,
-							  &completion);
-			seq_printf(s, "write_9c_2a_bank1_or07 packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-				   write2a_packet[0], write2a_packet[1],
-				   write2a_packet[2], write2a_packet[3],
-				   write2a_packet[4], ret, completion,
-				   ioread32(base + 0x008),
-				   ioread32(base + 0x00c),
-				   ioread32(base + 0x010));
-			if (ret) {
-				final_ret = ret;
-				goto out_unlock;
-			}
-		}
-
-		ret = hd60pro_mailbox_send_locked(hd, bank2_packet,
-						  ARRAY_SIZE(bank2_packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		seq_printf(s, "select_bank2 packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-			   bank2_packet[0], bank2_packet[1], bank2_packet[2],
-			   bank2_packet[3], bank2_packet[4], ret, completion,
-			   ioread32(base + 0x008), ioread32(base + 0x00c),
-			   ioread32(base + 0x010));
-		if (ret) {
-			final_ret = ret;
-			goto out_unlock;
-		}
-
-		ret = hd60pro_mailbox_send_locked(hd, write08_packet,
-						  ARRAY_SIZE(write08_packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		seq_printf(s, "write_9c_08_bank2_03 packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-			   write08_packet[0], write08_packet[1],
-			   write08_packet[2], write08_packet[3],
-			   write08_packet[4], ret, completion,
-			   ioread32(base + 0x008), ioread32(base + 0x00c),
-			   ioread32(base + 0x010));
-		if (ret)
-			final_ret = ret;
-	}
-
-out_unlock:
-	if (!final_ret && hd60pro_mailbox_dead(base)) {
-		final_ret = -ENODEV;
-		seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_pipeline_24dc28_table2_local);
-
-static int hd60pro_pipeline_write8_locked(struct hd60pro_dev *hd,
-					  struct seq_file *s,
-					  const char *name, u32 reg,
-					  u32 value)
-{
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u32 packet[5] = {
-		HD60PRO_MBOX_DOORBELL,
-		HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-		0x9c,
-		reg,
-		value & 0xff,
-	};
-	u32 completion = 0;
-	int ret;
-
-	ret = hd60pro_mailbox_send_locked(hd, packet, ARRAY_SIZE(packet),
-					  HD60PRO_MBOX_TIMEOUT_US,
-					  &completion);
-	seq_printf(s, "%s packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-		   name, packet[0], packet[1], packet[2], packet[3],
-		   packet[4], ret, completion, ioread32(base + 0x008),
-		   ioread32(base + 0x00c), ioread32(base + 0x010));
-
-	return ret;
-}
-
-static int hd60pro_i2c_read8_locked(struct hd60pro_dev *hd,
-				    struct seq_file *s, const char *name,
-				    u32 chip, u32 reg, u32 *value)
-{
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u32 packet[5] = {
-		HD60PRO_MBOX_DOORBELL,
-		HD60PRO_MBOX_CMD_I2C_READ8,
-		chip,
-		reg,
-		0,
-	};
-	u32 completion = 0;
-	int ret;
-
-	ret = hd60pro_mailbox_send_locked(hd, packet, ARRAY_SIZE(packet),
-					  HD60PRO_MBOX_TIMEOUT_US,
-					  &completion);
-	*value = ioread32(base + 0x010);
-	seq_printf(s, "%s packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x value=0x%08x bar0_008=0x%08x bar0_00c=0x%08x\n",
-		   name, packet[0], packet[1], packet[2], packet[3],
-		   packet[4], ret, completion, *value,
-		   ioread32(base + 0x008), ioread32(base + 0x00c));
-
-	return ret;
-}
-
-static int hd60pro_i2c_write8_locked(struct hd60pro_dev *hd,
-				     struct seq_file *s, const char *name,
-				     u32 chip, u32 reg, u32 value)
-{
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u32 packet[5] = {
-		HD60PRO_MBOX_DOORBELL,
-		HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-		chip,
-		reg,
-		value & 0xff,
-	};
-	u32 completion = 0;
-	int ret;
-
-	ret = hd60pro_mailbox_send_locked(hd, packet, ARRAY_SIZE(packet),
-					  HD60PRO_MBOX_TIMEOUT_US,
-					  &completion);
-	seq_printf(s, "%s packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-		   name, packet[0], packet[1], packet[2], packet[3],
-		   packet[4], ret, completion, ioread32(base + 0x008),
-		   ioread32(base + 0x00c), ioread32(base + 0x010));
-
-	return ret;
-}
-
-static int hd60pro_pipeline_read8_locked(struct hd60pro_dev *hd,
-					 struct seq_file *s,
-					 const char *name, u32 reg,
-					 u32 *value)
-{
-	return hd60pro_i2c_read8_locked(hd, s, name, 0x9c, reg, value);
-}
-
-static int hd60pro_selector_read8_locked(struct hd60pro_dev *hd,
-					 struct seq_file *s,
-					 const char *name, u32 selector,
-					 u32 reg, u32 *value)
-{
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u32 packed = (1u << 16) | ((reg & 0xff) << 8) | (selector & 0xff);
-	u32 packet[3] = {
-		HD60PRO_MBOX_DOORBELL,
-		HD60PRO_MBOX_CMD_SELECTOR_READ,
-		packed,
-	};
-	u32 completion = 0;
-	int ret;
-
-	ret = hd60pro_mailbox_send_locked(hd, packet, ARRAY_SIZE(packet),
-					  HD60PRO_MBOX_TIMEOUT_US,
-					  &completion);
-	*value = ioread32(base + 0x00c);
-	seq_printf(s, "%s selector=0x%02x reg=0x%02x packed=0x%08x result=%d completion=0x%08x value=0x%02x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-		   name, selector, reg, packed, ret, completion, *value & 0xff,
-		   ioread32(base + 0x008), ioread32(base + 0x00c),
-		   ioread32(base + 0x010));
-
-	return ret;
-}
-
-static int __maybe_unused hd60pro_selector_write8_locked(struct hd60pro_dev *hd,
-							 struct seq_file *s,
-							 const char *name,
-							 u32 selector, u32 reg,
-							 u32 value)
-{
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u32 packet[5] = {
-		HD60PRO_MBOX_DOORBELL,
-		HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-		selector,
-		reg,
-		value & 0xff,
-	};
-	u32 completion = 0;
-	int ret;
-
-	ret = hd60pro_mailbox_send_locked(hd, packet, ARRAY_SIZE(packet),
-					  HD60PRO_MBOX_TIMEOUT_US,
-					  &completion);
-	seq_printf(s, "%s selector=0x%02x reg=0x%02x value=0x%02x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-		   name, selector, reg, value & 0xff, ret, completion,
-		   ioread32(base + 0x008), ioread32(base + 0x00c),
-		   ioread32(base + 0x010));
-
-	return ret;
-}
-
-static int hd60pro_post_logo_pipeline_24dc28_table3_local_show(struct seq_file *s,
-							       void *unused)
-{
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u32 read24 = 0;
-	u32 readae = 0;
-	u32 readb4 = 0;
-	u32 valueae = 0;
-	u32 valuead = 0x05;
-	u32 valueb4 = 0;
-	unsigned int i;
-	int final_ret = 0;
-	int ret;
-
-	seq_puts(s, "windows_post_logo_pipeline_24dc28_table3_local\n");
-	seq_puts(s, "source: e60MZ0380.X64.SYS 0x14024e085..0x14024e282 local/default path after bank2 9c:08=3\n");
-	seq_puts(s, "local assumptions: PCI config bytes 0x0e/0x0f are 0, context+0x97bc=0 => bank1 9c:24=0x40, context+0x81f8=0 => bank0 9c:ad=5\n");
-	seq_puts(s, "planned packets: bank1 24/read24/optional 25-27, 30/31/32; bank0 b0, ae|4, ad, b1/b2/b3, b4 then b4&0xfc\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_post_logo_pipeline) {
-		seq_puts(s, "blocked; reload with allow_post_logo_pipeline=1 allow_mailbox_writes=1 after validated post_logo_pipeline_24dc28_table2_local\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (hd60pro_24dc28_state_at_or_after(base, 3)) {
-		seq_puts(s, "already_completed: table3 or later 24dc28 state observed\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_PIPELINE_WRITE ||
-	    ioread32(base + 0x008) != 0x4e ||
-	    ioread32(base + 0x00c) != 0x08 ||
-	    ioread32(base + 0x010) != 0x03 ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; last mailbox state does not look like completed post_logo_pipeline_24dc28_table2_local\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-
-	ret = hd60pro_pipeline_write8_locked(hd, s, "select_bank1_for_24_30_32",
-					     0x00, 0x01);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_24_bank1_40",
-					     0x24, 0x40);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_24_bank1",
-					    0x24, &read24);
-	if (ret)
-		goto fail;
-
-	if (read24 & 0x01) {
-		ret = hd60pro_pipeline_write8_locked(hd, s,
-						     "write_9c_25_bank1_00",
-						     0x25, 0x00);
-		if (ret)
-			goto fail;
-		ret = hd60pro_pipeline_write8_locked(hd, s,
-						     "write_9c_26_bank1_00",
-						     0x26, 0x00);
-		if (ret)
-			goto fail;
-		for (i = 0; i < 5; i++) {
-			ret = hd60pro_pipeline_write8_locked(hd, s,
-							     "write_9c_27_bank1_00_loop",
-							     0x27, 0x00);
-			if (ret)
-				goto fail;
-		}
-	} else {
-		seq_puts(s, "skip_bank1_25_26_27_loop: read_9c_24 bit0 is clear\n");
-	}
-
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_30_bank1_80",
-					     0x30, 0x80);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_31_bank1_00",
-					     0x31, 0x00);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_32_bank1_00",
-					     0x32, 0x00);
-	if (ret)
-		goto fail;
-
-	ret = hd60pro_pipeline_write8_locked(hd, s, "select_bank0_for_b0_b4",
-					     0x00, 0x00);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_b0_bank0_14",
-					     0xb0, 0x14);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_ae_bank0",
-					    0xae, &readae);
-	if (ret)
-		goto fail;
-	valueae = (readae | 0x04) & 0xff;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_ae_bank0_or04",
-					     0xae, valueae);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_ad_bank0_default05",
-					     0xad, valuead);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_b1_bank0_c0",
-					     0xb1, 0xc0);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_b2_bank0_00",
-					     0xb2, 0x00);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_b3_bank0_local00",
-					     0xb3, 0x00);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_b4_bank0_55",
-					     0xb4, 0x55);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_b4_bank0",
-					    0xb4, &readb4);
-	if (ret)
-		goto fail;
-	valueb4 = readb4 & 0xfc;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_b4_bank0_andfc",
-					     0xb4, valueb4);
-	if (ret)
-		goto fail;
-
-	goto out_unlock;
-
-fail:
-	final_ret = ret;
-
-out_unlock:
-	if (!final_ret && hd60pro_mailbox_dead(base)) {
-		final_ret = -ENODEV;
-		seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "read_9c_24: 0x%08x\n", read24);
-	seq_printf(s, "read_9c_ae: 0x%08x write_ae: 0x%02x\n",
-		   readae, valueae & 0xff);
-	seq_printf(s, "read_9c_b4: 0x%08x write_b4: 0x%02x\n",
-		   readb4, valueb4 & 0xff);
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_pipeline_24dc28_table3_local);
-
-static int hd60pro_post_logo_pipeline_24dc28_table4_local_show(struct seq_file *s,
-							       void *unused)
-{
-	static const struct {
-		const char *name;
-		u32 reg;
-		u32 value;
-	} writes[] = {
-		{ "select_bank2_for_post_b4", 0x00, 0x02 },
-		{ "write_9c_01_bank2_61", 0x01, 0x61 },
-		{ "write_9c_02_bank2_f5", 0x02, 0xf5 },
-		{ "write_9c_04_bank2_01", 0x04, 0x01 },
-		{ "write_9c_05_bank2_00", 0x05, 0x00 },
-		{ "write_9c_06_bank2_08", 0x06, 0x08 },
-		{ "write_9c_1c_bank2_1a", 0x1c, 0x1a },
-		{ "write_9c_1d_bank2_00", 0x1d, 0x00 },
-		{ "write_9c_1e_bank2_00", 0x1e, 0x00 },
-		{ "write_9c_1f_bank2_00", 0x1f, 0x00 },
-		{ "write_9c_17_bank2_c0", 0x17, 0xc0 },
-		{ "write_9c_19_bank2_ff", 0x19, 0xff },
-		{ "write_9c_1a_bank2_ff", 0x1a, 0xff },
-		{ "write_9c_1b_bank2_fc", 0x1b, 0xfc },
-		{ "write_9c_20_bank2_00", 0x20, 0x00 },
-		{ "write_9c_22_bank2_26", 0x22, 0x26 },
-		{ "write_9c_27_bank2_local00", 0x27, 0x00 },
-	};
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u32 read03 = 0;
-	u32 read25 = 0;
-	u32 read02 = 0;
-	u32 read07 = 0;
-	u32 read21 = 0;
-	u32 read2e = 0;
-	u32 value03 = 0;
-	u32 value25 = 0;
-	u32 value02 = 0;
-	u32 value07 = 0;
-	u32 value21 = 0;
-	u32 value2e = 0;
-	unsigned int i;
-	int final_ret = 0;
-	int ret;
-
-	seq_puts(s, "windows_post_logo_pipeline_24dc28_table4_local\n");
-	seq_puts(s, "source: e60MZ0380.X64.SYS 0x14024e287..0x14024e54f, bank2 continuation after table3 b4\n");
-	seq_puts(s, "local assumptions: context+0x73bc=0 => bank2 9c:27=0; stop before repeated bank0 ab/ac and helper calls\n");
-	seq_puts(s, "planned packets: bank2 01/02, RMW 03, writes 04/05/06/1c/1d/1e/1f, RMW 25/02/07, writes 17/19/1a/1b/20, RMW 21, write 22/27, RMW 2e\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_post_logo_pipeline) {
-		seq_puts(s, "blocked; reload with allow_post_logo_pipeline=1 allow_mailbox_writes=1 after validated post_logo_pipeline_24dc28_table3_local\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (hd60pro_24dc28_state_at_or_after(base, 4)) {
-		seq_puts(s, "already_completed: table4 or later 24dc28 state observed\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	    ioread32(base + 0x008) == 0x4e &&
-	    ioread32(base + 0x00c) == 0x2e &&
-	    ioread32(base + 0x010) == 0xa1 &&
-	    ioread32(base + 0x02c) == 1) {
-		seq_puts(s, "already_completed: final table4 state bank2 9c:2e=0xa1 observed\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_PIPELINE_WRITE ||
-	    ioread32(base + 0x008) != 0x4e ||
-	    ioread32(base + 0x00c) != 0xb4 ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; last mailbox state does not look like completed post_logo_pipeline_24dc28_table3_local\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-
-	for (i = 0; i < 3; i++) {
-		ret = hd60pro_pipeline_write8_locked(hd, s, writes[i].name,
-						     writes[i].reg,
-						     writes[i].value);
-		if (ret)
-			goto fail;
-	}
-
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_03_bank2",
-					    0x03, &read03);
-	if (ret)
-		goto fail;
-	value03 = (read03 | 0x02) & 0xff;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_03_bank2_or02",
-					     0x03, value03);
-	if (ret)
-		goto fail;
-
-	for (i = 3; i < 10; i++) {
-		ret = hd60pro_pipeline_write8_locked(hd, s, writes[i].name,
-						     writes[i].reg,
-						     writes[i].value);
-		if (ret)
-			goto fail;
-	}
-
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_25_bank2",
-					    0x25, &read25);
-	if (ret)
-		goto fail;
-	value25 = (read25 | 0xa2) & 0xff;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_25_bank2_ora2",
-					     0x25, value25);
-	if (ret)
-		goto fail;
-
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_02_bank2",
-					    0x02, &read02);
-	if (ret)
-		goto fail;
-	value02 = (read02 | 0x80) & 0xff;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_02_bank2_or80",
-					     0x02, value02);
-	if (ret)
-		goto fail;
-
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_07_bank2",
-					    0x07, &read07);
-	if (ret)
-		goto fail;
-	value07 = (read07 | 0x04) & 0xff;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_07_bank2_or04",
-					     0x07, value07);
-	if (ret)
-		goto fail;
-
-	for (i = 10; i < ARRAY_SIZE(writes); i++) {
-		ret = hd60pro_pipeline_write8_locked(hd, s, writes[i].name,
-						     writes[i].reg,
-						     writes[i].value);
-		if (ret)
-			goto fail;
-		if (writes[i].reg == 0x20)
-			break;
-	}
-
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_21_bank2",
-					    0x21, &read21);
-	if (ret)
-		goto fail;
-	value21 = read21 & 0xfc;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_21_bank2_andfc",
-					     0x21, value21);
-	if (ret)
-		goto fail;
-
-	for (i = 15; i < ARRAY_SIZE(writes); i++) {
-		ret = hd60pro_pipeline_write8_locked(hd, s, writes[i].name,
-						     writes[i].reg,
-						     writes[i].value);
-		if (ret)
-			goto fail;
-	}
-
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_2e_bank2",
-					    0x2e, &read2e);
-	if (ret)
-		goto fail;
-	value2e = (read2e | 0xa1) & 0xff;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_2e_bank2_ora1",
-					     0x2e, value2e);
-	if (ret)
-		goto fail;
-
-	goto out_unlock;
-
-fail:
-	final_ret = ret;
-
-out_unlock:
-	if (!final_ret && hd60pro_mailbox_dead(base)) {
-		final_ret = -ENODEV;
-		seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "read03=0x%08x write03=0x%02x read25=0x%08x write25=0x%02x read02=0x%08x write02=0x%02x\n",
-		   read03, value03 & 0xff, read25, value25 & 0xff,
-		   read02, value02 & 0xff);
-	seq_printf(s, "read07=0x%08x write07=0x%02x read21=0x%08x write21=0x%02x read2e=0x%08x write2e=0x%02x\n",
-		   read07, value07 & 0xff, read21, value21 & 0xff,
-		   read2e, value2e & 0xff);
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_pipeline_24dc28_table4_local);
-
-static int hd60pro_post_logo_helper_24eeb8_locked(struct hd60pro_dev *hd,
-						  struct seq_file *s,
-						  const char *name,
-						  u32 windows_edx)
-{
-	u32 readb7 = 0;
-	u32 valueb7;
-	int ret;
-
-	seq_printf(s, "%s: source 0x14024eeb8 local/default edx=0x%02x\n",
-		   name, windows_edx & 0xff);
-
-	/*
-	 * With the current local assumptions, the Windows helper reaches the
-	 * fallback GPIO-alt path and then updates bank0 9c:b7 from its input
-	 * bitmask. edx bit1 keeps b7 bit1 set; edx bit5 clears it.
-	 */
-	ret = hd60pro_mailbox_send_locked(hd,
-					  (u32 []) {
-						  HD60PRO_MBOX_DOORBELL,
-						  HD60PRO_MBOX_CMD_GPIO_ALT_SET,
-						  BIT(1),
-						  0,
-					  },
-					  4, HD60PRO_MBOX_TIMEOUT_US, &(u32){ 0 });
-	if (ret)
-		return ret;
-	seq_printf(s, "%s_gpio15_alt_line1_value0 result=%d\n", name, ret);
-
-	ret = hd60pro_pipeline_read8_locked(hd, s, "helper_read_9c_b7_bank0",
-					    0xb7, &readb7);
-	if (ret)
-		return ret;
-
-	valueb7 = (readb7 | 0x02) & 0xff;
-	if (windows_edx & 0x20)
-		valueb7 &= ~0x02;
-
-	ret = hd60pro_pipeline_write8_locked(hd, s,
-					     "helper_write_9c_b7_bank0",
-					     0xb7, valueb7);
-	seq_printf(s, "%s_read_b7=0x%08x %s_write_b7=0x%02x\n",
-		   name, readb7, name, valueb7 & 0xff);
-
-	return ret;
-}
-
-static int hd60pro_post_logo_helper_24d2a4_locked(struct hd60pro_dev *hd,
-						  struct seq_file *s)
-{
-	int ret;
-
-	seq_puts(s, "helper_24d2a4: write bank0 9c:b8=0x10 then 0x00\n");
-	ret = hd60pro_pipeline_write8_locked(hd, s,
-					     "helper_24d2a4_write_b8_10",
-					     0xb8, 0x10);
-	if (ret)
-		return ret;
-
-	return hd60pro_pipeline_write8_locked(hd, s,
-					      "helper_24d2a4_write_b8_00",
-					      0xb8, 0x00);
-}
-
-static int hd60pro_post_logo_helper_24db30_locked(struct hd60pro_dev *hd,
-						  struct seq_file *s)
-{
-	int ret;
-
-	seq_puts(s, "helper_24db30: write bank2 9c:07=0xf4 then 0x04\n");
-	ret = hd60pro_pipeline_write8_locked(hd, s,
-					     "helper_24db30_select_bank2",
-					     0x00, 0x02);
-	if (ret)
-		return ret;
-	ret = hd60pro_pipeline_write8_locked(hd, s,
-					     "helper_24db30_write_07_f4",
-					     0x07, 0xf4);
-	if (ret)
-		return ret;
-
-	return hd60pro_pipeline_write8_locked(hd, s,
-					      "helper_24db30_write_07_04",
-					      0x07, 0x04);
-}
-
-static int hd60pro_post_logo_pipeline_24dc28_table5_local_show(struct seq_file *s,
-							       void *unused)
-{
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u32 readab = 0;
-	u32 readac = 0;
-	u32 valueab = 0;
-	u32 valueac = 0;
-	int final_ret = 0;
-	int ret;
-
-	seq_puts(s, "windows_post_logo_pipeline_24dc28_table5_local\n");
-	seq_puts(s, "source: e60MZ0380.X64.SYS 0x14024e554..0x14024e84a local/default continuation after table4\n");
-	seq_puts(s, "local assumptions: context+0x73a8=0, PCI config bytes 0x0e/0x0f are 0, path writes 9c:51=0x89 and calls helper_24eeb8(0x30)\n");
-	seq_puts(s, "planned: bank0 ab/ac RMW, helper_24eeb8(0), helper_24d2a4, helper_24db30, 9c:51=0x89, helper_24eeb8(0x30), 9c:b7=0; stop before 0x14024d2ec\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_post_logo_pipeline) {
-		seq_puts(s, "blocked; reload with allow_post_logo_pipeline=1 allow_mailbox_writes=1 after validated post_logo_pipeline_24dc28_table4_local\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (hd60pro_24dc28_state_at_or_after(base, 5)) {
-		seq_puts(s, "already_completed: table5 or later 24dc28 state observed\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	    ioread32(base + 0x008) == 0x4e &&
-	    ioread32(base + 0x00c) == 0xb7 &&
-	    ioread32(base + 0x010) == 0x00 &&
-	    ioread32(base + 0x02c) == 1) {
-		seq_puts(s, "already_completed: final table5 state bank0 9c:b7=0 observed\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_PIPELINE_WRITE ||
-	    ioread32(base + 0x008) != 0x4e ||
-	    ioread32(base + 0x00c) != 0x2e ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; last mailbox state does not look like completed post_logo_pipeline_24dc28_table4_local\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-
-	ret = hd60pro_pipeline_write8_locked(hd, s, "select_bank0_for_ab_ac",
-					     0x00, 0x00);
-	if (ret)
-		goto fail;
-
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_ab_bank0",
-					    0xab, &readab);
-	if (ret)
-		goto fail;
-	valueab = (readab & 0x95) | 0x15;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_ab_bank0_rmw",
-					     0xab, valueab);
-	if (ret)
-		goto fail;
-
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_ac_bank0",
-					    0xac, &readac);
-	if (ret)
-		goto fail;
-	valueac = (readac & 0xd5) | 0x15;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_ac_bank0_rmw",
-					     0xac, valueac);
-	if (ret)
-		goto fail;
-
-	ret = hd60pro_post_logo_helper_24eeb8_locked(hd, s,
-						     "helper_24eeb8_first",
-						     0x00);
-	if (ret)
-		goto fail;
-	ret = hd60pro_post_logo_helper_24d2a4_locked(hd, s);
-	if (ret)
-		goto fail;
-	ret = hd60pro_post_logo_helper_24db30_locked(hd, s);
-	if (ret)
-		goto fail;
-
-	ret = hd60pro_pipeline_write8_locked(hd, s,
-					     "select_bank0_after_helper_24db30",
-					     0x00, 0x00);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_write8_locked(hd, s,
-					     "local_branch_write_9c_51_89",
-					     0x51, 0x89);
-	if (ret)
-		goto fail;
-	ret = hd60pro_post_logo_helper_24eeb8_locked(hd, s,
-						     "helper_24eeb8_second",
-						     0x30);
-	if (ret)
-		goto fail;
-
-	ret = hd60pro_pipeline_write8_locked(hd, s,
-					     "write_9c_b7_bank0_00_before_24d2ec",
-					     0xb7, 0x00);
-	if (ret)
-		goto fail;
-
-	goto out_unlock;
-
-fail:
-	final_ret = ret;
-
-out_unlock:
-	if (!final_ret && hd60pro_mailbox_dead(base)) {
-		final_ret = -ENODEV;
-		seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "read_ab=0x%08x write_ab=0x%02x read_ac=0x%08x write_ac=0x%02x\n",
-		   readab, valueab & 0xff, readac, valueac & 0xff);
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_pipeline_24dc28_table5_local);
-
-static int hd60pro_post_logo_pipeline_24dc28_table6_local_show(struct seq_file *s,
-							       void *unused)
-{
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u32 read01 = 0;
-	u32 read04 = 0;
-	u32 read09 = 0;
-	u32 read54 = 0;
-	u32 readac = 0;
-	u32 read00_set = 0;
-	u32 readce = 0;
-	u32 readcf = 0;
-	u32 read00_clear = 0;
-	u32 value01 = 0;
-	u32 value04 = 0;
-	u32 value09 = 0;
-	u32 value54 = 0;
-	u32 valueac = 0;
-	u32 value00_set = 0;
-	u32 valuece = 0;
-	u32 valuecf = 0;
-	u32 value00_clear = 0;
-	int final_ret = 0;
-	int ret;
-
-	seq_puts(s, "windows_post_logo_pipeline_24dc28_table6_local\n");
-	seq_puts(s, "source: e60MZ0380.X64.SYS 0x14024d2ec head, called after table5 by 0x14024dc28\n");
-	seq_puts(s, "planned: bank2 01|60, 04|1, 06=8, 09|20; bank0 54&ef, ac|80, 00|80, ce|80, cf=(read&fa)|2, 00&7f\n");
-	seq_puts(s, "stop before context-dependent 9c:d0/9c:cf dynamic block\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_post_logo_pipeline) {
-		seq_puts(s, "blocked; reload with allow_post_logo_pipeline=1 allow_mailbox_writes=1 after validated post_logo_pipeline_24dc28_table5_local\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (hd60pro_24dc28_state_at_or_after(base, 6)) {
-		seq_puts(s, "already_completed: table6 or later 24dc28 state observed\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	    ioread32(base + 0x008) == 0x4e &&
-	    ioread32(base + 0x00c) == 0x00 &&
-	    ioread32(base + 0x02c) == 1) {
-		seq_puts(s, "already_completed: final table6 state bank0 9c:00 updated observed\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_PIPELINE_WRITE ||
-	    ioread32(base + 0x008) != 0x4e ||
-	    ioread32(base + 0x00c) != 0xb7 ||
-	    ioread32(base + 0x010) != 0x00 ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; last mailbox state does not look like completed post_logo_pipeline_24dc28_table5_local\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-
-	ret = hd60pro_pipeline_write8_locked(hd, s, "select_bank2_for_24d2ec_head",
-					     0x00, 0x02);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_01_bank2",
-					    0x01, &read01);
-	if (ret)
-		goto fail;
-	value01 = (read01 & 0x0f) | 0x60;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_01_bank2_or60",
-					     0x01, value01);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_04_bank2",
-					    0x04, &read04);
-	if (ret)
-		goto fail;
-	value04 = (read04 | 0x01) & 0xff;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_04_bank2_or01",
-					     0x04, value04);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_06_bank2_08",
-					     0x06, 0x08);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_09_bank2",
-					    0x09, &read09);
-	if (ret)
-		goto fail;
-	value09 = (read09 | 0x20) & 0xff;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_09_bank2_or20",
-					     0x09, value09);
-	if (ret)
-		goto fail;
-
-	ret = hd60pro_pipeline_write8_locked(hd, s, "select_bank0_for_24d2ec_head",
-					     0x00, 0x00);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_54_bank0",
-					    0x54, &read54);
-	if (ret)
-		goto fail;
-	value54 = read54 & 0xef;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_54_bank0_andef",
-					     0x54, value54);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_ac_bank0",
-					    0xac, &readac);
-	if (ret)
-		goto fail;
-	valueac = (readac | 0x80) & 0xff;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_ac_bank0_or80",
-					     0xac, valueac);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_00_bank0_for_or80",
-					    0x00, &read00_set);
-	if (ret)
-		goto fail;
-	value00_set = (read00_set | 0x80) & 0xff;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_00_bank0_or80",
-					     0x00, value00_set);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_ce_bank0",
-					    0xce, &readce);
-	if (ret)
-		goto fail;
-	valuece = (readce | 0x80) & 0xff;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_ce_bank0_or80",
-					     0xce, valuece);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_cf_bank0",
-					    0xcf, &readcf);
-	if (ret)
-		goto fail;
-	valuecf = ((readcf & 0xfa) | 0x02) & 0xff;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_cf_bank0_andfa_or02",
-					     0xcf, valuecf);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_00_bank0_for_and7f",
-					    0x00, &read00_clear);
-	if (ret)
-		goto fail;
-	value00_clear = read00_clear & 0x7f;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_00_bank0_and7f",
-					     0x00, value00_clear);
-	if (ret)
-		goto fail;
-
-	goto out_unlock;
-
-fail:
-	final_ret = ret;
-
-out_unlock:
-	if (!final_ret && hd60pro_mailbox_dead(base)) {
-		final_ret = -ENODEV;
-		seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "bank2: 01 %02x->%02x 04 %02x->%02x 09 %02x->%02x\n",
-		   read01 & 0xff, value01 & 0xff, read04 & 0xff,
-		   value04 & 0xff, read09 & 0xff, value09 & 0xff);
-	seq_printf(s, "bank0: 54 %02x->%02x ac %02x->%02x 00 %02x->%02x->%02x ce %02x->%02x cf %02x->%02x\n",
-		   read54 & 0xff, value54 & 0xff, readac & 0xff,
-		   valueac & 0xff, read00_set & 0xff, value00_set & 0xff,
-		   value00_clear & 0xff, readce & 0xff, valuece & 0xff,
-		   readcf & 0xff, valuecf & 0xff);
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_pipeline_24dc28_table6_local);
-
-static int hd60pro_post_logo_pipeline_24dc28_table7_local_default_show(struct seq_file *s,
-								       void *unused)
-{
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	static const u8 windows_table[6] = { 0x06, 0x00, 0x04, 0x03, 0x07, 0x01 };
-	u32 read_d0 = 0;
-	u32 read_cf = 0;
-	u8 table_byte = windows_table[0];
-	u8 value_d0 = 0;
-	u8 value_cf = 0;
-	int final_ret = 0;
-	int ret;
-
-	seq_puts(s, "windows_post_logo_pipeline_24dc28_table7_local_default\n");
-	seq_puts(s, "source: e60MZ0380.X64.SYS 0x14024d4db..0x14024d5b2 local/default tail of 0x14024d2ec\n");
-	seq_puts(s, "local assumptions: context+0x9810=0, context+0x81dc=0 => table byte 0x06 from {06,00,04,03,07,01}\n");
-	seq_puts(s, "planned: read bank0 9c:d0/cf, write d0=(((table>>1)^d0)&3)^d0, write cf=((table<<7)&ff)|(cf&7f)\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_post_logo_pipeline) {
-		seq_puts(s, "blocked; reload with allow_post_logo_pipeline=1 allow_mailbox_writes=1 after validated post_logo_pipeline_24dc28_table6_local\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (hd60pro_24dc28_state_at_or_after(base, 7)) {
-		seq_puts(s, "already_completed: table7 24dc28 state observed\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	    ioread32(base + 0x008) == 0x4e &&
-	    ioread32(base + 0x00c) == 0xcf &&
-	    ioread32(base + 0x02c) == 1) {
-		seq_puts(s, "already_completed: final table7 state bank0 9c:cf updated observed\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_PIPELINE_WRITE ||
-	    ioread32(base + 0x008) != 0x4e ||
-	    ioread32(base + 0x00c) != 0x00 ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; last mailbox state does not look like completed post_logo_pipeline_24dc28_table6_local\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_d0_bank0",
-					    0xd0, &read_d0);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_read8_locked(hd, s, "read_9c_cf_bank0",
-					    0xcf, &read_cf);
-	if (ret)
-		goto fail;
-
-	value_d0 = ((((table_byte >> 1) ^ (read_d0 & 0xff)) & 0x03) ^
-		    (read_d0 & 0xff)) & 0xff;
-	value_cf = (((table_byte << 7) & 0xff) | (read_cf & 0x7f)) & 0xff;
-
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_d0_bank0_local_default",
-					     0xd0, value_d0);
-	if (ret)
-		goto fail;
-	ret = hd60pro_pipeline_write8_locked(hd, s, "write_9c_cf_bank0_local_default",
-					     0xcf, value_cf);
-	if (ret)
-		goto fail;
-
-	goto out_unlock;
-
-fail:
-	final_ret = ret;
-
-out_unlock:
-	if (!final_ret && hd60pro_mailbox_dead(base)) {
-		final_ret = -ENODEV;
-		seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "table_byte: 0x%02x\n", table_byte);
-	seq_printf(s, "d0: 0x%02x -> 0x%02x cf: 0x%02x -> 0x%02x\n",
-		   read_d0 & 0xff, value_d0, read_cf & 0xff, value_cf);
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_pipeline_24dc28_table7_local_default);
-
-static int hd60pro_post_logo_pipeline_28548c_after_24dc28_tail_show(struct seq_file *s,
-								    void *unused)
-{
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	static const struct {
-		const char *name;
-		u32 addr;
-		u32 reg;
-		u32 value;
-	} writes[] = {
-		{ "write_9a_31_after_24dc28", 0x9a, 0x31, 0x01 },
-		{ "write_88_03_a7_after_24dc28", 0x88, 0x03, 0xa7 },
-	};
-	unsigned int i;
-	int final_ret = 0;
-
-	seq_puts(s, "windows_post_logo_pipeline_28548c_after_24dc28_tail\n");
-	seq_puts(s, "source: e60MZ0380.X64.SYS 0x14028566b..0x14028568b after local 0x14024dc28 return\n");
-	seq_puts(s, "local assumptions: branch from 0x14028559f with context+0x73a8!=4; esi=0, r12=1\n");
-	seq_puts(s, "planned: helper 0x1402851cc writes 9a:31=1 then 88:03=0xa7\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_post_logo_pipeline) {
-		seq_puts(s, "blocked; reload with allow_post_logo_pipeline=1 allow_mailbox_writes=1 after validated post_logo_pipeline_24dc28_table7_local_default\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	    ioread32(base + 0x008) == 0x44 &&
-	    ioread32(base + 0x00c) == 0x03 &&
-	    ioread32(base + 0x010) == 0xa7 &&
-	    ioread32(base + 0x02c) == 1) {
-		seq_puts(s, "already_completed: final after-24dc28 tail state 88:03=0xa7 observed\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	    ioread32(base + 0x008) == 0x4e &&
-	    (ioread32(base + 0x00c) == 0x1f ||
-	     ioread32(base + 0x00c) == 0xa9) &&
-	    ioread32(base + 0x02c) == 1) {
-		seq_puts(s, "already_completed: local no-op path has no mailbox writes for this state\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_PIPELINE_WRITE ||
-	    ioread32(base + 0x008) != 0x4e ||
-	    ioread32(base + 0x00c) != 0xcf ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; last mailbox state does not look like completed post_logo_pipeline_24dc28_table7_local_default\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	for (i = 0; i < ARRAY_SIZE(writes); i++) {
-		u32 packet[5] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-			writes[i].addr,
-			writes[i].reg,
-			writes[i].value,
-		};
-		u32 completion = 0;
-		int ret;
-
-		ret = hd60pro_mailbox_send_locked(hd, packet, ARRAY_SIZE(packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		seq_printf(s, "%s packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-			   writes[i].name, packet[0], packet[1], packet[2],
-			   packet[3], packet[4], ret, completion,
-			   ioread32(base + 0x008), ioread32(base + 0x00c),
-			   ioread32(base + 0x010));
-		if (ret) {
-			final_ret = ret;
-			break;
-		}
-		if (hd60pro_mailbox_dead(base)) {
-			final_ret = -ENODEV;
-			seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-			break;
-		}
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_pipeline_28548c_after_24dc28_tail);
-
-static int hd60pro_post_logo_pipeline_286734_local_noop_show(struct seq_file *s,
-							     void *unused)
-{
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-
-	seq_puts(s, "windows_post_logo_pipeline_286734_local_noop\n");
-	seq_puts(s, "source: e60MZ0380.X64.SYS 0x140286734 local no-op path, used inside 0x14028548c and again at 0x14027a4cb\n");
-	seq_puts(s, "local assumptions: PCI config bytes 0x0e=0 and 0x0f=0 take the 0x140286ca9..0x1402868cf return path\n");
-	seq_puts(s, "planned: no mailbox writes for this local path; keep ordering before 0x140287224\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_post_logo_pipeline) {
-		seq_puts(s, "blocked; reload with allow_post_logo_pipeline=1 after validated post_logo_pipeline_28548c_after_24dc28_tail\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if ((ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	     ioread32(base + 0x008) == 0x4e &&
-	     (ioread32(base + 0x00c) == 0x1f ||
-	      ioread32(base + 0x00c) == 0xa9) &&
-	     ioread32(base + 0x02c) == 1) ||
-	    (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_GPIO_ALT_SET &&
-	     ioread32(base + 0x008) == BIT(11) &&
-	     ioread32(base + 0x00c) == 0 &&
-	     ioread32(base + 0x02c) == 1)) {
-		seq_puts(s, "already_completed: later 287224/coefficient state observed\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_PIPELINE_WRITE ||
-	    ioread32(base + 0x008) != 0x44 ||
-	    ioread32(base + 0x00c) != 0x03 ||
-	    ioread32(base + 0x010) != 0xa7 ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; last mailbox state does not look like completed post_logo_pipeline_28548c_after_24dc28_tail or 28548c_tail_local\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	seq_puts(s, "result: 0\n");
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_pipeline_286734_local_noop);
-
-static int hd60pro_post_logo_pipeline_28548c_local_prefix_show(struct seq_file *s,
-							       void *unused)
-{
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u32 packet[5] = {
-		HD60PRO_MBOX_DOORBELL,
-		HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-		0x88,
-		0x03,
-		0xa7,
-	};
-	u32 completion = 0;
-	int ret;
-
-	seq_puts(s, "windows_post_logo_pipeline_28548c_local_prefix\n");
-	seq_puts(s, "source: e60MZ0380.X64.SYS true 0x14028548c local path via helper 0x1402851cc before internal 0x140287224\n");
-	seq_puts(s, "local assumptions: context+0x73a8=0, PCI config bytes 0x0e/0x0f are 0; adjacent 0x14024dc28 block is partially reproduced through table2\n");
-	seq_puts(s, "planned packet: [0x800,0x1b,0x88,0x03,0xa7]\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_post_logo_pipeline) {
-		seq_puts(s, "blocked; reload with allow_post_logo_pipeline=1 allow_mailbox_writes=1 after validated post_logo_pipeline_28548c_min\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	    ioread32(base + 0x008) == 0x4e &&
-	    ioread32(base + 0x00c) == 0x1f &&
-	    ioread32(base + 0x010) == 0x01 &&
-	    ioread32(base + 0x02c) == 1) {
-		seq_puts(s, "already_completed: final 287224 state 9c:1f=1 observed\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	    ioread32(base + 0x008) == 0x4e &&
-	    ioread32(base + 0x00c) == 0xa9 &&
-	    ioread32(base + 0x010) == 0x00 &&
-	    ioread32(base + 0x02c) == 1) {
-		seq_puts(s, "already_completed: later coefficient state 9c:a9 low byte observed\n");
-		return 0;
-	}
-
-	if (!((ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	       ioread32(base + 0x008) == 0x4e &&
-	       ioread32(base + 0x00c) == 0x18 &&
-	       ioread32(base + 0x010) == 0x00 &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	       ioread32(base + 0x008) == 0x4e &&
-	       ioread32(base + 0x00c) == 0x13 &&
-	       ioread32(base + 0x010) == 0x08 &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	       ioread32(base + 0x008) == 0x4e &&
-	       ioread32(base + 0x00c) == 0x19 &&
-	       ioread32(base + 0x010) == 0x02 &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	       ioread32(base + 0x008) == 0x4e &&
-	       ioread32(base + 0x00c) == 0x08 &&
-	       ioread32(base + 0x010) == 0x03 &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	       ioread32(base + 0x008) == 0x4e &&
-	       ioread32(base + 0x00c) == 0xb4 &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	       ioread32(base + 0x008) == 0x4e &&
-	       ioread32(base + 0x00c) == 0x2e &&
-	       ioread32(base + 0x02c) == 1))) {
-		seq_puts(s, "blocked; last mailbox state does not look like completed post_logo_pipeline_28548c_min, 24dc28_head_local, 24dc28_table1_local, 24dc28_table2_local, 24dc28_table3_local, or 24dc28_table4_local\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	ret = hd60pro_mailbox_send_locked(hd, packet, ARRAY_SIZE(packet),
-					  HD60PRO_MBOX_TIMEOUT_US,
-					  &completion);
-	seq_printf(s, "packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-		   packet[0], packet[1], packet[2], packet[3], packet[4],
-		   ret, completion, ioread32(base + 0x008),
-		   ioread32(base + 0x00c), ioread32(base + 0x010));
-	if (!ret && hd60pro_mailbox_dead(base)) {
-		ret = -ENODEV;
-		seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "result: %d\n", ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_pipeline_28548c_local_prefix);
-
-static int hd60pro_post_logo_shadow_probe_show(struct seq_file *s,
-					       void *unused)
-{
-	static const u32 bank0_regs[] = {
-		0x00, 0x18, 0x1e, 0x1f, 0x27, 0x54,
-		0xab, 0xac, 0xad, 0xce, 0xcf, 0xd0,
-	};
-	static const u32 bank2_regs[] = {
-		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-		0x07, 0x09, 0x17, 0x19, 0x1a, 0x1b, 0x1c,
-		0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x25,
-		0x27, 0x2e, 0x4a,
-	};
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	unsigned int i;
-	int final_ret = 0;
-
-	seq_puts(s, "windows_post_logo_shadow_probe\n");
-	seq_puts(s, "purpose: read hardware 9c bank state before 0x140287224/0x14024c894 coefficient assumptions\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_post_logo_pipeline) {
-		seq_puts(s, "blocked; reload with allow_post_logo_pipeline=1 allow_mailbox_writes=1\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (!((ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	       ioread32(base + 0x008) == 0x44 &&
-	       ioread32(base + 0x00c) == 0x03 &&
-	       ioread32(base + 0x010) == 0xa7 &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	       ioread32(base + 0x008) == 0x4e &&
-	       ioread32(base + 0x00c) == 0x1f &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	       ioread32(base + 0x008) == 0x4e &&
-	       ioread32(base + 0x00c) == 0xa9 &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_READ &&
-	       ioread32(base + 0x008) == 0x4e &&
-	       ioread32(base + 0x00c) == 0x4a &&
-	       ioread32(base + 0x02c) == 1))) {
-		seq_puts(s, "blocked; run after post_logo_pipeline_28548c_after_24dc28_tail or later post-logo 9c state\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	final_ret = hd60pro_pipeline_write8_locked(hd, s,
-						   "select_bank0_for_probe",
-						   0x00, 0x00);
-	if (final_ret)
-		goto out_unlock;
-
-	seq_puts(s, "bank0_values:");
-	for (i = 0; i < ARRAY_SIZE(bank0_regs); i++) {
-		u32 value = 0;
-		char name[32];
-		int ret;
-
-		snprintf(name, sizeof(name), "read_bank0_9c_%02x",
-			 bank0_regs[i]);
-		ret = hd60pro_pipeline_read8_locked(hd, s, name,
-						    bank0_regs[i], &value);
-		if (ret) {
-			final_ret = ret;
-			goto out_unlock;
-		}
-		seq_printf(s, "bank0_9c_%02x: 0x%02x\n",
-			   bank0_regs[i], value & 0xff);
-	}
-
-	final_ret = hd60pro_pipeline_write8_locked(hd, s,
-						   "select_bank2_for_probe",
-						   0x00, 0x02);
-	if (final_ret)
-		goto out_unlock;
-
-	seq_puts(s, "bank2_values:");
-	for (i = 0; i < ARRAY_SIZE(bank2_regs); i++) {
-		u32 value = 0;
-		char name[32];
-		int ret;
-
-		snprintf(name, sizeof(name), "read_bank2_9c_%02x",
-			 bank2_regs[i]);
-		ret = hd60pro_pipeline_read8_locked(hd, s, name,
-						    bank2_regs[i], &value);
-		if (ret) {
-			final_ret = ret;
-			goto out_unlock;
-		}
-		seq_printf(s, "bank2_9c_%02x: 0x%02x\n",
-			   bank2_regs[i], value & 0xff);
-	}
-
-out_unlock:
-	mutex_unlock(&hd->mailbox_lock);
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_shadow_probe);
-
-static int hd60pro_post_logo_pipeline_287224_min_show(struct seq_file *s,
-						      void *unused)
-{
-	static const struct {
-		const char *name;
-		u32 reg;
-		u32 value;
-	} tail_writes[] = {
-		{ "ad_local_fifth_arg_zero_maps_07", 0xad, 0x07 },
-		{ "1e_default_bl", 0x1e, 0x11 },
-		{ "1f_default_fifth_arg", 0x1f, 0x01 },
-	};
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u32 read4a = 0;
-	u32 readab = 0;
-	u32 readac = 0;
-	u32 valueab;
-	u32 valueac;
-	unsigned int i;
-	int final_ret = 0;
-
-	seq_puts(s, "windows_post_logo_pipeline_287224_min\n");
-	seq_puts(s, "source: e60MZ0380.X64.SYS 0x140287224 local/default branch into 0x14024c894, used inside 0x14028548c and again at 0x14027a4d9\n");
-	seq_puts(s, "local assumptions: context+0x73a8=0, context+0x9920=0, context+0x9934=0, context+0x81b8=0, defaults 0x80/0x80/0x80/0x80/0x20\n");
-	seq_puts(s, "planned packets: bank2 read 9c:4a, bank0 read/modify/write 9c:ab and 9c:ac, then writes 9c:ad=0x07 9c:1e=0x11 9c:1f=1\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_post_logo_pipeline) {
-		seq_puts(s, "blocked; reload with allow_post_logo_pipeline=1 allow_mailbox_writes=1 after validated post_logo_pipeline_28548c_min\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	    ioread32(base + 0x008) == 0x4e &&
-	    ioread32(base + 0x00c) == 0x1f &&
-	    ioread32(base + 0x010) == 0x01 &&
-	    ioread32(base + 0x02c) == 1) {
-		seq_puts(s, "already_completed: final 287224 state 9c:1f=1 observed\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	    ioread32(base + 0x008) == 0x4e &&
-	    ioread32(base + 0x00c) == 0xa9 &&
-	    ioread32(base + 0x010) == 0x00 &&
-	    ioread32(base + 0x02c) == 1) {
-		seq_puts(s, "already_completed: later coefficient state 9c:a9 low byte observed\n");
-		return 0;
-	}
-
-	if (!((ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	       ioread32(base + 0x008) == 0x4e &&
-	       ioread32(base + 0x00c) == 0x18 &&
-	       ioread32(base + 0x010) == 0x00 &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	       ioread32(base + 0x008) == 0x44 &&
-	       ioread32(base + 0x00c) == 0x03 &&
-	       ioread32(base + 0x010) == 0xa7 &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_READ &&
-	       ioread32(base + 0x008) == 0x4e &&
-	       ioread32(base + 0x00c) == 0x4a &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_GPIO_ALT_SET &&
-	       ioread32(base + 0x008) == BIT(11) &&
-	       ioread32(base + 0x00c) == 0 &&
-	       ioread32(base + 0x02c) == 1))) {
-		seq_puts(s, "blocked; last mailbox state does not look like completed post_logo_pipeline_28548c_min or 28548c_tail_local\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	{
-		u32 bank2_packet[5] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-			0x9c,
-			0x00,
-			0x02,
-		};
-		u32 read4a_packet[5] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_I2C_READ8,
-			0x9c,
-			0x4a,
-			0x00,
-		};
-		u32 bank0_packet[5] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-			0x9c,
-			0x00,
-			0x00,
-		};
-		u32 readab_packet[5] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_I2C_READ8,
-			0x9c,
-			0xab,
-			0x00,
-		};
-		u32 readac_packet[5] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_I2C_READ8,
-			0x9c,
-			0xac,
-			0x00,
-		};
-		u32 completion = 0;
-		int ret;
-
-		ret = hd60pro_mailbox_send_locked(hd, bank2_packet,
-						  ARRAY_SIZE(bank2_packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		seq_printf(s, "bank2 packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-			   bank2_packet[0], bank2_packet[1], bank2_packet[2],
-			   bank2_packet[3], bank2_packet[4], ret, completion,
-			   ioread32(base + 0x008), ioread32(base + 0x00c),
-			   ioread32(base + 0x010));
-		if (ret) {
-			final_ret = ret;
-			goto out_unlock;
-		}
-
-		ret = hd60pro_mailbox_send_locked(hd, read4a_packet,
-						  ARRAY_SIZE(read4a_packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		read4a = ioread32(base + 0x010);
-		seq_printf(s, "read_9c_4a_bank2 packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x value=0x%08x derived_bits_3_2=0x%x bar0_008=0x%08x bar0_00c=0x%08x\n",
-			   read4a_packet[0], read4a_packet[1],
-			   read4a_packet[2], read4a_packet[3],
-			   read4a_packet[4], ret, completion, read4a,
-			   (read4a >> 2) & 3, ioread32(base + 0x008),
-			   ioread32(base + 0x00c));
-		if (ret) {
-			final_ret = ret;
-			goto out_unlock;
-		}
-
-		ret = hd60pro_mailbox_send_locked(hd, bank0_packet,
-						  ARRAY_SIZE(bank0_packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		seq_printf(s, "bank0 packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-			   bank0_packet[0], bank0_packet[1], bank0_packet[2],
-			   bank0_packet[3], bank0_packet[4], ret, completion,
-			   ioread32(base + 0x008), ioread32(base + 0x00c),
-			   ioread32(base + 0x010));
-		if (ret) {
-			final_ret = ret;
-			goto out_unlock;
-		}
-
-		ret = hd60pro_mailbox_send_locked(hd, readab_packet,
-						  ARRAY_SIZE(readab_packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		readab = ioread32(base + 0x010);
-		seq_printf(s, "read_9c_ab_bank0 packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x value=0x%08x bar0_008=0x%08x bar0_00c=0x%08x\n",
-			   readab_packet[0], readab_packet[1],
-			   readab_packet[2], readab_packet[3],
-			   readab_packet[4], ret, completion, readab,
-			   ioread32(base + 0x008), ioread32(base + 0x00c));
-		if (ret) {
-			final_ret = ret;
-			goto out_unlock;
-		}
-
-		valueab = (readab & 0x95) | 0x15;
-		{
-			u32 writeab_packet[5] = {
-				HD60PRO_MBOX_DOORBELL,
-				HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-				0x9c,
-				0xab,
-				valueab,
-			};
-
-			ret = hd60pro_mailbox_send_locked(hd, writeab_packet,
-							  ARRAY_SIZE(writeab_packet),
-							  HD60PRO_MBOX_TIMEOUT_US,
-							  &completion);
-			seq_printf(s, "write_9c_ab_bank0 value=(read&0x95)|0x15=0x%02x packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-				   valueab & 0xff, writeab_packet[0],
-				   writeab_packet[1], writeab_packet[2],
-				   writeab_packet[3], writeab_packet[4], ret,
-				   completion, ioread32(base + 0x008),
-				   ioread32(base + 0x00c),
-				   ioread32(base + 0x010));
-			if (ret) {
-				final_ret = ret;
-				goto out_unlock;
-			}
-		}
-
-		ret = hd60pro_mailbox_send_locked(hd, readac_packet,
-						  ARRAY_SIZE(readac_packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		readac = ioread32(base + 0x010);
-		seq_printf(s, "read_9c_ac_bank0 packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x value=0x%08x bar0_008=0x%08x bar0_00c=0x%08x\n",
-			   readac_packet[0], readac_packet[1],
-			   readac_packet[2], readac_packet[3],
-			   readac_packet[4], ret, completion, readac,
-			   ioread32(base + 0x008), ioread32(base + 0x00c));
-		if (ret) {
-			final_ret = ret;
-			goto out_unlock;
-		}
-
-		valueac = (readac & 0xd5) | 0x15;
-		{
-			u32 writeac_packet[5] = {
-				HD60PRO_MBOX_DOORBELL,
-				HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-				0x9c,
-				0xac,
-				valueac,
-			};
-
-			ret = hd60pro_mailbox_send_locked(hd, writeac_packet,
-							  ARRAY_SIZE(writeac_packet),
-							  HD60PRO_MBOX_TIMEOUT_US,
-							  &completion);
-			seq_printf(s, "write_9c_ac_bank0 value=(read&0xd5)|0x15=0x%02x packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-				   valueac & 0xff, writeac_packet[0],
-				   writeac_packet[1], writeac_packet[2],
-				   writeac_packet[3], writeac_packet[4], ret,
-				   completion, ioread32(base + 0x008),
-				   ioread32(base + 0x00c),
-				   ioread32(base + 0x010));
-			if (ret) {
-				final_ret = ret;
-				goto out_unlock;
-			}
-		}
-	}
-
-	for (i = 0; i < ARRAY_SIZE(tail_writes); i++) {
-		u32 packet[5] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-			0x9c,
-			tail_writes[i].reg,
-			tail_writes[i].value,
-		};
-		u32 completion = 0;
-		int ret;
-
-		ret = hd60pro_mailbox_send_locked(hd, packet, ARRAY_SIZE(packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		seq_printf(s, "write_tail%u_%s packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-			   i, tail_writes[i].name, packet[0], packet[1],
-			   packet[2], packet[3], packet[4], ret, completion,
-			   ioread32(base + 0x008), ioread32(base + 0x00c),
-			   ioread32(base + 0x010));
-		if (ret) {
-			final_ret = ret;
-			break;
-		}
-		if (hd60pro_mailbox_dead(base)) {
-			final_ret = -ENODEV;
-			seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-			break;
-		}
-	}
-
-out_unlock:
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_pipeline_287224_min);
-
-static int hd60pro_pipeline_write_coeff_locked(struct hd60pro_dev *hd,
-					       struct seq_file *s,
-					       const char *name, u32 reg,
-					       u16 value)
-{
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u32 high_packet[5] = {
-		HD60PRO_MBOX_DOORBELL,
-		HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-		0x9c,
-		reg + 1,
-		(value >> 8) & 0x7f,
-	};
-	u32 low_packet[5] = {
-		HD60PRO_MBOX_DOORBELL,
-		HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-		0x9c,
-		reg,
-		value & 0xff,
-	};
-	u32 high_completion = 0;
-	u32 low_completion = 0;
-	int ret;
-
-	ret = hd60pro_mailbox_send_locked(hd, high_packet,
-					  ARRAY_SIZE(high_packet),
-					  HD60PRO_MBOX_TIMEOUT_US,
-					  &high_completion);
-	if (ret)
-		return ret;
-
-	ret = hd60pro_mailbox_send_locked(hd, low_packet,
-					  ARRAY_SIZE(low_packet),
-					  HD60PRO_MBOX_TIMEOUT_US,
-					  &low_completion);
-	seq_printf(s, "%s reg=0x%02x value=0x%04x high_ret=%d high_done=0x%08x low_ret=%d low_done=0x%08x final_reg=0x%08x final_value=0x%08x\n",
-		   name, reg, value, 0, high_completion, ret, low_completion,
-		   ioread32(base + 0x00c), ioread32(base + 0x010));
-
-	return ret;
-}
-
-static int hd60pro_post_logo_pipeline_24c894_coeffs_show(struct seq_file *s,
-							 void *unused)
-{
-	static const struct {
-		const char *name;
-		u32 reg;
-		u16 value;
-	} coeffs[] = {
-		{ "coeff0_9b", 0x9b, 0x103f },
-		{ "coeff1_95", 0x95, 0x0000 },
-		{ "coeff2_a1", 0xa1, 0x0000 },
-		{ "coeff3_99", 0x99, 0x0000 },
-		{ "coeff4_93", 0x93, 0x1000 },
-		{ "coeff5_9f", 0x9f, 0x0000 },
-		{ "coeff6_9d", 0x9d, 0x0000 },
-		{ "coeff7_97", 0x97, 0x0000 },
-		{ "coeff8_a3", 0xa3, 0x1000 },
-		{ "tail_a5", 0xa5, 0x2000 },
-		{ "tail_a7_local_r14_0", 0xa7, 0x0000 },
-		{ "tail_a9", 0xa9, 0x2000 },
-	};
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	unsigned int i;
-	int final_ret = 0;
-
-	seq_puts(s, "windows_post_logo_pipeline_24c894_coeffs\n");
-	seq_puts(s, "source: e60MZ0380.X64.SYS 0x14024cbf1..0x14024cdf2 and helper 0x140274aec\n");
-	seq_puts(s, "local assumptions: post_logo_pipeline_287224_min completed, read_9c_4a_bank2=0, defaults 0x80/0x82/0x80 produce fixed coefficient words\n");
-	seq_puts(s, "helper 0x140274aec writes [reg+1]=(value>>8)&0x7f, then [reg]=value&0xff via command 0x1b address 0x9c\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_post_logo_pipeline) {
-		seq_puts(s, "blocked; reload with allow_post_logo_pipeline=1 allow_mailbox_writes=1 after validated post_logo_pipeline_287224_min\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	    ioread32(base + 0x008) == 0x4e &&
-	    ioread32(base + 0x00c) == 0xa9 &&
-	    ioread32(base + 0x010) == 0x00 &&
-	    ioread32(base + 0x02c) == 1) {
-		seq_puts(s, "already_completed: final coefficient state 9c:a9 low byte observed\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_PIPELINE_WRITE ||
-	    ioread32(base + 0x008) != 0x4e ||
-	    ioread32(base + 0x00c) != 0x1f ||
-	    ioread32(base + 0x010) != 0x01 ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; last mailbox state does not look like completed post_logo_pipeline_287224_min\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	for (i = 0; i < ARRAY_SIZE(coeffs); i++) {
-		int ret;
-
-		ret = hd60pro_pipeline_write_coeff_locked(hd, s,
-							  coeffs[i].name,
-							  coeffs[i].reg,
-							  coeffs[i].value);
-		if (ret) {
-			final_ret = ret;
-			break;
-		}
-		if (hd60pro_mailbox_dead(base)) {
-			final_ret = -ENODEV;
-			seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-			break;
-		}
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_pipeline_24c894_coeffs);
-
-static int hd60pro_post_logo_pipeline_28548c_tail_local_show(struct seq_file *s,
-							     void *unused)
-{
-	static const struct {
-		const char *name;
-		u32 packet[5];
-		u8 words;
-	} steps[] = {
-		{
-			.name = "select_bank2_for_9c",
-			.packet = {
-				HD60PRO_MBOX_DOORBELL,
-				HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-				0x9c,
-				0x00,
-				0x02,
-			},
-			.words = 5,
-		},
-		{
-			.name = "write_9c_27_local_default",
-			.packet = {
-				HD60PRO_MBOX_DOORBELL,
-				HD60PRO_MBOX_CMD_PIPELINE_WRITE,
-				0x9c,
-				0x27,
-				0x00,
-			},
-			.words = 5,
-		},
-		{
-			.name = "gpio15_alt_line10_value1",
-			.packet = {
-				HD60PRO_MBOX_DOORBELL,
-				HD60PRO_MBOX_CMD_GPIO_ALT_SET,
-				BIT(10),
-				BIT(10),
-				0x00,
-			},
-			.words = 4,
-		},
-		{
-			.name = "gpio15_alt_line11_value0",
-			.packet = {
-				HD60PRO_MBOX_DOORBELL,
-				HD60PRO_MBOX_CMD_GPIO_ALT_SET,
-				BIT(11),
-				0x00,
-				0x00,
-			},
-			.words = 4,
-		},
-	};
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	unsigned int i;
-	int final_ret = 0;
-
-	seq_puts(s, "windows_post_logo_pipeline_28548c_tail_local\n");
-	seq_puts(s, "source: local/default tail of e60MZ0380.X64.SYS 0x14028548c after coefficient setup\n");
-	seq_puts(s, "local assumptions: context+0x73bc=0, context+0x73a8=0, pci class/revision bytes 0x0e/0x0f are 0\n");
-	seq_puts(s, "planned packets: 9c:00=2, 9c:27=0, GPIO15-alt line10=1, GPIO15-alt line11=0\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_post_logo_pipeline) {
-		seq_puts(s, "blocked; reload with allow_post_logo_pipeline=1 allow_mailbox_writes=1 after validated post_logo_pipeline_24c894_coeffs\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_PIPELINE_WRITE ||
-	    ioread32(base + 0x008) != 0x4e ||
-	    ioread32(base + 0x00c) != 0xa9 ||
-	    ioread32(base + 0x010) != 0x00 ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; last mailbox state does not look like completed post_logo_pipeline_24c894_coeffs\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	for (i = 0; i < ARRAY_SIZE(steps); i++) {
-		u32 completion = 0;
-		int ret;
-
-		ret = hd60pro_mailbox_send_locked(hd, steps[i].packet,
-						  steps[i].words,
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		seq_printf(s, "%s packet=", steps[i].name);
-		if (steps[i].words == 4)
-			seq_printf(s, "0x%08x,0x%08x,0x%08x,0x%08x",
-				   steps[i].packet[0], steps[i].packet[1],
-				   steps[i].packet[2], steps[i].packet[3]);
-		else
-			seq_printf(s, "0x%08x,0x%08x,0x%08x,0x%08x,0x%08x",
-				   steps[i].packet[0], steps[i].packet[1],
-				   steps[i].packet[2], steps[i].packet[3],
-				   steps[i].packet[4]);
-		seq_printf(s, " result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-			   ret, completion, ioread32(base + 0x008),
-			   ioread32(base + 0x00c), ioread32(base + 0x010));
-		if (ret) {
-			final_ret = ret;
-			break;
-		}
-		if (hd60pro_mailbox_dead(base)) {
-			final_ret = -ENODEV;
-			seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-			break;
-		}
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_pipeline_28548c_tail_local);
-
-static int hd60pro_post_logo_selector_shadow_probe_show(struct seq_file *s,
-							void *unused)
-{
-	static const struct {
-		u32 selector;
-		u32 reg;
-		const char *name;
-	} reads[] = {
-		{ 0x30, 0x00, "generic_30_00" },
-		{ 0x30, 0x1b, "generic_30_1b" },
-		{ 0x88, 0x03, "generic_88_03" },
-		{ 0x88, 0x07, "generic_88_07" },
-		{ 0x88, 0x0c, "generic_88_0c" },
-		{ 0x88, 0x1c, "generic_88_1c" },
-		{ 0x88, 0x55, "generic_88_55" },
-		{ 0x94, 0x00, "generic_94_00" },
-		{ 0x94, 0x07, "generic_94_07" },
-		{ 0x9a, 0x00, "generic_9a_00" },
-		{ 0x9a, 0x01, "generic_9a_01" },
-		{ 0x9a, 0x31, "generic_9a_31" },
-		{ 0x9a, 0x38, "generic_9a_38" },
-		{ 0xb8, 0x42, "generic_b8_42" },
-		{ 0xb8, 0x8c, "generic_b8_8c" },
-	};
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	unsigned int i;
-	int final_ret = 0;
-
-	seq_puts(s, "windows_post_logo_selector_shadow_probe\n");
-	seq_puts(s, "purpose: read generic selector/register state touched by 0x14028548c through helper 0x1402851cc\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_post_logo_pipeline) {
-		seq_puts(s, "blocked; reload with allow_post_logo_pipeline=1 allow_mailbox_writes=1\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required for mailbox reads in this diagnostic\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (!((ioread32(base + 0x004) == HD60PRO_MBOX_CMD_GPIO_ALT_SET &&
-	       ioread32(base + 0x008) == BIT(11) &&
-	       ioread32(base + 0x00c) == 0 &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	       ioread32(base + 0x008) == 0x4e &&
-	       ioread32(base + 0x00c) == 0xa9 &&
-	       ioread32(base + 0x010) == 0x00 &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_I2C_WRITE_EXT &&
-	       ioread32(base + 0x008) == 0x51 &&
-	       ioread32(base + 0x00c) == 0x10 &&
-	       ioread32(base + 0x010) == 0x01 &&
-	       ioread32(base + 0x02c) == 1))) {
-		seq_puts(s, "blocked; run after post_logo_pipeline_28548c_tail_local, 24c894_coeffs, or post_logo_cmd1d_a2\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	for (i = 0; i < ARRAY_SIZE(reads); i++) {
-		u32 value = 0;
-		int ret;
-
-		ret = hd60pro_selector_read8_locked(hd, s, reads[i].name,
-						    reads[i].selector,
-						    reads[i].reg, &value);
-		if (ret) {
-			final_ret = ret;
-			break;
-		}
-		if (hd60pro_mailbox_dead(base)) {
-			final_ret = -ENODEV;
-			seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-			break;
-		}
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_selector_shadow_probe);
-
-static int hd60pro_post_logo_cmd1d_a2_show(struct seq_file *s, void *unused)
-{
-	static const struct {
-		const char *name;
-		u32 device;
-		u32 reg;
-		u32 value;
-	} writes[] = {
-		{ "a2_11_context_1d0b0_default0", 0xa2, 0x11, 0x00 },
-		{ "a2_12_5a", 0xa2, 0x12, 0x5a },
-		{ "a2_10_5a", 0xa2, 0x10, 0x5a },
-	};
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	unsigned int i;
-	int final_ret = 0;
-
-	seq_puts(s, "windows_post_logo_cmd1d_a2\n");
-	seq_puts(s, "source: 0x140287b54, three calls immediately after post-logo pipeline setup\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_cmd1d_write) {
-		seq_puts(s, "blocked; reload with allow_cmd1d_write=1 allow_mailbox_writes=1 after validated logo_upload_all\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (!((ioread32(base + 0x004) == HD60PRO_MBOX_CMD_LOGO_COMMIT &&
-	       ioread32(base + 0x008) == 1 &&
-	       ioread32(base + 0x00c) == HD60PRO_LOGO_PAYLOAD_SIZE &&
-	       ioread32(base + 0x010) == HD60PRO_LOGO_DESCRIPTOR &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	       ioread32(base + 0x008) == 0x4e &&
-	       ioread32(base + 0x00c) == 0x18 &&
-	       ioread32(base + 0x010) == 0x00 &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	       ioread32(base + 0x008) == 0x4e &&
-	       ioread32(base + 0x00c) == 0x1f &&
-	       ioread32(base + 0x010) == 0x01 &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_WRITE &&
-	       ioread32(base + 0x008) == 0x4e &&
-	       ioread32(base + 0x00c) == 0xa9 &&
-	       ioread32(base + 0x010) == 0x00 &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_GPIO_ALT_SET &&
-	       ioread32(base + 0x008) == BIT(11) &&
-	       ioread32(base + 0x00c) == 0 &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_PIPELINE_READ &&
-	       ioread32(base + 0x008) == 0x5c &&
-	       ioread32(base + 0x00c) == 0x8c &&
-	       ioread32(base + 0x02c) == 1) ||
-	      (ioread32(base + 0x004) == HD60PRO_MBOX_CMD_SELECTOR_READ &&
-	       ioread32(base + 0x008) == ((1u << 16) | (0x8c << 8) | 0xb8) &&
-	       ioread32(base + 0x02c) == 1))) {
-		seq_puts(s, "blocked; last mailbox state does not look like completed logo_upload_all commit or post-logo pipeline step\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	for (i = 0; i < ARRAY_SIZE(writes); i++) {
-		u32 packet[6] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_I2C_WRITE_EXT,
-			writes[i].device,
-			writes[i].reg,
-			1,
-			writes[i].value,
-		};
-		u32 completion = 0;
-		u32 status0;
-		u32 status1;
-		u32 status2;
-		int ret;
-
-		ret = hd60pro_mailbox_send_locked(hd, packet, ARRAY_SIZE(packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		status0 = ioread32(base + 0x008);
-		status1 = ioread32(base + 0x00c);
-		status2 = ioread32(base + 0x010);
-		seq_printf(s, "write%u_%s packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-			   i, writes[i].name, packet[0], packet[1], packet[2],
-			   packet[3], packet[4], packet[5], ret, completion,
-			   status0, status1, status2);
-		if (ret) {
-			final_ret = ret;
-			break;
-		}
-		if (hd60pro_mailbox_dead(base)) {
-			final_ret = -ENODEV;
-			seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-			break;
-		}
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_cmd1d_a2);
-
-static int hd60pro_post_logo_cmd1d_variant_sweep_show(struct seq_file *s,
-						      void *unused)
-{
-	static const u32 a2_11_values[] = { 0x00, 0x01, 0x05, 0x5a, 0xff };
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u8 challenge_bytes[4] = { 0x12, 0x34, 0x56, 0x78 };
-	u32 challenge_value = ((u32)challenge_bytes[3] << 24) |
-			      ((u32)challenge_bytes[2] << 16) |
-			      ((u32)challenge_bytes[1] << 8) |
-			      challenge_bytes[0];
-	u32 expected_response = hd60pro_windows_challenge_hash(challenge_bytes);
-	unsigned int i;
-	int final_ret = 0;
-
-	seq_puts(s, "windows_post_logo_cmd1d_variant_sweep\n");
-	seq_puts(s, "purpose: test context+0x1d0b0 candidates for a2:11 before fixed a2:12/a2:10 and a2:13 challenge\n");
-	seq_printf(s, "expected_response: 0x%08x\n", expected_response);
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_cmd1d_write) {
-		seq_puts(s, "blocked; reload with allow_cmd1d_write=1 allow_mailbox_writes=1 and run post_logo_cmd1d_a2 first\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_I2C_WRITE_EXT ||
-	    ioread32(base + 0x008) != 0x51 ||
-	    ioread32(base + 0x00c) != 0x10 ||
-	    ioread32(base + 0x010) != 0x01 ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; run post_logo_cmd1d_a2 immediately before this sweep\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	for (i = 0; i < ARRAY_SIZE(a2_11_values); i++) {
-		u32 packets[][6] = {
-			{ HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_WRITE_EXT,
-			  0xa2, 0x11, 1, a2_11_values[i] },
-			{ HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_WRITE_EXT,
-			  0xa2, 0x12, 1, 0x5a },
-			{ HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_WRITE_EXT,
-			  0xa2, 0x10, 1, 0x5a },
-			{ HD60PRO_MBOX_DOORBELL, HD60PRO_MBOX_CMD_I2C_WRITE_EXT,
-			  0xa2, 0x13, 8, challenge_value },
-		};
-		u32 version_packet[3] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_GET_VERSION,
-			HD60PRO_MBOX_SELECTOR_FW_A3,
-		};
-		u32 completion = 0;
-		u32 response;
-		unsigned int j;
-		int ret = 0;
-
-		for (j = 0; j < ARRAY_SIZE(packets); j++) {
-			ret = hd60pro_mailbox_send_locked(hd, packets[j],
-							  ARRAY_SIZE(packets[j]),
-							  HD60PRO_MBOX_TIMEOUT_US,
-							  &completion);
-			if (ret)
-				break;
-		}
-		if (!ret)
-			ret = hd60pro_mailbox_send_locked(hd, version_packet,
-							  ARRAY_SIZE(version_packet),
-							  HD60PRO_MBOX_TIMEOUT_US,
-							  &completion);
-		response = ioread32(base + 0x010);
-		seq_printf(s, "a2_11=0x%02x ret=%d completion=0x%08x response=0x%08x match=%d bar0_008=0x%08x bar0_00c=0x%08x\n",
-			   a2_11_values[i], ret, completion, response,
-			   response == expected_response, ioread32(base + 0x008),
-			   ioread32(base + 0x00c));
-		if (ret) {
-			final_ret = ret;
-			break;
-		}
-		if (hd60pro_mailbox_dead(base)) {
-			final_ret = -ENODEV;
-			seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-			break;
-		}
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_cmd1d_variant_sweep);
-
-static int hd60pro_post_logo_challenge_a2_show(struct seq_file *s,
-					       void *unused)
-{
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u8 challenge_bytes[4] = { 0x12, 0x34, 0x56, 0x78 };
-	u32 challenge_value = ((u32)challenge_bytes[3] << 24) |
-			      ((u32)challenge_bytes[2] << 16) |
-			      ((u32)challenge_bytes[1] << 8) |
-			      challenge_bytes[0];
-	u32 challenge_packet[6] = {
-		HD60PRO_MBOX_DOORBELL,
-		HD60PRO_MBOX_CMD_I2C_WRITE_EXT,
-		0xa2,
-		0x13,
-		8,
-		challenge_value,
-	};
-	u32 version_packet[3] = {
-		HD60PRO_MBOX_DOORBELL,
-		HD60PRO_MBOX_CMD_GET_VERSION,
-		HD60PRO_MBOX_SELECTOR_FW_A3,
-	};
-	u32 challenge_completion = 0;
-	u32 version_completion = 0;
-	u32 expected_response = hd60pro_windows_challenge_hash(challenge_bytes);
-	u32 challenge_status0;
-	u32 challenge_status1;
-	u32 challenge_status2;
-	u32 version_status0;
-	u32 version_status1;
-	u32 version_status2;
-	int ret;
-
-	seq_puts(s, "windows_post_logo_challenge_a2\n");
-	seq_puts(s, "source: 0x14027a534..0x14027a63f, 0x140287bd8 then 0x140277c78 selector 0xa3\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-	seq_printf(s, "challenge_bytes: %02x:%02x:%02x:%02x\n",
-		   challenge_bytes[0], challenge_bytes[1],
-		   challenge_bytes[2], challenge_bytes[3]);
-	seq_printf(s, "windows_expected_response: 0x%08x\n",
-		   expected_response);
-
-	if (!allow_cmd1d_write) {
-		seq_puts(s, "blocked; reload with allow_cmd1d_write=1 allow_mailbox_writes=1 and run post_logo_cmd1d_a2 first\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_I2C_WRITE_EXT ||
-	    ioread32(base + 0x008) != 0x51 ||
-	    ioread32(base + 0x00c) != 0x10 ||
-	    ioread32(base + 0x010) != 0x01 ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; last mailbox state does not look like completed post_logo_cmd1d_a2 final write\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	ret = hd60pro_mailbox_send_locked(hd, challenge_packet,
-					  ARRAY_SIZE(challenge_packet),
-					  HD60PRO_MBOX_TIMEOUT_US,
-					  &challenge_completion);
-	challenge_status0 = ioread32(base + 0x008);
-	challenge_status1 = ioread32(base + 0x00c);
-	challenge_status2 = ioread32(base + 0x010);
-	seq_printf(s, "challenge_packet: 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x\n",
-		   challenge_packet[0], challenge_packet[1],
-		   challenge_packet[2], challenge_packet[3],
-		   challenge_packet[4], challenge_packet[5]);
-	seq_printf(s, "challenge_result: %d\n", ret);
-	seq_printf(s, "challenge_completion: 0x%08x\n", challenge_completion);
-	seq_printf(s, "challenge_status_bar0_0x08: 0x%08x\n",
-		   challenge_status0);
-	seq_printf(s, "challenge_status_bar0_0x0c: 0x%08x\n",
-		   challenge_status1);
-	seq_printf(s, "challenge_status_bar0_0x10: 0x%08x\n",
-		   challenge_status2);
-	if (ret)
-		goto out_unlock;
-
-	ret = hd60pro_mailbox_send_locked(hd, version_packet,
-					  ARRAY_SIZE(version_packet),
-					  HD60PRO_MBOX_TIMEOUT_US,
-					  &version_completion);
-	version_status0 = ioread32(base + 0x008);
-	version_status1 = ioread32(base + 0x00c);
-	version_status2 = ioread32(base + 0x010);
-	seq_printf(s, "version_packet: 0x%08x 0x%08x 0x%08x\n",
-		   version_packet[0], version_packet[1], version_packet[2]);
-	seq_printf(s, "version_result: %d\n", ret);
-	seq_printf(s, "version_completion: 0x%08x\n", version_completion);
-	seq_printf(s, "version_status_bar0_0x08: 0x%08x\n",
-		   version_status0);
-	seq_printf(s, "version_status_bar0_0x0c: 0x%08x\n",
-		   version_status1);
-	seq_printf(s, "version_status_bar0_0x10: 0x%08x\n",
-		   version_status2);
-	seq_printf(s, "windows_challenge_match: %d\n",
-		   version_status2 == expected_response);
-	hd->pipeline_ready = version_status2 == expected_response;
-	seq_printf(s, "pipeline_ready: %d\n", hd->pipeline_ready);
-
-out_unlock:
-	mutex_unlock(&hd->mailbox_lock);
-	seq_printf(s, "result: %d\n", ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_challenge_a2);
-
-static int hd60pro_post_logo_challenge_wait_a2_show(struct seq_file *s,
-						    void *unused)
-{
-	static const unsigned int waits_ms[] = { 0, 1, 10, 50, 100, 250, 500, 1000 };
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	u8 challenge_bytes[4] = { 0x12, 0x34, 0x56, 0x78 };
-	u32 challenge_value = ((u32)challenge_bytes[3] << 24) |
-			      ((u32)challenge_bytes[2] << 16) |
-			      ((u32)challenge_bytes[1] << 8) |
-			      challenge_bytes[0];
-	u32 expected = hd60pro_windows_challenge_hash(challenge_bytes);
-	u32 challenge_packet[6] = {
-		HD60PRO_MBOX_DOORBELL,
-		HD60PRO_MBOX_CMD_I2C_WRITE_EXT,
-		0xa2,
-		0x13,
-		8,
-		challenge_value,
-	};
-	u32 version_packet[3] = {
-		HD60PRO_MBOX_DOORBELL,
-		HD60PRO_MBOX_CMD_GET_VERSION,
-		HD60PRO_MBOX_SELECTOR_FW_A3,
-	};
-	u32 challenge_completion = 0;
-	unsigned int i;
-	int final_ret = 0;
-
-	seq_puts(s, "windows_post_logo_challenge_wait_a2\n");
-	seq_puts(s, "sends one deterministic a2:13 challenge, then rereads 0x1c/a3 after increasing waits\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-	seq_printf(s, "challenge_bytes: %02x:%02x:%02x:%02x\n",
-		   challenge_bytes[0], challenge_bytes[1],
-		   challenge_bytes[2], challenge_bytes[3]);
-	seq_printf(s, "windows_expected_response: 0x%08x\n", expected);
-
-	if (!allow_cmd1d_write) {
-		seq_puts(s, "blocked; reload with allow_cmd1d_write=1 allow_mailbox_writes=1 and run post_logo_cmd1d_a2 first\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_I2C_WRITE_EXT ||
-	    ioread32(base + 0x008) != 0x51 ||
-	    ioread32(base + 0x00c) != 0x10 ||
-	    ioread32(base + 0x010) != 0x01 ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; run post_logo_cmd1d_a2 immediately before this wait test\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	final_ret = hd60pro_mailbox_send_locked(hd, challenge_packet,
-						ARRAY_SIZE(challenge_packet),
-						HD60PRO_MBOX_TIMEOUT_US,
-						&challenge_completion);
-	seq_printf(s, "challenge_packet: 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x\n",
-		   challenge_packet[0], challenge_packet[1],
-		   challenge_packet[2], challenge_packet[3],
-		   challenge_packet[4], challenge_packet[5]);
-	seq_printf(s, "challenge_result: %d\n", final_ret);
-	seq_printf(s, "challenge_completion: 0x%08x\n", challenge_completion);
-	if (final_ret)
-		goto out_unlock;
-
-	for (i = 0; i < ARRAY_SIZE(waits_ms); i++) {
-		u32 completion = 0;
-		u32 response;
-		int ret;
-
-		if (waits_ms[i])
-			msleep(waits_ms[i]);
-		ret = hd60pro_mailbox_send_locked(hd, version_packet,
-						  ARRAY_SIZE(version_packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		response = ioread32(base + 0x010);
-		seq_printf(s, "read_after_ms=%u result=%d completion=0x%08x response=0x%08x match=%d bar0_008=0x%08x bar0_00c=0x%08x\n",
-			   waits_ms[i], ret, completion, response,
-			   response == expected, ioread32(base + 0x008),
-			   ioread32(base + 0x00c));
-		if (ret) {
-			final_ret = ret;
-			break;
-		}
-	}
-
-out_unlock:
-	mutex_unlock(&hd->mailbox_lock);
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_challenge_wait_a2);
-
-static int hd60pro_post_logo_challenge_sweep_a2_show(struct seq_file *s,
-						     void *unused)
-{
-	static const u8 challenges[][4] = {
-		{ 0x12, 0x34, 0x56, 0x78 },
-		{ 0x78, 0x56, 0x34, 0x12 },
-		{ 0x00, 0x00, 0x00, 0x00 },
-		{ 0x01, 0x02, 0x03, 0x04 },
-		{ 0x10, 0x20, 0x30, 0x40 },
-	};
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	unsigned int i;
-	int final_ret = 0;
-
-	seq_puts(s, "windows_post_logo_challenge_sweep_a2\n");
-	seq_puts(s, "sends several deterministic 0x1d a2:13 challenges and checks 0x1c/a3 against the Windows software hash\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_cmd1d_write) {
-		seq_puts(s, "blocked; reload with allow_cmd1d_write=1 allow_mailbox_writes=1 and run post_logo_cmd1d_a2 first\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_GET_VERSION ||
-	    ioread32(base + 0x008) != 0x51 ||
-	    ioread32(base + 0x00c) != 0x13 ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; run post_logo_challenge_a2 immediately before this sweep\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	for (i = 0; i < ARRAY_SIZE(challenges); i++) {
-		const u8 *bytes = challenges[i];
-		u32 challenge_value = ((u32)bytes[3] << 24) |
-				      ((u32)bytes[2] << 16) |
-				      ((u32)bytes[1] << 8) |
-				      bytes[0];
-		u32 challenge_packet[6] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_I2C_WRITE_EXT,
-			0xa2,
-			0x13,
-			8,
-			challenge_value,
-		};
-		u32 version_packet[3] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_GET_VERSION,
-			HD60PRO_MBOX_SELECTOR_FW_A3,
-		};
-		u32 challenge_completion = 0;
-		u32 version_completion = 0;
-		u32 expected = hd60pro_windows_challenge_hash(bytes);
-		u32 response;
-		int ret;
-
-		ret = hd60pro_mailbox_send_locked(hd, challenge_packet,
-						  ARRAY_SIZE(challenge_packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &challenge_completion);
-		if (ret) {
-			final_ret = ret;
-			seq_printf(s, "challenge%u bytes=%02x:%02x:%02x:%02x write_result=%d write_completion=0x%08x\n",
-				   i, bytes[0], bytes[1], bytes[2], bytes[3],
-				   ret, challenge_completion);
-			break;
-		}
-
-		ret = hd60pro_mailbox_send_locked(hd, version_packet,
-						  ARRAY_SIZE(version_packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &version_completion);
-		response = ioread32(base + 0x010);
-		seq_printf(s, "challenge%u bytes=%02x:%02x:%02x:%02x packet_value=0x%08x expected=0x%08x response=0x%08x match=%d write_completion=0x%08x read_result=%d read_completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x\n",
-			   i, bytes[0], bytes[1], bytes[2], bytes[3],
-			   challenge_value, expected, response,
-			   response == expected, challenge_completion, ret,
-			   version_completion, ioread32(base + 0x008),
-			   ioread32(base + 0x00c));
-		if (ret) {
-			final_ret = ret;
-			break;
-		}
-		if (hd60pro_mailbox_dead(base)) {
-			final_ret = -ENODEV;
-			seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-			break;
-		}
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_challenge_sweep_a2);
-
-static int hd60pro_post_logo_selector1c_dump_show(struct seq_file *s,
-						  void *unused)
-{
-	static const u32 selectors[] = {
-		0x50, 0x51, 0x90, 0x98, 0x9a, 0x9c,
-		0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5,
-		0xb0, 0xc0,
-	};
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base = hd60pro_mailbox_base(hd);
-	unsigned int i;
-	int final_ret = 0;
-
-	seq_puts(s, "windows_post_logo_selector1c_dump\n");
-	seq_puts(s, "source: generic Windows read helper 0x140277c78 sends packet [0x800,0x1c,selector] and returns BAR0+0x10\n");
-	seq_puts(s, "purpose: inspect nearby selectors after the A2 post-logo writes without running the A2 challenge loop\n");
-	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
-
-	if (!allow_cmd1d_write) {
-		seq_puts(s, "blocked; reload with allow_cmd1d_write=1 allow_mailbox_writes=1 and run post_logo_cmd1d_a2 first\n");
-		return 0;
-	}
-
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "disabled; allow_mailbox_writes=1 is also required\n");
-		return 0;
-	}
-
-	if (!base) {
-		seq_puts(s, "selected mailbox BAR is not mapped\n");
-		return 0;
-	}
-
-	if (ioread32(base + 0x004) != HD60PRO_MBOX_CMD_I2C_WRITE_EXT ||
-	    ioread32(base + 0x008) != 0x51 ||
-	    ioread32(base + 0x00c) != 0x10 ||
-	    ioread32(base + 0x010) != 0x01 ||
-	    ioread32(base + 0x02c) != 1) {
-		seq_puts(s, "blocked; run post_logo_cmd1d_a2 immediately before this dump\n");
-		seq_printf(s, "bar0_004: 0x%08x\n", ioread32(base + 0x004));
-		seq_printf(s, "bar0_008: 0x%08x\n", ioread32(base + 0x008));
-		seq_printf(s, "bar0_00c: 0x%08x\n", ioread32(base + 0x00c));
-		seq_printf(s, "bar0_010: 0x%08x\n", ioread32(base + 0x010));
-		seq_printf(s, "bar0_02c: 0x%08x\n", ioread32(base + 0x02c));
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	for (i = 0; i < ARRAY_SIZE(selectors); i++) {
-		u32 packet[3] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_GET_VERSION,
-			selectors[i],
-		};
-		u32 completion = 0;
-		u32 status0;
-		u32 status1;
-		u32 status2;
-		int ret;
-
-		ret = hd60pro_mailbox_send_locked(hd, packet, ARRAY_SIZE(packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		status0 = ioread32(base + 0x008);
-		status1 = ioread32(base + 0x00c);
-		status2 = ioread32(base + 0x010);
-		seq_printf(s, "selector=0x%02x result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-			   selectors[i], ret, completion, status0, status1,
-			   status2);
-		if (ret) {
-			final_ret = ret;
-			break;
-		}
-		if (hd60pro_mailbox_dead(base)) {
-			final_ret = -ENODEV;
-			seq_puts(s, "aborted: mailbox reads indicate inaccessible device\n");
-			break;
-		}
-	}
-	if (!final_ret) {
-		u32 restore_packet[6] = {
-			HD60PRO_MBOX_DOORBELL,
-			HD60PRO_MBOX_CMD_I2C_WRITE_EXT,
-			0xa2,
-			0x10,
-			1,
-			0x5a,
-		};
-		u32 completion = 0;
-		int ret;
-
-		ret = hd60pro_mailbox_send_locked(hd, restore_packet,
-						  ARRAY_SIZE(restore_packet),
-						  HD60PRO_MBOX_TIMEOUT_US,
-						  &completion);
-		seq_printf(s, "restore_a2_10_5a result=%d completion=0x%08x bar0_008=0x%08x bar0_00c=0x%08x bar0_010=0x%08x\n",
-			   ret, completion, ioread32(base + 0x008),
-			   ioread32(base + 0x00c), ioread32(base + 0x010));
-		final_ret = ret;
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	seq_printf(s, "result: %d\n", final_ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_post_logo_selector1c_dump);
-
 static int hd60pro_health_show(struct seq_file *s, void *unused)
 {
 	struct hd60pro_dev *hd = s->private;
@@ -7599,6 +3512,12 @@ static int hd60pro_capture_info_show(struct seq_file *s, void *unused)
 	seq_printf(s, "irq_count: %u\n", hd->irq_count);
 	seq_printf(s, "mailbox_irq_count: %u\n", hd->mailbox_irq_count);
 	seq_printf(s, "dma_frame_count: %u\n", hd->dma_frame_count);
+	seq_printf(s, "dma_frame_irq_mask: 0x%08x\n", dma_frame_irq_mask);
+	seq_printf(s, "real_dma_timeout_ms: %u\n", real_dma_timeout_ms);
+	seq_printf(s, "real_dma_cmd_timeout_ms: %u\n",
+		   real_dma_cmd_timeout_ms);
+	seq_printf(s, "pending_frame_status: 0x%08x\n",
+		   hd->pending_frame_status);
 	if (hd->bar0) {
 		seq_printf(s, "bar0_040_dma_field_flags: 0x%08x\n",
 			   ioread32(hd->bar0 + HD60PRO_REG_DMA_FIELD_FLAGS));
@@ -7655,6 +3574,8 @@ static int hd60pro_endpoint_info_show(struct seq_file *s, void *unused)
 	seq_puts(s, "firmware_pciep_isr_frame_notify: commands 0x50..0x52, 0x60..0x62, 0x6e also notify epint/epint_1080p/status paths\n");
 	seq_puts(s, "firmware_dma_modules: vpl_dmac.ko vpl_vic.ko vpl_edmc.ko\n");
 	seq_puts(s, "firmware_vic_symbols: VideoCap_OpenVIC InitVIC StartVIC WaitVIC GetBufVIC ReleaseBufVIC StopVIC CloseVIC\n");
+	seq_puts(s, "firmware_vic_start_path: video_capture_mgr SET_VIC launches tinyvenc7/5; libvideocap VideoCap_StartVIC sets VIC control bits then loops ioctl(/dev/vpl_vic, 0xe313)\n");
+	seq_puts(s, "firmware_vic_getbuf_path: libvideocap VideoCap_GetBufVIC uses ioctl(/dev/vpl_vic, 0x8078e303) to copy a 0x78-byte frame/buffer record\n");
 	seq_puts(s, "firmware_dmac_symbols: VPL_DMAC_SetMMRInfo SetupProfile StartHead StartTail IntrEnable IntrClear Reset\n");
 	seq_printf(s, "pipeline_ready_after_a2: %d\n", hd->pipeline_ready);
 	seq_printf(s, "host_dma_buffers_prepared: %d\n",
@@ -7932,6 +3853,175 @@ static int hd60pro_endpoint_command_plan_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(hd60pro_endpoint_command_plan);
 
+struct hd60pro_mz0380_scale_row {
+	u16 width;
+	u16 height;
+};
+
+static const struct hd60pro_mz0380_scale_row hd60pro_mz0380_scale_tb[] = {
+	{ 0, 0 },
+	{ 4096, 2160 },
+	{ 3840, 2160 },
+	{ 1920, 1200 },
+	{ 1920, 1080 },
+	{ 1680, 1050 },
+	{ 1280, 1024 },
+	{ 1280, 960 },
+	{ 1280, 720 },
+	{ 1024, 768 },
+	{ 1024, 576 },
+	{ 864, 486 },
+	{ 854, 480 },
+	{ 800, 600 },
+	{ 768, 576 },
+	{ 768, 432 },
+	{ 720, 576 },
+	{ 720, 486 },
+	{ 720, 480 },
+	{ 720, 405 },
+	{ 640, 480 },
+	{ 640, 360 },
+	{ 400, 300 },
+	{ 384, 288 },
+	{ 384, 216 },
+	{ 352, 288 },
+	{ 352, 240 },
+	{ 320, 288 },
+	{ 320, 240 },
+	{ 160, 120 },
+};
+
+static int hd60pro_windows_stream_scale_table_show(struct seq_file *s,
+						   void *unused)
+{
+	unsigned int i;
+
+	seq_puts(s, "windows_stream_scale_table: recovered LXV4L2D_MZ0380.ko scale_tb; no hardware writes\n");
+	seq_puts(s, "source: /home/wozt/mz0380-rootfs/usr/lib/modules/5.4.18-35-generic/misc/LXV4L2D_MZ0380.ko .data+0x1ed8 size 240\n");
+	seq_puts(s, "use_in_stream_start: MZ0380_StartFirmware sanitizes runtime stream dimensions against these rows before building 0x29/0x2d/0x31 packets\n");
+	seq_puts(s, "target_1080p60_scale_index: 4\n");
+	for (i = 0; i < ARRAY_SIZE(hd60pro_mz0380_scale_tb); i++) {
+		const struct hd60pro_mz0380_scale_row *row =
+			&hd60pro_mz0380_scale_tb[i];
+
+		seq_printf(s, "scale_tb[%02u]: %u x %u%s\n", i,
+			   row->width, row->height,
+			   i == 4 ? "  target_1920x1080" : "");
+	}
+	seq_puts(s, "sc2cc_vin_map: 0,2,1,3,4,6,5,7\n");
+	seq_puts(s, "current_packet_status: scale index is known, but 0x2d/0x31 still need runtime fields from device stream-state offsets copied into sp+0x140..0x240 in MZ0380_StartFirmware\n");
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_windows_stream_scale_table);
+
+static int hd60pro_windows_stream_extra_commands_show(struct seq_file *s,
+						      void *unused)
+{
+	seq_puts(s, "windows_stream_extra_commands: decoded Windows post-SET_VIC command gates; no hardware writes\n");
+	seq_puts(s, "source: /home/wozt/mz0380-decompiled/MZ0380_StartFirmware.c lines 1072..1313\n");
+	seq_puts(s, "current_linux_stream_start_test: sends cmd 0x29, cmd 0x2a, cmd 0x02 only\n");
+	seq_puts(s, "important_caveat: Windows may send cmd 0x2d and cmd 0x31 after 0x29/0x2a, but only after success bits are set\n");
+	seq_puts(s, "success_bits:\n");
+	seq_puts(s, "  bit_0x0100: set when cmd 0x29 completes\n");
+	seq_puts(s, "  bit_0x0200: set when cmd 0x2a completes\n");
+	seq_puts(s, "  bit_0x0400: set when primary cmd 0x2d completes\n");
+	seq_puts(s, "  bit_0x0800: set when secondary cmd 0x2d completes\n");
+	seq_puts(s, "  bit_0x1000: set when cmd 0x31 completes\n");
+	seq_puts(s, "primary_0x2d_gate: (success_bits & 0x0300) == 0x0300 and device family is not the early auto-skip family\n");
+	seq_puts(s, "primary_0x2d_shape: [0x800,0x2d,0x3fff,w3,w4,w5,w6,w7,w8,w9,w10,w11], length 0x0c dwords\n");
+	seq_puts(s, "primary_0x2d_fields:\n");
+	seq_puts(s, "  w3  = channel | (fps << 16) | (uVar6 << 24)\n");
+	seq_puts(s, "  w4  = source0 | (color0 << 8) | (offset0 << 16) | 0x01000000\n");
+	seq_puts(s, "  w5  = source0_high/aux high dword\n");
+	seq_puts(s, "  w6  = row_or_slot0 | (timing0 << 8) | (misc0 << 16)\n");
+	seq_puts(s, "  w7  = scaled_height0 | (scaled_width0 << 16), gcd-reduced by 2/3/5 when possible\n");
+	seq_puts(s, "  w8  = crop_x0 | (crop_y0 << 16)\n");
+	seq_puts(s, "  w9  = table8_0 | (table6_0 << 16)\n");
+	seq_puts(s, "  w10 = table12_0 | (table10_0 << 16)\n");
+	seq_puts(s, "  w11 = table2_0 | (table4_0 << 16)\n");
+	seq_puts(s, "secondary_0x2d_gate: (success_bits & 0x0700) == 0x0700 and secondary window values are present\n");
+	seq_puts(s, "secondary_0x2d_shape: same command/length; field set 1 uses the high halves of uStack_98/uStack_a0 and table indexes 1/3/5/7/9/11/13/15\n");
+	seq_puts(s, "cmd_0x31_gate: (success_bits & 0x0f00) == 0x0f00\n");
+	seq_puts(s, "cmd_0x31_shape: [0x800,0x31,0x3f,w3,w4,w5,w6], length 0x07 dwords\n");
+	seq_puts(s, "cmd_0x31_fields:\n");
+	seq_puts(s, "  w3 = channel | (fps << 8) | (uStack_40_low << 16) | (uStack_50_low << 24)\n");
+	seq_puts(s, "  w4 = uVar3 | (preset_0x598 << 16) | (bVar11 << 24)\n");
+	seq_puts(s, "  w5 = board-family boolean << 16 in the decompiled uStack_28 high dword\n");
+	seq_puts(s, "  w6 = uStack_148 | (uVar35 << 16), forced to 0 for 12ab:0370/0371 720x480 mode only\n");
+	seq_puts(s, "runtime_trace_targets_from_arm_context:\n");
+	seq_puts(s, "  param_1+0x1818 stream_state: words +0x013 +0x020 +0x025 +0x02a +0x02f +0x034 +0x039 +0x044 +0x62d +0x639\n");
+	seq_puts(s, "  param_1+0x1944 window_table_a: words +0x000 +0x008 +0x020 +0x028 +0x040 +0x048 +0x060 +0x068 +0x080 +0x088\n");
+	seq_puts(s, "  param_1+0x14878 window_table_b: words +0x000 +0x008 +0x040 +0x160 +0x1a0 +0x1a8 +0x1c0 +0x1c8 +0x1e0 +0x1e8 +0x200 +0x208 +0x220 +0x228 +0x240 +0x248 +0x260 +0x268 +0x280 +0x288 +0x2a0 +0x2a8 +0x2c0 +0x2c8 +0x320 +0x328 +0x330 +0x338\n");
+	seq_puts(s, "  param_1+0x14000 board_state: words +0x08b +0x08c +0x08d +0x08e +0x08f +0x597 +0x598 +0x5b1 +0x5c4 +0x5c5 +0x5cf\n");
+	seq_puts(s, "why_not_sent_by_default: payloads depend on sanitized mode tables at puVar37/puVar39/unaff_x21; hard-coding guessed values can hide the real cold-boot result\n");
+	seq_puts(s, "guarded_sender: stream_extra_command_send can send exact traced packets only with allow_stream_extra_commands=1 and stream_extra_* module arrays\n");
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_windows_stream_extra_commands);
+
+static void hd60pro_dump_stream_extra_packet(struct seq_file *s,
+					     const char *label,
+					     const uint *packet, int count,
+					     u32 cmd, unsigned int expected)
+{
+	unsigned int i;
+
+	seq_printf(s, "%s_count: %d\n", label, count);
+	seq_printf(s, "%s_valid: %d\n", label,
+		   hd60pro_stream_extra_packet_valid(packet, count, cmd,
+						    expected));
+	if (count <= 0)
+		return;
+	seq_printf(s, "%s_packet:", label);
+	for (i = 0; i < count && i < expected; i++)
+		seq_printf(s, " 0x%08x", packet[i]);
+	seq_putc(s, '\n');
+}
+
+static int hd60pro_stream_extra_command_send_show(struct seq_file *s,
+						  void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	int ret;
+
+	seq_puts(s, "stream_extra_command_send: explicit raw Windows 0x2d/0x31 packet sender\n");
+	seq_puts(s, "normal_path_default: disabled; no packets are sent unless allow_stream_extra_commands=1\n");
+	seq_puts(s, "intended_order: run after 0x29/0x2a success gates; V4L2 can also send these after 0x29/0x2a with send_stream_extra_commands=1\n");
+	seq_printf(s, "allow_stream_extra_commands: %d\n",
+		   allow_stream_extra_commands);
+	seq_printf(s, "send_stream_extra_commands: %d\n",
+		   send_stream_extra_commands);
+	seq_printf(s, "real_dma_cmd_timeout_ms: %u\n",
+		   real_dma_cmd_timeout_ms);
+	hd60pro_dump_stream_extra_packet(s, "primary_0x2d",
+					 stream_extra_primary_2d,
+					 stream_extra_primary_2d_count,
+					 0x2d, 12);
+	hd60pro_dump_stream_extra_packet(s, "secondary_0x2d",
+					 stream_extra_secondary_2d,
+					 stream_extra_secondary_2d_count,
+					 0x2d, 12);
+	hd60pro_dump_stream_extra_packet(s, "final_0x31",
+					 stream_extra_final_31,
+					 stream_extra_final_31_count,
+					 0x31, 7);
+
+	if (!allow_stream_extra_commands) {
+		seq_puts(s, "result: blocked by allow_stream_extra_commands=0\n");
+		return 0;
+	}
+
+	mutex_lock(&hd->mailbox_lock);
+	ret = hd60pro_send_stream_extra_packets_locked(hd, s);
+	mutex_unlock(&hd->mailbox_lock);
+	seq_printf(s, "result: %d\n", ret);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_stream_extra_command_send);
+
 static void hd60pro_fill_set_vic_event_record(u8 event[HD60PRO_EP_EVENT_RECORD_BYTES])
 {
 	memset(event, 0, HD60PRO_EP_EVENT_RECORD_BYTES);
@@ -8139,10 +4229,8 @@ static int hd60pro_endpoint_transport_plan_show(struct seq_file *s,
 	seq_printf(s, "bar0_payload_window_offset: 0x%02x\n",
 		   HD60PRO_FW_WINDOW_OFFSET);
 	seq_printf(s, "bar0_selected_mailbox_len: %pa\n", &len);
-	seq_printf(s, "logo_payload_size: 0x%05x\n",
-		   HD60PRO_LOGO_PAYLOAD_SIZE);
-	seq_printf(s, "logo_payload_descriptor: 0x%08x\n",
-		   HD60PRO_LOGO_DESCRIPTOR);
+	seq_puts(s, "logo_payload_size: 0x25800\n");
+	seq_puts(s, "logo_payload_descriptor: 0x00f00140\n");
 	seq_puts(s, "firmware_epint_record_model: video_capture_mgr reads/writes 0x2c-byte records from /sys/vpl_pciep/epint\n");
 	seq_puts(s, "candidate_set_vic_record: command 0x29, record size 0x2c, declared SET_VIC payload 0x28\n");
 	seq_puts(s, "candidate_post_set_vic_record: command 0x2a, declared payload 0x14, notifies audio_ctrl then epint/epint_1080p\n");
@@ -8807,6 +4895,8 @@ static int hd60pro_firmware_userland_flow_show(struct seq_file *s,
 	seq_puts(s, "event_0x61: LOGO END DOWNLOAD path; finalizes saved logo state and acks\n");
 	seq_puts(s, "event_0x6e: LOAD_FILES path; may transform payload bytes then ack\n");
 	seq_puts(s, "event_0x07: STOP_STREAMING path; runs echo '0' > /sys/vpl_pciep/hready and kills capture_app_infinite/capture_audio_8ch\n");
+	seq_puts(s, "set_vic_child_process: launches tinyvenc7 or tinyvenc5 with many geometry/color arguments after YUY2/YV12 sensor_config\n");
+	seq_puts(s, "tinyvenc_video_path: libvideocap VideoCap_StartVIC sets VIC MMR bits and loops ioctl(/dev/vpl_vic, 0xe313); VideoCap_GetBufVIC uses ioctl 0x8078e303 for a 0x78-byte buffer record\n");
 	seq_puts(s, "set_vic_format_string: [Video_MGR][ch%d] SET_VIC fw(%d), fps(%d), resolution(%dx%d) interlace(%d), ... input_frame_width(%d), input_frame_height(%d), bitstream_num(%d), ... is_nosg(%d)\n");
 	seq_puts(s, "host_implication: Linux host probably needs to make firmware emit/consume epint records and hready state, not only mailbox A3 queries\n");
 	seq_puts(s, "next_reverse_target: correlate Windows stream-start writes with the epint 0x29/0x2a record layout and the 0x2c-byte ack ownership protocol\n");
@@ -8814,6 +4904,56 @@ static int hd60pro_firmware_userland_flow_show(struct seq_file *s,
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(hd60pro_firmware_userland_flow);
+
+static int hd60pro_firmware_audio_path_show(struct seq_file *s, void *unused)
+{
+	seq_puts(s, "firmware_audio_path: decoded from yuan_demo_sdi/audio_capture_mgr and capture_audio_8ch\n");
+	seq_puts(s, "event_transport: audio_capture_mgr opens /sys/vpl_pciep/audio_ctrl, reads/polls 0x2c-byte records, and acks with pwrite(offset 0)\n");
+	seq_puts(s, "start_event: command 0x2a is Set AIC params\n");
+	seq_puts(s, "record_fields_printed_by_firmware: bits, channel_num, mono, freq, frame_num_of_period, period_num_of_buffer, on\n");
+	seq_puts(s, "hd_launch: ./capture_audio_8ch -D -P <periods> -d <i2s> -R <freq> -F <frames_per_period> -B <bits>\n");
+	seq_puts(s, "force_8ch: audio_capture_mgr can force capture_audio_8ch with -d 8 for four stereo ALSA devices\n");
+	seq_puts(s, "hready_side_effects: disable writes echo 0 > /sys/vpl_pciep/hready; enable writes echo 1 > /sys/vpl_pciep/hready\n");
+	seq_puts(s, "capture_audio_8ch_pcm_devices: hw:0,0 hw:0,1 hw:0,2 hw:0,3\n");
+	seq_puts(s, "alsa_hw_params: access=RW_INTERLEAVED, format=S16_LE, channels=2 per PCM, rate from -R, period size from -F\n");
+	seq_puts(s, "default_hd_hint: for HD use rate 48000, frames_per_period 256, period_num_of_buffer 4\n");
+	seq_puts(s, "pcm_read_loop: reads each active stereo PCM with snd_pcm_readi(), handles -EPIPE with snd_pcm_prepare(), then packs four sources\n");
+	seq_puts(s, "mma_path: MemBroker_GetMemory(period_bytes << 6), TK_MMA_Init(0,2,0x20,1), TK_MMA_SetOptions(), MemBroker_GetPhysAddr(), TK_MMA_ProcessOneFrame()\n");
+	seq_puts(s, "mma_process_shape: TK_MMA_ProcessOneFrame(handle, ((channel_state + 0x3ffffff) * 0x4000) - 0x70000000, phys_pcm_buffer, period_bytes << 2)\n");
+	seq_puts(s, "completion_notify: writes 0x18 bytes to /sys/class/vpl_pciep/channel_done after each processed PCM frame\n");
+	seq_puts(s, "host_implication: Linux ALSA capture should mirror the host-visible audio frame/ring after firmware channel_done is understood; fake/silent ALSA would hide the real missing transport\n");
+	seq_puts(s, "next_reverse_target: map channel_done record bytes and the host-side raw-audio tasklet fields that consume firmware PCM buffers\n");
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_firmware_audio_path);
+
+static int hd60pro_i2c_read8_locked(struct hd60pro_dev *hd,
+				    struct seq_file *s, const char *name,
+				    u32 chip, u32 reg, u32 *value)
+{
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	u32 packet[5] = {
+		HD60PRO_MBOX_DOORBELL,
+		HD60PRO_MBOX_CMD_I2C_READ8,
+		chip,
+		reg,
+		0,
+	};
+	u32 completion = 0;
+	int ret;
+
+	ret = hd60pro_mailbox_send_locked(hd, packet, ARRAY_SIZE(packet),
+					  HD60PRO_MBOX_TIMEOUT_US,
+					  &completion);
+	*value = ioread32(base + 0x010);
+	seq_printf(s, "%s packet=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x result=%d completion=0x%08x value=0x%08x bar0_008=0x%08x bar0_00c=0x%08x\n",
+		   name, packet[0], packet[1], packet[2], packet[3],
+		   packet[4], ret, completion, *value,
+		   ioread32(base + 0x008), ioread32(base + 0x00c));
+
+	return ret;
+}
 
 static int hd60pro_endpoint_bridge_regs_show(struct seq_file *s, void *unused)
 {
@@ -8897,88 +5037,6 @@ static int hd60pro_firmware_pcie_outbound_regs_show(struct seq_file *s,
 DEFINE_SHOW_ATTRIBUTE(hd60pro_firmware_pcie_outbound_regs);
 
 /*
- * bar5_dma_program: directly program the PCIe endpoint outbound window from
- * the host side, mirroring what ep.ko pcie_set_outbound does from firmware.
- *
- * After cmds 0x29/0x2a/0x06 succeed, the firmware wants to DMA frames to
- * host RAM, but BAR5[0x054/0x058] (outbound target address) remain 0 —
- * the firmware never calls pcie_set_outbound because it doesn't know where
- * to send frames. We replicate pcie_set_outbound from the host:
- *
- *   BAR5[0x050] = 0x00000001  (enable outbound window)
- *   BAR5[0x074] = 0x90000000  (endpoint-space base for outbound)
- *   BAR5[0x07c] = 0x91ffffff  (endpoint-space limit)
- *   BAR5[0x054] = frame_dma_low   (host physical address low 32 bits)
- *   BAR5[0x058] = frame_dma_high  (host physical address high 32 bits)
- *
- * Requires: allow_mailbox_writes=1 (uses same gate), dma_frame_dma != 0.
- * After reading this file, trigger STREAMON and watch for bit-0 frame IRQs.
- */
-static int hd60pro_bar5_dma_program_show(struct seq_file *s, void *unused)
-{
-	struct hd60pro_dev *hd = s->private;
-	u32 frame_low, frame_high;
-	u32 r050, r054, r058, r074, r07c;
-
-	if (!hd->bar5) {
-		seq_puts(s, "bar5_dma_program: BAR5 not mapped\n");
-		return 0;
-	}
-	if (!hd->dma_frame_dma[0]) {
-		seq_puts(s, "bar5_dma_program: no dma_frame_dma (run init first)\n");
-		return 0;
-	}
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "bar5_dma_program: blocked; reload with allow_mailbox_writes=1\n");
-		return 0;
-	}
-
-	frame_low  = (u32)(hd->dma_frame_dma[0] & 0xffffffffULL);
-	frame_high = (u32)(hd->dma_frame_dma[0] >> 32);
-
-	seq_printf(s, "bar5_dma_program: frame_dma=0x%016llx low=0x%08x high=0x%08x\n",
-		   (unsigned long long)hd->dma_frame_dma[0], frame_low, frame_high);
-	seq_puts(s, "bar5_dma_program: reading before...\n");
-	seq_printf(s, "  bar5_050=0x%08x bar5_054=0x%08x bar5_058=0x%08x\n",
-		   ioread32(hd->bar5 + 0x050),
-		   ioread32(hd->bar5 + 0x054),
-		   ioread32(hd->bar5 + 0x058));
-	seq_printf(s, "  bar5_074=0x%08x bar5_07c=0x%08x bar5_0d4=0x%08x\n",
-		   ioread32(hd->bar5 + 0x074),
-		   ioread32(hd->bar5 + 0x07c),
-		   ioread32(hd->bar5 + 0x0d4));
-
-	/* Program outbound window (mirrors firmware ep.ko pcie_set_outbound) */
-	iowrite32(0x90000000, hd->bar5 + 0x074);
-	iowrite32(0x91ffffff, hd->bar5 + 0x07c);
-	iowrite32(frame_low,  hd->bar5 + 0x054);
-	iowrite32(frame_high, hd->bar5 + 0x058);
-	iowrite32(0x00000001, hd->bar5 + 0x050);
-	/* pcie_set_outbound also writes +0xd4 = 0x00f00000
-	 * ARM instruction "0f 26 a0 e3" = MOV r2, #(0x0f ROR 12) = 0x00f00000
-	 * (prior value 0x0f000000 was wrong — off by factor-of-16 typo)
-	 */
-	iowrite32(0x00f00000, hd->bar5 + 0x0d4);
-
-	seq_puts(s, "bar5_dma_program: written, reading after...\n");
-	r050 = ioread32(hd->bar5 + 0x050);
-	r054 = ioread32(hd->bar5 + 0x054);
-	r058 = ioread32(hd->bar5 + 0x058);
-	r074 = ioread32(hd->bar5 + 0x074);
-	r07c = ioread32(hd->bar5 + 0x07c);
-	seq_printf(s, "  bar5_050=0x%08x bar5_054=0x%08x bar5_058=0x%08x\n",
-		   r050, r054, r058);
-	seq_printf(s, "  bar5_074=0x%08x bar5_07c=0x%08x bar5_0d4=0x%08x\n",
-		   r074, r07c, ioread32(hd->bar5 + 0x0d4));
-	seq_printf(s, "bar5_dma_program: outbound window %s (054/058 sticky: %s)\n",
-		   (r050 & 1) ? "enabled" : "NOT enabled (050 bit0 clear)",
-		   (r054 == frame_low && r058 == frame_high) ? "YES" : "NO (may be read-only from host)");
-	seq_puts(s, "bar5_dma_program: now start streaming and watch for bit-0 IRQs\n");
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_bar5_dma_program);
-
-/*
  * frame_buffer_peek: dump first 256 bytes of the DMA frame buffer via
  * CPU virtual address. If the firmware DMA'd anything, it shows here.
  * All zeros = firmware hasn't written yet; non-zero = DMA is working.
@@ -9040,10 +5098,24 @@ static int hd60pro_firmware_dmac_outbound_path_show(struct seq_file *s,
 	seq_puts(s, "interpretation:\n");
 	seq_puts(s, "  the missing host DMA advertisement is probably not a Windows BAR write directly to BAR5+0x54/+0x58\n");
 	seq_puts(s, "  Windows likely causes firmware video_capture_mgr/libvideocap to build a VPL_DMAC tail profile, and vpl_dmac.ko then programs the PCI endpoint outbound window\n");
-	seq_puts(s, "  profile bytes +0x38/+0x39/+0x3a are now critical; they should correspond to endpoint channel and host/outbound address selector words\n");
+	seq_puts(s, "  profile bytes +0x38/+0x39/+0x3a come from object+0x60..+0x62 and are byte-sized pcie_set_outbound controls, not the host frame address directly\n");
+	seq_puts(s, "firmware_userspace_wrapper:\n");
+	seq_puts(s, "  libmassmemaccess.so.9 opens /dev/vpl_dmac and owns the userspace profile buffer\n");
+	seq_puts(s, "  MassMemAccess_StartDMAC fills a 0x3c-byte profile at object+0x4c\n");
+	seq_puts(s, "  profile+0x08 is a control word assembled from object+0x20/+0x24/+0x14 and mode object+0x1c\n");
+	seq_puts(s, "  profile+0x10..+0x34 hold MemMgr physical addresses and transfer geometry copied directly to DMAC MMR +0x10..+0x34\n");
+	seq_puts(s, "  profile+0x38..+0x3b are bytes object+0x60..+0x63; +0x3b gates pcie_set_outbound\n");
+	seq_puts(s, "  profile fields are converted with MemMgr_GetPhysAddr, then MemMgr_CacheCopyBack(..., 0x3c)\n");
+	seq_puts(s, "  ioctl(fd, 0xde00) loops until VPL_DMAC_StartHead/StartTail succeeds\n");
+	seq_puts(s, "  ioctl(fd, 0xde01) is the wait-for-DMAC-completion path\n");
+	seq_puts(s, "vpl_dmac_ioctl_decode:\n");
+	seq_puts(s, "  0xde00 -> VPL_DMAC_StartHead, then VPL_DMAC_StartTail with selected profile pointer\n");
+	seq_puts(s, "  0xde01 -> wait for channel completion\n");
+	seq_puts(s, "  0x8004de03 -> version/check path used by MassMemAccess_CheckDMAC\n");
+	seq_puts(s, "  0x4004de02 -> MMR mapping/setup path\n");
 	seq_puts(s, "linux_next_step:\n");
-	seq_puts(s, "  recover the firmware userspace ioctl/profile struct passed to VPL_DMAC_StartTail from libvideocap.so.13 VideoCap_StartVIC/GetBufVIC paths\n");
-	seq_puts(s, "  only after that, add a guarded Linux mirror that writes an equivalent DMAC tail profile or endpoint event instead of guessing BAR5 writes\n");
+	seq_puts(s, "  find which video_capture_mgr/libvideocap event populates object+0x54..+0x63 for the capture frame transfer\n");
+	seq_puts(s, "  then trigger that firmware path or mirror the exact DMAC MMR profile; do not guess BAR5 writes\n");
 	seq_puts(s, "linux_current_state:\n");
 	seq_printf(s, "  pipeline_ready: %d\n", hd->pipeline_ready);
 	seq_printf(s, "  v4l2_synthetic_frames: %d\n", synthetic_v4l2);
@@ -9054,415 +5126,6 @@ static int hd60pro_firmware_dmac_outbound_path_show(struct seq_file *s,
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(hd60pro_firmware_dmac_outbound_path);
-
-static int hd60pro_windows_88_update_plan_show(struct seq_file *s,
-					       void *unused)
-{
-	struct hd60pro_dev *hd = s->private;
-	u32 r15 = 0, r16 = 0, r18 = 0;
-	int ret = 0;
-
-	seq_puts(s, "windows_88_update_plan: no hardware writes; decoded Windows stream-start register update\n");
-	seq_puts(s, "source: e60MZ0380.X64.SYS 0x14026ec85..0x14026ed36\n");
-	seq_puts(s, "mailbox_helpers: read=0x1402777e4 -> [0x800,0x1a,0x88,reg,0], write=0x1402851cc -> [0x800,0x1b,0x88,reg,value]\n");
-	seq_puts(s, "windows_sequence: read 0x88:18, read 0x88:16, read 0x88:15, compute adjusted values using context+0x36c/+0xa20 calibration tables, write 0x88:15, write 0x88:16, write 0x88:18\n");
-	seq_puts(s, "windows_formula_observed:\n");
-	seq_puts(s, "  base_phase = ((read15 & 0x70) << 4) | read16\n");
-	seq_puts(s, "  base_gain = read18\n");
-	seq_puts(s, "  adjusted_phase = base_phase + calibration_36c[index]\n");
-	seq_puts(s, "  adjusted_gain = base_gain + calibration_a20[index]\n");
-	seq_puts(s, "  write15 = ((adjusted_phase >> 4) & 0x70) | (read15 & 0x0f)\n");
-	seq_puts(s, "  write16 = adjusted_phase & 0xff\n");
-	seq_puts(s, "  write18 = adjusted_gain & 0xff\n");
-	seq_puts(s, "local_observation: current pipeline-ready card reports all three source registers as zero\n");
-	if (!allow_mailbox_writes || !allow_i2c_read_command1a) {
-		seq_puts(s, "live_read_blocked; reload with allow_mailbox_writes=1 allow_i2c_read_command1a=1\n");
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	ret = hd60pro_i2c_read8_locked(hd, s, "source_read_88_18", 0x88,
-				       0x18, &r18);
-	if (!ret)
-		ret = hd60pro_i2c_read8_locked(hd, s, "source_read_88_16",
-					       0x88, 0x16, &r16);
-	if (!ret)
-		ret = hd60pro_i2c_read8_locked(hd, s, "source_read_88_15",
-					       0x88, 0x15, &r15);
-	mutex_unlock(&hd->mailbox_lock);
-
-	if (!ret) {
-		u32 base_phase = ((r15 & 0x70) << 4) | (r16 & 0xff);
-
-		seq_printf(s, "observed_read15: 0x%02x\n", r15 & 0xff);
-		seq_printf(s, "observed_read16: 0x%02x\n", r16 & 0xff);
-		seq_printf(s, "observed_read18: 0x%02x\n", r18 & 0xff);
-		seq_printf(s, "observed_base_phase: 0x%03x\n", base_phase);
-		seq_printf(s, "observed_base_gain: 0x%02x\n", r18 & 0xff);
-	}
-	seq_puts(s, "next_needed: recover calibration_36c/a20 index/value source from the Windows context or trace these writes on Windows\n");
-
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_windows_88_update_plan);
-
-static int hd60pro_windows_calibration_info_show(struct seq_file *s,
-						 void *unused)
-{
-	seq_puts(s, "windows_calibration_info: decoded Windows calibration property paths; no hardware writes\n");
-	seq_puts(s, "source_binary: e60MZ0380.X64.SYS\n");
-	seq_puts(s, "streaming_gate: context+0x72c0 == 1 and context+0x1d110 stream-info pointer must be valid\n");
-	seq_puts(s, "current_index: stream_info+0x1fdc selects the active calibration slot\n");
-	seq_puts(s, "mode_selector: context+0x73a8 selects table family; mode 3 uses primary tables, mode 2 uses alternate tables\n");
-	seq_puts(s, "board_gate: for other modes Windows checks PCI/private byte context->board+0x0e against 0x51/0x52 or 0xc1/0xc2 before using primary tables\n");
-	seq_puts(s, "\nphase_table_getter_14023f0a0:\n");
-	seq_puts(s, "  mode3_value: stream_info[index]+0x36c\n");
-	seq_puts(s, "  mode2_value: stream_info[index]+0x1e3c\n");
-	seq_puts(s, "  otherwise: zero unless board_gate passes, then primary +0x36c\n");
-	seq_puts(s, "phase_table_setter_14023f120:\n");
-	seq_puts(s, "  stores user value to +0x36c or +0x1e3c and marks +0x1788/+0x1f74 dirty flags\n");
-	seq_puts(s, "  updates aggregate phase stream_info+0x1fe0 + user value\n");
-	seq_puts(s, "  when aggregate >= 0, writes chip 0x9c reg 0x80 high nibble/phase-high and reg 0x81 phase-low\n");
-	seq_puts(s, "  if endpoint bridge exists at context+0x1f1a8 and stream_info+0x2080 matches 0x260c/0x270c, writes chip 0x88:40=channel, reads 0x88:16/15, writes 0x88:15/16\n");
-	seq_puts(s, "\ngain_table_getter_14023f320:\n");
-	seq_puts(s, "  mode3_value: stream_info[index]+0xa20\n");
-	seq_puts(s, "  mode2_value: stream_info[index]+0x1ea4\n");
-	seq_puts(s, "  otherwise: zero unless board_gate passes, then primary +0xa20\n");
-	seq_puts(s, "gain_table_setter_14023f3a0:\n");
-	seq_puts(s, "  stores user value to +0xa20 or +0x1ea4 and marks +0x1788/+0x1f74 dirty flags\n");
-	seq_puts(s, "  updates aggregate gain stream_info+0x1fe4 + user value\n");
-	seq_puts(s, "  when aggregate >= 0, writes chip 0x9c reg 0x84 with low byte of aggregate gain\n");
-	seq_puts(s, "  if endpoint bridge exists and stream_info+0x2080 matches 0x260c/0x270c, writes chip 0x88:40=channel, reads 0x88:18, writes 0x88:18=aggregate gain low byte\n");
-	seq_puts(s, "\ncapture_setup_consumers:\n");
-	seq_puts(s, "  0x1402518aa reads stream_info[index]+0x36c during stream setup\n");
-	seq_puts(s, "  0x1402518b2 reads stream_info[index]+0xa20 during stream setup\n");
-	seq_puts(s, "  0x14026ec85..0x14026ed36 recomputes live 0x88:15/16/18 from current hardware reads plus those two calibration values\n");
-	seq_puts(s, "\nlinux_status:\n");
-	seq_puts(s, "  calibration defaults are not recovered yet; current live 0x88 reads are zero on this card after pipeline-ready init\n");
-	seq_puts(s, "  keep 0x88 writes disabled until we know whether Windows sets nonzero calibration values or zero is a valid default for this board/mode\n");
-
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_windows_calibration_info);
-
-static int hd60pro_windows_bridge_attach_info_show(struct seq_file *s,
-						   void *unused)
-{
-	struct hd60pro_dev *hd = s->private;
-	static const u8 chip60_regs[] = {
-		0xff, 0xf0, 0xf2, 0xf3, 0xf4, 0xf5, 0x5c,
-	};
-	unsigned int i;
-	u32 value = 0;
-	int ret;
-
-	seq_puts(s, "windows_bridge_attach_info: decoded Windows endpoint-bridge attach paths; read-only except optional live mailbox reads\n");
-	seq_puts(s, "source_binary: e60MZ0380.X64.SYS\n");
-	seq_puts(s, "attach_path_140254614: iterates four sibling contexts from global table 0x14039f160 + context+0x1f190\n");
-	seq_puts(s, "attach_path_140254614: if sibling+0x1f1a8 is null, calls post-logo helper 0x140287224, then stores sibling+0x1f1a8=parent_context and sibling+0x1f1b0=channel_index\n");
-	seq_puts(s, "attach_path_14026dec0: stream/status worker repeats the same sibling+0x1f1a8/+0x1f1b0 attach for active channels\n");
-	seq_puts(s, "board_gates: stream_info+0x2080 values 0x2400/0x2611/0x270c alter channel count and mode; second+ channels require board byte 0x52 or 0xc2\n");
-	seq_puts(s, "after_attach_chip60_sequence_14025469c:\n");
-	seq_puts(s, "  write 0x60:ff = (channel_index & 3) + 5\n");
-	seq_puts(s, "  read 0x60:f0/f4/f5, then conditionally read 0x60:f3/f2\n");
-	seq_puts(s, "  maps observed status bytes through helpers 0x14025e57c/0x14025e544/0x140254884\n");
-	seq_puts(s, "  writes 0x60:ff again with the same selector before checking 0x60:5c\n");
-	seq_puts(s, "  may call GPIO/helper 0x14025d87c with line 0x12 and 0x24 after 1s/100ms/100ms sleeps when state becomes 0x31/0x32\n");
-	seq_puts(s, "consumers_1402441a0_140244210: property/query paths call 0x14026edd8 and 0x14026fa98 through context+0x1f1a8 with channel context+0x1f1b0\n");
-	seq_puts(s, "linux_inference: 0x1f1a8 is not a DMA buffer pointer; it is a parent/controller context used for cross-channel bridge I2C/mailbox accesses\n");
-	seq_puts(s, "next_needed: decode 0x14026fa98 and 0x14027379c/0x1402737d4 to identify the host-visible event or hready/channel_done transition\n");
-
-	if (!allow_mailbox_writes || !allow_i2c_read_command1a) {
-		seq_puts(s, "live_chip60_read_blocked; reload with allow_mailbox_writes=1 allow_i2c_read_command1a=1\n");
-		return 0;
-	}
-
-	seq_puts(s, "live_chip60_reads:\n");
-	mutex_lock(&hd->mailbox_lock);
-	for (i = 0; i < ARRAY_SIZE(chip60_regs); i++) {
-		char name[32];
-
-		snprintf(name, sizeof(name), "read_60_%02x",
-			 chip60_regs[i]);
-		ret = hd60pro_i2c_read8_locked(hd, s, name, 0x60,
-					       chip60_regs[i], &value);
-		if (ret)
-			break;
-	}
-	mutex_unlock(&hd->mailbox_lock);
-
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_windows_bridge_attach_info);
-
-struct hd60pro_reg8_pair {
-	u8 reg;
-	u8 value;
-};
-
-static const u8 hd60pro_win_88_rmw_regs_1402d5984[] = {
-	0xfa, 0xfa, 0xfb, 0xfb, 0x00, 0x00, 0x00, 0x00,
-	0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
-};
-
-static const u8 hd60pro_win_88_rmw_masks_1402d59f4[] = {
-	0xf8, 0x8f, 0xf8, 0x8f, 0x00, 0xff, 0xff, 0xff,
-	0xff, 0xff, 0xff, 0x00, 0x02, 0x03, 0x00, 0x00,
-};
-
-static const u8 hd60pro_win_88_rmw_or_1402d5af0[] = {
-	0x01, 0x10, 0x01, 0x10, 0x01, 0x02, 0x04, 0x08,
-	0x0f, 0x00, 0x00, 0x00, 0xfe, 0xfd, 0xfb, 0xf7,
-};
-
-static const u8 hd60pro_win_88_f5_masks_1402d5afc[] = {
-	0xfe, 0xfd, 0xfb, 0xf7, 0xf0, 0x00, 0x00, 0x00,
-};
-
-static const u8 hd60pro_win_88_literal_14033f770_first16[] = {
-	0xe9, 0x4b, 0x81, 0x6f, 0xf6, 0x9a, 0xcf, 0x43,
-	0x92, 0x49, 0xc0, 0x34, 0x18, 0x01, 0x02, 0x22,
-};
-
-static const u8 hd60pro_win_88_literal_14033f7a0_first16[] = {
-	0xe9, 0x4b, 0x81, 0x6f, 0xf6, 0x9a, 0xcf, 0x43,
-	0x92, 0x49, 0xc0, 0x34, 0x21, 0x01, 0x02, 0x22,
-};
-
-static void hd60pro_seq_u8_table(struct seq_file *s, const char *name,
-				 const u8 *table, unsigned int count)
-{
-	unsigned int i;
-
-	seq_printf(s, "%s:", name);
-	for (i = 0; i < count; i++)
-		seq_printf(s, " %02x", table[i]);
-	seq_putc(s, '\n');
-}
-
-static int hd60pro_windows_88_mask_tables_show(struct seq_file *s,
-					       void *unused)
-{
-	unsigned int i;
-
-	seq_puts(s, "windows_88_mask_tables: decoded Windows chip 0x88 dynamic mask/update helpers; no hardware writes\n");
-	seq_puts(s, "source_binary: e60MZ0380.X64.SYS .rdata extracted by VA to PE section offset mapping\n");
-	seq_puts(s, "helper_clear_14027383c: reads chip 0x88 register selected by table 0x1402d5984, writes old & mask from 0x1402d59f4\n");
-	seq_puts(s, "helper_set_1402739ac: same selector/mask path, then ORs table byte from 0x1402d5af0 before writing\n");
-	seq_puts(s, "helper_literal_140272d20: writes count bytes from caller table to consecutive chip 0x88 registers starting at base dl\n");
-	seq_puts(s, "helper_literal_call_a: 0x14027282e uses table 0x14033f770, base 0x15, count 9\n");
-	seq_puts(s, "helper_literal_call_b: 0x140272a74 uses table 0x14033f7a0, base 0x15, count 9\n");
-	seq_puts(s, "helper_literal_note: these tables look like repeated GUID/property literals in .rdata, but this helper consumes their first bytes as hardware write payload\n");
-	seq_puts(s, "stream_id_group_a: 0x2400, 0x2611, 0x270c use four consecutive table slots when channel selector >= 4\n");
-	seq_puts(s, "stream_id_group_b: 0x2601, 0x260c use two table slots with even indexing when channel selector >= 4\n");
-	seq_puts(s, "stream_id_group_small_channel: selector < 4 uses either the direct selector or (selector & 1) * 2 depending stream family\n");
-	seq_puts(s, "helper_select_1402737d4: writes chip 0x88:40 with a Windows channel/mode selector mapping before dynamic 0x88 accesses\n");
-	seq_puts(s, "helper_select_1402737d4_mapping: selector 0->00 1->01 2->02 3->03 4->04 5->10 9->40, other high selectors fall back through value 04 unless exact Windows compare passes\n");
-	seq_puts(s, "helper_encode_1402734d8: converts one byte into five consecutive 0x88 writes: base=00, base+1=encoded_mode, base+2=encoded_mid, base+3=encoded_tail, base+4=fc\n");
-	seq_puts(s, "property_caller_140244210: takes caller r8 as an 8-byte state buffer, uses child context+0x1f1a8 parent bridge and child context+0x1f1b0 channel, then calls 0x14026fa98\n");
-	seq_puts(s, "status_caller_1402441a0: similar bridge wrapper, but calls 0x14026edd8 to read eight 0x88 status bytes into caller r8\n");
-	seq_puts(s, "helper_state_14026fa98: consumes the 8-byte per-channel state buffer and writes dynamic 0x88 windows around 0x56..0x80, gated by stream_info+0x2080\n");
-	seq_puts(s, "helper_state_14026fa98_context: reads parent context+0x81a4 mode; if >=3, selector defaults can come from stream_info+channel*4+0x22f4 and state byte from +0x2304\n");
-	seq_puts(s, "helper_state_14026fa98_default_writes: for non-0x2601/0x260c/0x2611/0x270c stream IDs, clears 0x88:40 then writes dynamic regs 0x56/57/5b/5c, selects 0x88:40=0x10, clears same regs again, then writes input bytes to 0x58..0x5f style windows\n");
-	seq_puts(s, "helper_state_14026fa98_special_writes: 0x2601/0x2611 and 0x260c/0x270c branches use helper_encode_1402734d8 for packed pattern writes instead of only direct byte writes\n");
-	hd60pro_seq_u8_table(s, "table_1402d5984_regs_first16",
-			     hd60pro_win_88_rmw_regs_1402d5984,
-			     ARRAY_SIZE(hd60pro_win_88_rmw_regs_1402d5984));
-	hd60pro_seq_u8_table(s, "table_1402d59f4_and_masks_first16",
-			     hd60pro_win_88_rmw_masks_1402d59f4,
-			     ARRAY_SIZE(hd60pro_win_88_rmw_masks_1402d59f4));
-	hd60pro_seq_u8_table(s, "table_1402d5af0_or_bits_first16",
-			     hd60pro_win_88_rmw_or_1402d5af0,
-			     ARRAY_SIZE(hd60pro_win_88_rmw_or_1402d5af0));
-	hd60pro_seq_u8_table(s, "table_1402d5afc_f5_masks_first8",
-			     hd60pro_win_88_f5_masks_1402d5afc,
-			     ARRAY_SIZE(hd60pro_win_88_f5_masks_1402d5afc));
-	hd60pro_seq_u8_table(s, "literal_14033f770_first16",
-			     hd60pro_win_88_literal_14033f770_first16,
-			     ARRAY_SIZE(hd60pro_win_88_literal_14033f770_first16));
-	hd60pro_seq_u8_table(s, "literal_14033f7a0_first16",
-			     hd60pro_win_88_literal_14033f7a0_first16,
-			     ARRAY_SIZE(hd60pro_win_88_literal_14033f7a0_first16));
-	seq_puts(s, "literal_14033f770_write_plan_count9: 88:15=e9 88:16=4b 88:17=81 88:18=6f 88:19=f6 88:1a=9a 88:1b=cf 88:1c=43 88:1d=92\n");
-	seq_puts(s, "literal_14033f7a0_write_plan_count9: same first nine bytes as 0x14033f770; later table bytes differ but are not consumed by those two count=9 calls\n");
-	seq_puts(s, "decoded_slot_plan_first_four:\n");
-	for (i = 0; i < 4; i++) {
-		u8 reg = hd60pro_win_88_rmw_regs_1402d5984[i];
-		u8 mask = hd60pro_win_88_rmw_masks_1402d59f4[i];
-		u8 set = hd60pro_win_88_rmw_or_1402d5af0[i];
-
-		seq_printf(s, "  slot_%u: reg=0x%02x clear=(old & 0x%02x) set=((old & 0x%02x) | 0x%02x)\n",
-			   i, reg, mask, mask, set);
-	}
-	seq_puts(s, "local_status: these tables explain the previously skipped 0x88:f5 mask family and the post-preset dynamic fa/fb updates; 0x14026fa98 appears to be a dynamic property/state setter, not the missing DMA transport itself\n");
-	seq_puts(s, "next_needed: identify the KS/property that feeds the 8-byte r8 buffer, then separate optional signal-conditioning writes from mandatory stream-start/DMA endpoint commands\n");
-
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_windows_88_mask_tables);
-
-static int hd60pro_windows_capture_88_presets_show(struct seq_file *s,
-						   void *unused)
-{
-	static const struct hd60pro_reg8_pair preset_272d98[] = {
-		{ 0x0c, 0x03 }, { 0x0d, 0x10 }, { 0x20, 0x60 },
-		{ 0x26, 0x02 }, { 0x2b, 0x58 }, { 0x2d, 0x30 },
-		{ 0x2e, 0x70 }, { 0x30, 0x48 }, { 0x31, 0xbb },
-		{ 0x32, 0x2e }, { 0x33, 0x90 }, { 0x39, 0x8c },
-		{ 0x2c, 0x0a }, { 0x27, 0x2d }, { 0x28, 0x00 },
-		{ 0x13, 0x00 },
-	};
-	static const struct hd60pro_reg8_pair preset_272f1c[] = {
-		{ 0x0c, 0x03 }, { 0x0d, 0x10 }, { 0x20, 0x60 },
-		{ 0x26, 0x02 }, { 0x2b, 0x58 }, { 0x2d, 0x30 },
-		{ 0x2e, 0x70 }, { 0x30, 0x48 }, { 0x31, 0xbb },
-		{ 0x32, 0x2e }, { 0x33, 0x90 }, { 0x39, 0x88 },
-		{ 0x2c, 0x0a }, { 0x27, 0x2d }, { 0x28, 0x00 },
-		{ 0x13, 0x00 },
-	};
-	unsigned int i;
-
-	seq_puts(s, "windows_capture_88_presets: decoded Windows chip 0x88 capture/video presets; no hardware writes\n");
-	seq_puts(s, "source_binary: e60MZ0380.X64.SYS\n");
-	seq_puts(s, "dispatch_source: 0x140272a0f chooses helpers by stream_info+0x2080 and mode/channel state\n");
-	seq_puts(s, "mode_ids_seen: 0x2400, 0x2601, 0x2611, 0x260c, 0x270c\n");
-	seq_puts(s, "common_entry: writes 0x88:35=0x05 when stream_info+0x2080 >= 0x2200\n");
-	seq_puts(s, "common_entry: reads 0x88:02 then writes (read & 0xfa) | 0x02 back to 0x88:02\n");
-	seq_puts(s, "common_entry: reads 0x88:f5 and masks it with table byte at 0x1402d5afc[index], then writes 0x88:f5; first bytes are fe fd fb f7 f0\n");
-	seq_puts(s, "preset_140272d98_for_0x2400:\n");
-	for (i = 0; i < ARRAY_SIZE(preset_272d98); i++)
-		seq_printf(s, "  write_88_%02x: 0x%02x\n",
-			   preset_272d98[i].reg, preset_272d98[i].value);
-	seq_puts(s, "  final_rmw_88_14: read 0x88:14, write value & 0x9f\n");
-	seq_puts(s, "preset_140272f1c_variant:\n");
-	for (i = 0; i < ARRAY_SIZE(preset_272f1c); i++)
-		seq_printf(s, "  write_88_%02x: 0x%02x\n",
-			   preset_272f1c[i].reg, preset_272f1c[i].value);
-	seq_puts(s, "  final_rmw_88_14: read 0x88:14, write value & 0x9f\n");
-	seq_puts(s, "special_1080p_like_tail_140272bc3_when_mode_byte_2_and_stream_id_matches_0x2601_family_or_0x270c:\n");
-	seq_puts(s, "  write_88_16: 0x40\n");
-	seq_puts(s, "  write_88_15: 0x13\n");
-	seq_puts(s, "  write_88_16: 0x0a\n");
-	seq_puts(s, "  write_88_17: 0x00\n");
-	seq_puts(s, "  write_88_18: 0x19\n");
-	seq_puts(s, "  write_88_19: 0xd0\n");
-	seq_puts(s, "  write_88_1a: 0x25\n");
-	seq_puts(s, "  write_88_1c: 0x06\n");
-	seq_puts(s, "  write_88_1d: 0x7a\n");
-	seq_puts(s, "post_tail: calls 0x14027383c and optionally sets bit 0x40 in 0x88:35 if state flag byte has 0x40\n");
-	seq_puts(s, "linux_status: captured as documentation only; do not auto-apply before stream_info+0x2080 mode and source signal path are confirmed\n");
-
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_windows_capture_88_presets);
-
-static int hd60pro_capture_88_dump_regs_locked(struct hd60pro_dev *hd,
-					       struct seq_file *s,
-					       const char *prefix)
-{
-	static const u8 regs[] = {
-		0x02, 0x0c, 0x0d, 0x13, 0x14, 0x15, 0x16, 0x17,
-		0x18, 0x19, 0x1a, 0x1c, 0x1d, 0x20, 0x26, 0x27,
-		0x28, 0x2b, 0x2c, 0x2d, 0x2e, 0x30, 0x31, 0x32,
-		0x33, 0x35, 0x39, 0xf5,
-	};
-	unsigned int i;
-	u32 value = 0;
-	int ret;
-
-	for (i = 0; i < ARRAY_SIZE(regs); i++) {
-		char name[40];
-
-		snprintf(name, sizeof(name), "%s_88_%02x", prefix, regs[i]);
-		ret = hd60pro_i2c_read8_locked(hd, s, name, 0x88, regs[i],
-					       &value);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
-}
-
-static int hd60pro_apply_capture_88_preset_2400_min_show(struct seq_file *s,
-							 void *unused)
-{
-	struct hd60pro_dev *hd = s->private;
-	static const struct hd60pro_reg8_pair preset[] = {
-		{ 0x35, 0x05 },
-		{ 0x0c, 0x03 }, { 0x0d, 0x10 }, { 0x20, 0x60 },
-		{ 0x26, 0x02 }, { 0x2b, 0x58 }, { 0x2d, 0x30 },
-		{ 0x2e, 0x70 }, { 0x30, 0x48 }, { 0x31, 0xbb },
-		{ 0x32, 0x2e }, { 0x33, 0x90 }, { 0x39, 0x8c },
-		{ 0x2c, 0x0a }, { 0x27, 0x2d }, { 0x28, 0x00 },
-		{ 0x13, 0x00 },
-	};
-	u32 value02 = 0, value14 = 0;
-	unsigned int i;
-	int ret = 0;
-
-	seq_puts(s, "apply_capture_88_preset_2400_min: experimental opt-in Windows 0x88 preset; hardware writes when enabled\n");
-	seq_puts(s, "source: e60MZ0380.X64.SYS helpers 0x140272a0f and 0x140272d98\n");
-	seq_puts(s, "scope: common 0x88:35/0x88:02 RMW + fixed 0x140272d98 preset + final 0x88:14 RMW\n");
-	seq_puts(s, "skipped_by_design: 0x88:f5 mask-table write is not applied because table index/value is not confirmed\n");
-	seq_puts(s, "skipped_by_design: 1080p-like tail 0x15..0x1d is not applied here; it has separate stream-id/mode gates\n");
-	seq_puts(s, "known_test_result: on this card, writes return completion=1 but immediate 0x1a reads still report zero; treat write success as command acceptance, not latched register proof\n");
-	if (!hd->pipeline_ready) {
-		seq_puts(s, "blocked; pipeline_ready is false, run the persistent init sequence first\n");
-		return 0;
-	}
-	if (!allow_mailbox_writes || !allow_i2c_read_command1a ||
-	    !allow_capture_88_writes) {
-		seq_puts(s, "blocked; reload with allow_mailbox_writes=1 allow_i2c_read_command1a=1 allow_capture_88_writes=1 after pipeline-ready init\n");
-		return 0;
-	}
-
-	mutex_lock(&hd->mailbox_lock);
-	seq_puts(s, "before_reads:\n");
-	ret = hd60pro_capture_88_dump_regs_locked(hd, s, "before");
-	if (ret)
-		goto out_unlock;
-
-	ret = hd60pro_i2c_read8_locked(hd, s, "common_read_88_02", 0x88,
-				       0x02, &value02);
-	if (ret)
-		goto out_unlock;
-	value02 = (value02 & 0xfa) | 0x02;
-
-	for (i = 0; i < ARRAY_SIZE(preset); i++) {
-		char name[48];
-
-		snprintf(name, sizeof(name), "write_88_%02x_min",
-			 preset[i].reg);
-		ret = hd60pro_i2c_write8_locked(hd, s, name, 0x88,
-						preset[i].reg,
-						preset[i].value);
-		if (ret)
-			goto out_unlock;
-	}
-
-	ret = hd60pro_i2c_write8_locked(hd, s, "common_write_88_02_rmw",
-					0x88, 0x02, value02);
-	if (ret)
-		goto out_unlock;
-	ret = hd60pro_i2c_read8_locked(hd, s, "final_read_88_14", 0x88,
-				       0x14, &value14);
-	if (ret)
-		goto out_unlock;
-	value14 &= 0x9f;
-	ret = hd60pro_i2c_write8_locked(hd, s, "final_write_88_14_and9f",
-					0x88, 0x14, value14);
-	if (ret)
-		goto out_unlock;
-
-	seq_puts(s, "after_reads:\n");
-	ret = hd60pro_capture_88_dump_regs_locked(hd, s, "after");
-
-out_unlock:
-	mutex_unlock(&hd->mailbox_lock);
-	seq_printf(s, "result: %d\n", ret);
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_apply_capture_88_preset_2400_min);
 
 static int hd60pro_firmware_endpoint_tables_show(struct seq_file *s,
 						 void *unused)
@@ -9560,20 +5223,34 @@ static int hd60pro_firmware_load_show(struct seq_file *s, void *unused)
 	u32 status0;
 	u32 status1;
 	u32 status2;
-	u32 prepare_packet[3];
+	u32 prepare_packet[4];
 	u32 commit_packet[3];
 	u32 prepare_irq_delta = 0;
 	u32 commit_irq_delta = 0;
+	size_t prepare_dwords;
+	unsigned int commit_timeout_ms;
+	bool base_mode;
+	bool full_mode;
 	int ret;
 
 	if (!allow_firmware_load) {
 		seq_puts(s, "disabled; reload with allow_firmware_load=1 allow_mailbox_writes=1 to run Windows firmware download sequence\n");
+		seq_puts(s, "modes: firmware_load_mode=base uses 0x0e/0x0f, firmware_load_mode=full uses 0x0b/0x0c\n");
 		return 0;
 	}
 
-	if (!allow_unsafe_visible_fw_prepare) {
+	base_mode = sysfs_streq(firmware_load_mode, "base");
+	full_mode = sysfs_streq(firmware_load_mode, "full");
+	if (!base_mode && !full_mode) {
+		seq_printf(s, "blocked: unknown firmware_load_mode=%s\n",
+			   firmware_load_mode);
+		seq_puts(s, "valid modes: base, full\n");
+		return 0;
+	}
+
+	if (full_mode && !allow_unsafe_visible_fw_prepare) {
 		seq_puts(s, "blocked: command 0x0b on cold hardware was observed to make PCI config and MMIO read 0xffffffff\n");
-		seq_puts(s, "reload with allow_unsafe_visible_fw_prepare=1 only after the missing pre-init/base-firmware step is understood\n");
+		seq_puts(s, "reload with allow_unsafe_visible_fw_prepare=1 only after preinit/base-firmware state is validated\n");
 		return 0;
 	}
 
@@ -9599,10 +5276,14 @@ static int hd60pro_firmware_load_show(struct seq_file *s, void *unused)
 	}
 
 	seq_printf(s, "firmware_name: %s\n", firmware_name);
+	seq_printf(s, "firmware_load_mode: %s\n", base_mode ? "base" : "full");
 	seq_printf(s, "firmware_size: %zu\n", fw->size);
 	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
 	seq_printf(s, "mailbox_len: %pa\n", &len);
 	seq_printf(s, "copy_offset: 0x%x\n", HD60PRO_FW_WINDOW_OFFSET);
+	if (base_mode)
+		seq_printf(s, "firmware_base_selector: 0x%08x\n",
+			   firmware_base_selector);
 
 	if (fw->size + HD60PRO_FW_WINDOW_OFFSET > len) {
 		seq_puts(s, "result: aperture_too_small\n");
@@ -9613,20 +5294,40 @@ static int hd60pro_firmware_load_show(struct seq_file *s, void *unused)
 	}
 
 	prepare_packet[0] = HD60PRO_MBOX_DOORBELL;
-	prepare_packet[1] = HD60PRO_MBOX_CMD_DOWNLOAD_FW_PREPARE;
-	prepare_packet[2] = fw->size;
+	if (base_mode) {
+		prepare_packet[1] = HD60PRO_MBOX_CMD_DOWNLOAD_BASE_FW_PREPARE;
+		prepare_packet[2] = firmware_base_selector;
+		prepare_packet[3] = fw->size;
+		prepare_dwords = 4;
+	} else {
+		prepare_packet[1] = HD60PRO_MBOX_CMD_DOWNLOAD_FW_PREPARE;
+		prepare_packet[2] = fw->size;
+		prepare_packet[3] = 0;
+		prepare_dwords = 3;
+	}
 	commit_packet[0] = HD60PRO_MBOX_DOORBELL;
-	commit_packet[1] = HD60PRO_MBOX_CMD_DOWNLOAD_FW_COMMIT;
+	commit_packet[1] = base_mode ?
+		HD60PRO_MBOX_CMD_DOWNLOAD_BASE_FW_COMMIT :
+		HD60PRO_MBOX_CMD_DOWNLOAD_FW_COMMIT;
 	commit_packet[2] = 1;
+	commit_timeout_ms = base_mode ?
+		HD60PRO_BASE_FW_COMMIT_TIMEOUT_MS :
+		HD60PRO_VISIBLE_FW_COMMIT_TIMEOUT_MS;
 
 	mutex_lock(&hd->mailbox_lock);
 	ret = hd60pro_mailbox_send_async_locked(hd, prepare_packet,
-						ARRAY_SIZE(prepare_packet),
+						prepare_dwords,
 						HD60PRO_MBOX_ASYNC_TIMEOUT_MS,
 						&prepare_completion,
 						&prepare_irq_delta);
-	seq_printf(s, "prepare_command: 0x%08x 0x%08x 0x%08x\n",
-		   prepare_packet[0], prepare_packet[1], prepare_packet[2]);
+	if (base_mode)
+		seq_printf(s, "prepare_command: 0x%08x 0x%08x 0x%08x 0x%08x\n",
+			   prepare_packet[0], prepare_packet[1],
+			   prepare_packet[2], prepare_packet[3]);
+	else
+		seq_printf(s, "prepare_command: 0x%08x 0x%08x 0x%08x\n",
+			   prepare_packet[0], prepare_packet[1],
+			   prepare_packet[2]);
 	seq_printf(s, "prepare_result: %d\n", ret);
 	seq_printf(s, "prepare_completion: 0x%08x\n", prepare_completion);
 	seq_printf(s, "prepare_irq_delta: %u\n", prepare_irq_delta);
@@ -9639,7 +5340,7 @@ static int hd60pro_firmware_load_show(struct seq_file *s, void *unused)
 
 	ret = hd60pro_mailbox_send_async_locked(hd, commit_packet,
 						ARRAY_SIZE(commit_packet),
-						HD60PRO_VISIBLE_FW_COMMIT_TIMEOUT_MS,
+						commit_timeout_ms,
 						&commit_completion,
 						&commit_irq_delta);
 	seq_printf(s, "commit_command: 0x%08x 0x%08x 0x%08x\n",
@@ -9699,6 +5400,7 @@ struct hd60pro_buffer {
 };
 
 static void hd60pro_complete_synthetic_buffers(struct hd60pro_dev *hd);
+static void hd60pro_schedule_stream_timeout(struct hd60pro_dev *hd);
 
 static int hd60pro_queue_setup(struct vb2_queue *q, unsigned int *nbuffers,
 			       unsigned int *nplanes, unsigned int sizes[],
@@ -9744,6 +5446,8 @@ static void hd60pro_buf_queue(struct vb2_buffer *vb)
 
 	if (complete_now && synthetic_v4l2)
 		hd60pro_complete_synthetic_buffers(hd);
+	else if (complete_now)
+		hd60pro_schedule_stream_timeout(hd);
 }
 
 static void hd60pro_fill_synthetic_frame(void *vaddr, size_t size)
@@ -9821,10 +5525,48 @@ static void hd60pro_return_queued_buffers(struct hd60pro_dev *hd,
 	spin_unlock_irqrestore(&hd->queued_lock, flags);
 }
 
+static void hd60pro_stream_timeout_work(struct work_struct *work)
+{
+	struct hd60pro_dev *hd =
+		container_of(to_delayed_work(work), struct hd60pro_dev,
+			     stream_timeout_work);
+	bool has_queued;
+	unsigned long flags;
+
+	if (!real_dma_timeout_ms || synthetic_v4l2 || !hd->streaming ||
+	    !hd->dma_capture_active)
+		return;
+
+	spin_lock_irqsave(&hd->queued_lock, flags);
+	has_queued = !list_empty(&hd->queued_bufs);
+	spin_unlock_irqrestore(&hd->queued_lock, flags);
+
+	if (!has_queued)
+		return;
+
+	dev_warn_ratelimited(&hd->pdev->dev,
+			     "real DMA timeout after %u ms: delivering black fallback V4L2 buffers (irq=%u dma_frames=%u status=0x%08x)\n",
+			     real_dma_timeout_ms, hd->irq_count,
+			     hd->dma_frame_count, hd->cum_irq_status);
+	hd60pro_complete_synthetic_buffers(hd);
+}
+
+static void hd60pro_schedule_stream_timeout(struct hd60pro_dev *hd)
+{
+	if (!real_dma_timeout_ms || synthetic_v4l2 || !hd->streaming ||
+	    !hd->dma_capture_active)
+		return;
+
+	mod_delayed_work(system_wq, &hd->stream_timeout_work,
+			 msecs_to_jiffies(real_dma_timeout_ms));
+}
+
 /*
  * hd60pro_frame_tasklet - deliver one captured frame to vb2.
  *
- * Called from IRQ context (softirq) when BAR0[0x30] bit 0 fires.
+ * Called from IRQ context (softirq) when BAR0[0x30] matches
+ * dma_frame_irq_mask. Windows notes point at bit 0 for DMA done; local
+ * firmware observations also show bit 10 as a frame/event notification.
  * Flow from LXV4L2D_MZ0380.ko decompilation:
  *   1. Read BAR0[0x44] bits[1:0] → active ping-pong buffer index (0-3).
  *   2. Frame payload starts at BAR0 + dma_bar0_frame_offset
@@ -9847,12 +5589,27 @@ static void hd60pro_frame_tasklet(unsigned long priv)
 	unsigned long flags;
 	u64 timestamp;
 	u32 sequence;
+	u32 dma_payload = 0;
+	u32 payload_size = frame_size;
+	u32 frame_status;
+	u8 *dma_buf = NULL;
 
 	if (!base || !hd->dma_capture_active)
 		return;
 
+	spin_lock_irqsave(&hd->irq_lock, flags);
+	frame_status = hd->pending_frame_status;
+	hd->pending_frame_status = 0;
+	spin_unlock_irqrestore(&hd->irq_lock, flags);
+
 	/* BAR0[0x44] bits[1:0] = which ping-pong buffer is ready */
 	buf_idx = ioread32(base + HD60PRO_REG_DMA_BUF_IDX) & (HD60PRO_DMA_BUF_COUNT - 1);
+	if (hd->dma_frame_cpu[buf_idx]) {
+		dma_buf = (u8 *)hd->dma_frame_cpu[buf_idx];
+		dma_payload = get_unaligned_le32(dma_buf);
+		if (dma_payload && dma_payload <= frame_size)
+			payload_size = dma_payload;
+	}
 
 	/*
 	 * Per-channel ACK register: for single-channel HD60 Pro (channel 0),
@@ -9863,8 +5620,20 @@ static void hd60pro_frame_tasklet(unsigned long priv)
 	spin_lock_irqsave(&hd->queued_lock, flags);
 	if (list_empty(&hd->queued_bufs) || !hd->streaming) {
 		spin_unlock_irqrestore(&hd->queued_lock, flags);
+		if (dma_buf)
+			put_unaligned_le32(0, dma_buf);
+		hd->last_frame_meta.timestamp_ns = ktime_get_ns();
+		hd->last_frame_meta.duration_ns = HD60PRO_DEFAULT_FRAME_PERIOD_NS;
+		hd->last_frame_meta.payload_bytes = payload_size;
+		hd->last_frame_meta.flags = 0x00000100;
+		hd->last_frame_meta.extra = 0x00000002;
+		hd->dma_frame_count++;
 		/* ACK so hardware can reuse the buffer slot */
 		iowrite8(0, base + HD60PRO_REG_DMA_ACK_BASE);
+		dev_info_ratelimited(&hd->pdev->dev,
+				     "frame event without queued vb2 buffer: status=0x%08x buf_idx=%u payload=%u header=0x%08x total=%u\n",
+				     frame_status, buf_idx, payload_size,
+				     dma_payload, hd->dma_frame_count);
 		return;
 	}
 	buf = list_first_entry(&hd->queued_bufs, struct hd60pro_buffer, list);
@@ -9884,12 +5653,13 @@ static void hd60pro_frame_tasklet(unsigned long priv)
 	 *   *dma_buf = 0   (clear header dword so firmware knows host consumed frame)
 	 *   BAR0[channel + 0x50] = 0  (ACK channel 0)
 	 */
-	if (hd->dma_frame_cpu[buf_idx]) {
-		u8 *dma_buf = (u8 *)hd->dma_frame_cpu[buf_idx];
-
-		memcpy(vaddr, dma_buf + HD60PRO_DMA_HDR_SIZE, frame_size);
+	if (dma_buf) {
+		memcpy(vaddr, dma_buf + HD60PRO_DMA_HDR_SIZE, payload_size);
+		if (payload_size < frame_size)
+			memset((u8 *)vaddr + payload_size, 0,
+			       frame_size - payload_size);
 		/* Clear first dword of DMA header so firmware can detect reuse */
-		*(u32 *)dma_buf = 0;
+		put_unaligned_le32(0, dma_buf);
 	} else {
 		hd60pro_fill_synthetic_frame(vaddr, frame_size);
 	}
@@ -9897,22 +5667,24 @@ static void hd60pro_frame_tasklet(unsigned long priv)
 	/* ACK channel 0 so firmware can write the next frame */
 	iowrite8(0, base + HD60PRO_REG_DMA_ACK_BASE);
 
-	vb2_set_plane_payload(&buf->vb.vb2_buf, 0, frame_size);
+	vb2_set_plane_payload(&buf->vb.vb2_buf, 0, payload_size);
 	buf->vb.sequence = sequence;
 	buf->vb.field = HD60PRO_DEFAULT_FIELD;
 	buf->vb.vb2_buf.timestamp = timestamp;
 	hd->last_frame_meta.timestamp_ns = timestamp;
 	hd->last_frame_meta.duration_ns = HD60PRO_DEFAULT_FRAME_PERIOD_NS;
-	hd->last_frame_meta.payload_bytes = frame_size;
+	hd->last_frame_meta.payload_bytes = payload_size;
 	hd->last_frame_meta.flags = 0x00000100;
 	hd->last_frame_meta.extra = 0;
 	hd->last_frame_meta.sequence = sequence;
 	hd->dma_frame_count++;
 	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+	hd60pro_schedule_stream_timeout(hd);
 
 	dev_info_ratelimited(&hd->pdev->dev,
-			     "frame: buf_idx=%u seq=%u total=%u\n",
-			     buf_idx, sequence, hd->dma_frame_count);
+			     "frame: status=0x%08x buf_idx=%u payload=%u header=0x%08x seq=%u total=%u\n",
+			     frame_status, buf_idx, payload_size,
+			     dma_payload, sequence, hd->dma_frame_count);
 }
 
 static int hd60pro_start_streaming(struct vb2_queue *q, unsigned int count)
@@ -9961,7 +5733,8 @@ static int hd60pro_start_streaming(struct vb2_queue *q, unsigned int count)
 			iowrite32(0, base + HD60PRO_REG_MBOX_COMPLETE);
 			ret = hd60pro_mailbox_send_async_locked(hd, setvic,
 								ARRAY_SIZE(setvic),
-								15000, &completion, &irq_delta);
+								real_dma_cmd_timeout_ms,
+								&completion, &irq_delta);
 			if (ret && ret != -ETIMEDOUT)
 				goto unlock_streaming;
 			dev_info(&hd->pdev->dev,
@@ -9984,13 +5757,20 @@ static int hd60pro_start_streaming(struct vb2_queue *q, unsigned int count)
 			iowrite32(0, base + HD60PRO_REG_MBOX_COMPLETE);
 			ret = hd60pro_mailbox_send_async_locked(hd, notify,
 								ARRAY_SIZE(notify),
-								15000, &completion, &irq_delta);
+								real_dma_cmd_timeout_ms,
+								&completion, &irq_delta);
 			if (ret && ret != -ETIMEDOUT)
 				goto unlock_streaming;
 			dev_info(&hd->pdev->dev,
 				 "start_streaming: cmd 0x2a ret=%d irq_delta=%u\n",
 				 ret, irq_delta);
 			ret = 0;
+		}
+
+		if (send_stream_extra_commands) {
+			ret = hd60pro_send_stream_extra_packets_locked(hd, NULL);
+			if (ret)
+				goto unlock_streaming;
 		}
 
 		/* Step 3: cmd 0x02 — advertise 4 DMA buffer addresses */
@@ -10014,7 +5794,8 @@ static int hd60pro_start_streaming(struct vb2_queue *q, unsigned int count)
 			iowrite32(0, base + HD60PRO_REG_MBOX_COMPLETE);
 			ret = hd60pro_mailbox_send_async_locked(hd, pkt02,
 								ARRAY_SIZE(pkt02),
-								15000, &completion, &irq_delta);
+								real_dma_cmd_timeout_ms,
+								&completion, &irq_delta);
 			if (ret && ret != -ETIMEDOUT)
 				goto unlock_streaming;
 			dev_info(&hd->pdev->dev,
@@ -10023,8 +5804,8 @@ static int hd60pro_start_streaming(struct vb2_queue *q, unsigned int count)
 			ret = 0;
 		}
 
-		/* Step 4: cmd 0x06 stream start */
-		{
+		/* Step 4: optional legacy/unknown cmd 0x06 stream start */
+		if (send_stream_start_cmd06) {
 			const u32 start[] = {
 				HD60PRO_MBOX_DOORBELL,
 				HD60PRO_MBOX_CMD_STREAM_START,
@@ -10034,7 +5815,8 @@ static int hd60pro_start_streaming(struct vb2_queue *q, unsigned int count)
 			iowrite32(0, base + HD60PRO_REG_MBOX_COMPLETE);
 			ret = hd60pro_mailbox_send_async_locked(hd, start,
 								ARRAY_SIZE(start),
-								15000, &completion, &irq_delta);
+								real_dma_cmd_timeout_ms,
+								&completion, &irq_delta);
 			if (ret == -ETIMEDOUT) {
 				dev_warn(&hd->pdev->dev,
 					 "start_streaming: cmd 0x06 timed out — continuing\n");
@@ -10048,12 +5830,17 @@ static int hd60pro_start_streaming(struct vb2_queue *q, unsigned int count)
 					 "start_streaming: cmd 0x06 done irq_delta=%u completion=0x%08x\n",
 					 irq_delta, completion);
 			}
+		} else {
+			dev_info(&hd->pdev->dev,
+				 "start_streaming: skipping cmd 0x06 (enable send_stream_start_cmd06=1 to test it)\n");
 		}
 
 unlock_streaming:
 		mutex_unlock(&hd->mailbox_lock);
 		if (synthetic_v4l2)
 			hd60pro_complete_synthetic_buffers(hd);
+		else
+			hd60pro_schedule_stream_timeout(hd);
 		return ret;
 	}
 
@@ -10076,11 +5863,13 @@ static void hd60pro_stop_streaming(struct vb2_queue *q)
 {
 	struct hd60pro_dev *hd = vb2_get_drv_priv(q);
 
+	cancel_delayed_work_sync(&hd->stream_timeout_work);
 	hd->dma_capture_active = false;
 	tasklet_kill(&hd->frame_tasklet);
 
-	/* Send cmd 0x07 (stream stop, mirror of cmd 0x06) */
-	if (allow_dma_capture && hd->bar0 && hd->irq >= 0) {
+	/* Send cmd 0x07 only when the matching legacy cmd 0x06 was used. */
+	if (allow_dma_capture && send_stream_start_cmd06 && hd->bar0 &&
+	    hd->irq >= 0) {
 		const u32 stop[] = {
 			HD60PRO_MBOX_DOORBELL,
 			HD60PRO_MBOX_CMD_STREAM_STOP,
@@ -10091,8 +5880,13 @@ static void hd60pro_stop_streaming(struct vb2_queue *q)
 		mutex_lock(&hd->mailbox_lock);
 		iowrite32(0, hd->bar0 + HD60PRO_REG_MBOX_COMPLETE);
 		hd60pro_mailbox_send_async_locked(hd, stop, ARRAY_SIZE(stop),
-						  5000, &completion, NULL);
+						  real_dma_cmd_timeout_ms,
+						  &completion, NULL);
 		mutex_unlock(&hd->mailbox_lock);
+		pci_clear_master(hd->pdev);
+	} else if (allow_dma_capture && hd->bar0 && hd->irq >= 0) {
+		dev_info(&hd->pdev->dev,
+			 "stop_streaming: skipping cmd 0x07 because cmd 0x06 was not sent\n");
 		pci_clear_master(hd->pdev);
 	}
 
@@ -10430,20 +6224,15 @@ static int hd60pro_info_show(struct seq_file *s, void *unused)
 	seq_printf(s, "v4l2_synthetic_frames: %d\n", synthetic_v4l2);
 	seq_printf(s, "busmaster_requested: %d\n", enable_busmaster);
 	seq_printf(s, "irq_requested: %d\n", request_irq_vector);
+	seq_printf(s, "irq_mode: %s\n", irq_mode);
 	seq_printf(s, "v4l2_enabled: %d\n", enable_v4l2);
 	seq_printf(s, "mailbox_writes_allowed: %d\n", allow_mailbox_writes);
 	seq_printf(s, "firmware_load_allowed: %d\n", allow_firmware_load);
 	seq_printf(s, "preinit_command1_allowed: %d\n", allow_preinit_command1);
 	seq_printf(s, "fw_status_command10_allowed: %d\n",
 		   allow_fw_status_command10);
-	seq_printf(s, "gpio_command17_allowed: %d\n", allow_gpio_command17);
-	seq_printf(s, "gpio17_sequence_allowed: %d\n", allow_gpio17_sequence);
 	seq_printf(s, "i2c_read_command1a_allowed: %d\n",
 		   allow_i2c_read_command1a);
-	seq_printf(s, "logo_upload_allowed: %d\n", allow_logo_upload);
-	seq_printf(s, "post_logo_pipeline_allowed: %d\n",
-		   allow_post_logo_pipeline);
-	seq_printf(s, "cmd1d_write_allowed: %d\n", allow_cmd1d_write);
 	seq_printf(s, "auto_init_requested: %d\n", auto_init);
 	seq_puts(s, "auto_init_status: not wired; use scripts/load-initialized-root.sh for the persistent reconstructed sequence\n");
 	seq_printf(s, "prepare_dma_buffers: %d\n", prepare_dma_buffers);
@@ -10553,64 +6342,6 @@ static int hd60pro_bar5_full_show(struct seq_file *s, void *unused)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(hd60pro_bar5_full);
-
-/*
- * bar0_dma_advertise: write the host frame DMA address to BAR0[0x60..0x67].
- * Hypothesis: the firmware reads BAR0[0x60] to learn the host DMA target
- * before starting VIC/DMAC capture. Writes frame_dma (low/high) and
- * desc_dma (for the full descriptor), then reads them back.
- */
-static int hd60pro_bar0_dma_advertise_show(struct seq_file *s, void *unused)
-{
-	struct hd60pro_dev *hd = s->private;
-	void __iomem *base;
-	u32 frame_low, frame_high, desc_low, desc_high;
-
-	if (!hd->bar0) {
-		seq_puts(s, "bar0_dma_advertise: BAR0 not mapped\n");
-		return 0;
-	}
-	if (!hd->dma_frame_dma[0] || !hd->dma_desc_dma) {
-		seq_puts(s, "bar0_dma_advertise: no DMA buffers (run init first)\n");
-		return 0;
-	}
-	if (!allow_mailbox_writes) {
-		seq_puts(s, "bar0_dma_advertise: blocked; reload with allow_mailbox_writes=1\n");
-		return 0;
-	}
-
-	base = hd->bar0;
-	frame_low  = (u32)(hd->dma_frame_dma[0] & 0xffffffffULL);
-	frame_high = (u32)(hd->dma_frame_dma[0] >> 32);
-	desc_low   = (u32)(hd->dma_desc_dma & 0xffffffffULL);
-	desc_high  = (u32)(hd->dma_desc_dma >> 32);
-
-	seq_printf(s, "bar0_dma_advertise: frame_dma=0x%016llx desc_dma=0x%016llx\n",
-		   (unsigned long long)hd->dma_frame_dma[0],
-		   (unsigned long long)hd->dma_desc_dma);
-	seq_puts(s, "bar0_dma_advertise: before BAR0[0x60..0x6f]:\n");
-	seq_printf(s, "  [60]=%08x [64]=%08x [68]=%08x [6c]=%08x\n",
-		   ioread32(base + 0x60), ioread32(base + 0x64),
-		   ioread32(base + 0x68), ioread32(base + 0x6c));
-
-	/*
-	 * Write frame DMA address at BAR0[0x60..0x67] and
-	 * desc DMA address at BAR0[0x68..0x6f].
-	 * Hypothesis: firmware polls BAR0[0x60] for host frame buffer PA.
-	 */
-	iowrite32(frame_low,  base + 0x60);
-	iowrite32(frame_high, base + 0x64);
-	iowrite32(desc_low,   base + 0x68);
-	iowrite32(desc_high,  base + 0x6c);
-
-	seq_puts(s, "bar0_dma_advertise: written. BAR0[0x60..0x6f] after:\n");
-	seq_printf(s, "  [60]=%08x [64]=%08x [68]=%08x [6c]=%08x\n",
-		   ioread32(base + 0x60), ioread32(base + 0x64),
-		   ioread32(base + 0x68), ioread32(base + 0x6c));
-	seq_puts(s, "bar0_dma_advertise: now start streaming and watch for frame IRQs\n");
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(hd60pro_bar0_dma_advertise);
 
 /*
  * cmd02_dma_setup: send command 0x02 (12 dwords) to advertise host DMA buffer
@@ -10891,17 +6622,17 @@ DEFINE_SHOW_ATTRIBUTE(hd60pro_setvic_inject);
 /*
  * stream_start_test: full hardware capture sequence without V4L2 buffers.
  *
- * Sends the complete start sequence (cmds 0x29 + 0x2a + 0x02 + 0x06), enables
- * dma_capture_active so the IRQ handler recognises DMA-frame interrupts, then
- * polls for 5 s watching irq_count vs mailbox_irq_count.  Any bit-0 IRQ
- * (HD60PRO_IRQ_DMA_FRAME) means the firmware DMA'd a frame; frame_buffer_peek
- * data means the DMA address in BAR5+0x054 is correct.
+ * Sends the current best-known start sequence (cmds 0x29 + 0x2a + 0x02),
+ * enables dma_capture_active so the IRQ handler recognises DMA-frame
+ * interrupts, then polls for 30 s watching irq_count vs mailbox_irq_count.
+ * Frame IRQs plus non-zero frame_buffer_peek data mean the firmware produced
+ * a host-visible frame.
  *
  * No V4L2 buffers are required; the frame tasklet will ACK each arriving frame
  * and print a dev_info, but won't deliver to vb2.  This lets us confirm the
  * hardware path is alive before debugging the VLC / V4L2 layer.
  *
- * Requires: pipeline_ready=1, bar5_dma_program already run, allow_dma_capture=1.
+ * Requires: pipeline_ready=1, prepare_dma_buffers=1, allow_dma_capture=1.
  * Safe to run multiple times; clears dma_capture_active on exit.
  */
 static int hd60pro_stream_start_test_show(struct seq_file *s, void *unused)
@@ -10941,8 +6672,8 @@ static int hd60pro_stream_start_test_show(struct seq_file *s, void *unused)
 		return 0;
 	}
 
-	seq_puts(s, "stream_start_test: sending full start sequence for 1080p60 HDMI\n");
-	seq_printf(s, "  bar5_054=0x%08x (DMA dest; expect 0x%08x after bar5_dma_program)\n",
+	seq_puts(s, "stream_start_test: sending start sequence for 1080p60 HDMI\n");
+	seq_printf(s, "  bar5_054=0x%08x (firmware outbound dest; first DMA buf low=0x%08x)\n",
 		   ioread32(hd->bar5 + 0x054),
 		   (u32)(hd->dma_frame_dma[0] & 0xffffffff));
 	seq_printf(s, "  bar5_050=0x%08x  bar5_074=0x%08x  bar5_07c=0x%08x\n",
@@ -11008,6 +6739,16 @@ static int hd60pro_stream_start_test_show(struct seq_file *s, void *unused)
 
 	msleep(100);
 
+	if (send_stream_extra_commands) {
+		mutex_lock(&hd->mailbox_lock);
+		ret = hd60pro_send_stream_extra_packets_locked(hd, s);
+		mutex_unlock(&hd->mailbox_lock);
+		seq_printf(s, "stream_extra_commands: ret=%d\n", ret);
+		if (ret)
+			return 0;
+		msleep(100);
+	}
+
 	/* ── cmd 0x02 DMA buffer advertise ───────────────────────────────── */
 	{
 		u32 frame_size = hd60pro_frame_size();
@@ -11045,8 +6786,9 @@ static int hd60pro_stream_start_test_show(struct seq_file *s, void *unused)
 	 * The firmware_commands_seen list from the ARM endpoint only contains:
 	 *   BEGIN_FIRMWARE_DOWNLOAD, BEGIN_BASE_FIRMWARE_DOWNLOAD,
 	 *   SET_VIC_PARAMS (0x29), STOP_STREAMING, GET_FIRMWARE_VERSION.
-	 * There is no START_STREAMING command.  The Windows driver likely starts
-	 * capture automatically after SET_VIC_PARAMS + POST_SET_VIC + DMA setup.
+	 * There is no START_STREAMING command.  Windows can send additional
+	 * format/window commands 0x2d and 0x31 after successful 0x29/0x2a gates,
+	 * but those payloads are table-derived and are not proven here yet.
 	 * Sending an unknown cmd 0x06 may have been cancelling the capture.
 	 */
 	seq_puts(s, "stream_start_test: 3 cmds sent (0x29+0x2a+0x02); skipping cmd 0x06\n");
@@ -11066,8 +6808,12 @@ static int hd60pro_stream_start_test_show(struct seq_file *s, void *unused)
 	hd->non_mbox_irq_count = 0;
 
 	seq_puts(s, "stream_start_test: polling 30s for DMA frame IRQs\n");
-	seq_printf(s, "irq_count_before_poll=%u mailbox_irq_before=%u non_mbox_before=%u\n",
-		   hd->irq_count, hd->mailbox_irq_count, hd->non_mbox_irq_count);
+	seq_printf(s, "irq_count_before_poll=%u mailbox_irq_before=%u non_mbox_before=%u dma_frame_irq_mask=0x%08x\n",
+		   hd->irq_count, hd->mailbox_irq_count,
+		   hd->non_mbox_irq_count, dma_frame_irq_mask);
+	seq_printf(s, "frame_irq_bits: legacy_bit0=0x%08x arm_bit10=0x%08x\n",
+		   (u32)HD60PRO_IRQ_DMA_FRAME_LEGACY,
+		   (u32)HD60PRO_IRQ_DMA_FRAME_ARM);
 	seq_puts(s, "note: bar0_030 shows 0 in poll (cleared by ISR); use last_irq_status/cum_irq_status\n");
 
 	/* ── poll 30 s ───────────────────────────────────────────────────── */
@@ -11188,9 +6934,10 @@ static int hd60pro_stream_start_test_show(struct seq_file *s, void *unused)
 		seq_puts(s, "result: DMA frames received! Start VLC: vlc v4l2:///dev/video0\n");
 	else if (hd->non_mbox_irq_count > 0)
 		seq_printf(s, "result: non-mailbox IRQs arrived (non_mbox=%u cum=0x%08x) but dma_frame_count=0\n"
-			   "  → check cum_irq_status: if BIT(10)=0x400, ARM sends frame-notify but wrong bit checked\n"
+			   "  → check dma_frame_irq_mask=0x%08x against cum_irq_status; BIT(10)=0x400 is now accepted by default\n"
 			   "  → if all frame buffers zero: DMA not reaching host RAM (check bar5_054 vs dma_frame_dma[0])\n",
-			   hd->non_mbox_irq_count, hd->cum_irq_status);
+			   hd->non_mbox_irq_count, hd->cum_irq_status,
+			   dma_frame_irq_mask);
 	else
 		seq_puts(s, "result: no non-mailbox IRQs at all; DMAC may not be sending frames to host\n");
 
@@ -11262,6 +7009,84 @@ static int hd60pro_mailbox_regs_show(struct seq_file *s, void *unused)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(hd60pro_mailbox_regs);
+
+static int hd60pro_windows_preinit_state_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	void __iomem *base = hd60pro_mailbox_base(hd);
+	u16 pci_command;
+	u16 pci_status;
+	u32 bar0_phys = (u32)pci_resource_start(hd->pdev, HD60PRO_BAR0);
+	u32 expected_low = bar0_phys + 0x4;
+	u32 expected_high = bar0_phys + HD60PRO_FW_WINDOW_OFFSET - 0x1;
+
+	if (!mmio_dump) {
+		seq_puts(s, "disabled; reload with mmio_dump=1 for read-only diagnostics\n");
+		return 0;
+	}
+
+	pci_read_config_word(hd->pdev, PCI_COMMAND, &pci_command);
+	pci_read_config_word(hd->pdev, PCI_STATUS, &pci_status);
+
+	seq_puts(s, "windows_preinit_state: read-only BAR snapshot for 0x140278bb0\n");
+	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
+	seq_printf(s, "pci_command: 0x%04x\n", pci_command);
+	seq_printf(s, "pci_status: 0x%04x\n", pci_status);
+	seq_printf(s, "bar0_phys_low32: 0x%08x\n", bar0_phys);
+	seq_printf(s, "expected_bar5_030: 0x%08x\n", expected_low);
+	seq_printf(s, "expected_bar5_038: 0x%08x\n", expected_high);
+
+	if (base) {
+		seq_printf(s, "bar0_000_doorbell: 0x%08x\n",
+			   ioread32(base + 0x000));
+		seq_printf(s, "bar0_004_command: 0x%08x\n",
+			   ioread32(base + 0x004));
+		seq_printf(s, "bar0_008_arg0: 0x%08x\n",
+			   ioread32(base + 0x008));
+		seq_printf(s, "bar0_00c_arg1: 0x%08x\n",
+			   ioread32(base + 0x00c));
+		seq_printf(s, "bar0_02c_completion: 0x%08x\n",
+			   ioread32(base + 0x02c));
+		seq_printf(s, "bar0_030_irq_status: 0x%08x\n",
+			   ioread32(base + 0x030));
+	}
+
+	if (hd->bar5) {
+		seq_printf(s, "bar5_000_status: 0x%08x\n",
+			   ioread32(hd->bar5 + 0x000));
+		seq_printf(s, "bar5_018_status: 0x%08x\n",
+			   ioread32(hd->bar5 + 0x018));
+		seq_printf(s, "bar5_02c_status: 0x%08x\n",
+			   ioread32(hd->bar5 + 0x02c));
+		seq_printf(s, "bar5_030_ref_low: 0x%08x\n",
+			   ioread32(hd->bar5 + 0x030));
+		seq_printf(s, "bar5_038_ref_high: 0x%08x\n",
+			   ioread32(hd->bar5 + 0x038));
+		seq_printf(s, "bar5_040_payload0: 0x%08x\n",
+			   ioread32(hd->bar5 + 0x040));
+		seq_printf(s, "bar5_048_payload2: 0x%08x\n",
+			   ioread32(hd->bar5 + 0x048));
+		seq_printf(s, "bar5_050_outbound_enable: 0x%08x\n",
+			   ioread32(hd->bar5 + 0x050));
+		seq_printf(s, "bar5_054_outbound_a: 0x%08x\n",
+			   ioread32(hd->bar5 + 0x054));
+		seq_printf(s, "bar5_058_outbound_b: 0x%08x\n",
+			   ioread32(hd->bar5 + 0x058));
+		seq_printf(s, "bar5_0dc_irq_ack_sideband: 0x%08x\n",
+			   ioread32(hd->bar5 + HD60PRO_REG_IRQ_ACK_SIDEBAND));
+	}
+
+	seq_printf(s, "bar5_refs_match_windows_preinit: %d\n",
+		   hd->bar5 &&
+		   ioread32(hd->bar5 + 0x030) == expected_low &&
+		   ioread32(hd->bar5 + 0x038) == expected_high);
+	seq_printf(s, "mailbox_irq_bit11_set: %d\n",
+		   base && !!(ioread32(base + HD60PRO_REG_IRQ_STATUS) &
+			      HD60PRO_IRQ_MBOX_COMPLETE));
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_windows_preinit_state);
 
 static const char *hd60pro_bar5_reg_name(unsigned int offset)
 {
@@ -11373,6 +7198,9 @@ static void hd60pro_debugfs_init(struct hd60pro_dev *hd)
 			    &hd60pro_capture_start_plan_fops);
 	debugfs_create_file("endpoint_command_plan", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_endpoint_command_plan_fops);
+	debugfs_create_file("windows_stream_scale_table", 0400,
+			    hd->debugfs_dir, hd,
+			    &hd60pro_windows_stream_scale_table_fops);
 	debugfs_create_file("set_vic_event_record", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_set_vic_event_record_fops);
 	debugfs_create_file("send_set_vic", 0400, hd->debugfs_dir, hd,
@@ -11427,12 +7255,10 @@ static void hd60pro_debugfs_init(struct hd60pro_dev *hd)
 			    &hd60pro_windows_physical_buffer_xrefs_fops);
 	debugfs_create_file("firmware_userland_flow", 0400, hd->debugfs_dir,
 			    hd, &hd60pro_firmware_userland_flow_fops);
+	debugfs_create_file("firmware_audio_path", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_firmware_audio_path_fops);
 	debugfs_create_file("endpoint_bridge_regs", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_endpoint_bridge_regs_fops);
-	debugfs_create_file("bar5_dma_program", 0400, hd->debugfs_dir, hd,
-			    &hd60pro_bar5_dma_program_fops);
-	debugfs_create_file("bar0_dma_advertise", 0400, hd->debugfs_dir, hd,
-			    &hd60pro_bar0_dma_advertise_fops);
 	debugfs_create_file("cmd02_dma_setup", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_cmd02_dma_setup_fops);
 	debugfs_create_file("frame_buffer_peek", 0400, hd->debugfs_dir, hd,
@@ -11443,24 +7269,14 @@ static void hd60pro_debugfs_init(struct hd60pro_dev *hd)
 	debugfs_create_file("firmware_dmac_outbound_path", 0400,
 			    hd->debugfs_dir, hd,
 			    &hd60pro_firmware_dmac_outbound_path_fops);
-	debugfs_create_file("windows_88_update_plan", 0400, hd->debugfs_dir,
-			    hd, &hd60pro_windows_88_update_plan_fops);
-	debugfs_create_file("windows_calibration_info", 0400, hd->debugfs_dir,
-			    hd, &hd60pro_windows_calibration_info_fops);
-	debugfs_create_file("windows_bridge_attach_info", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_windows_bridge_attach_info_fops);
-	debugfs_create_file("windows_capture_88_presets", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_windows_capture_88_presets_fops);
-	debugfs_create_file("windows_88_mask_tables", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_windows_88_mask_tables_fops);
-	debugfs_create_file("apply_capture_88_preset_2400_min", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_apply_capture_88_preset_2400_min_fops);
 	debugfs_create_file("firmware_endpoint_tables", 0400, hd->debugfs_dir,
 			    hd, &hd60pro_firmware_endpoint_tables_fops);
+	debugfs_create_file("windows_stream_extra_commands", 0400,
+			    hd->debugfs_dir, hd,
+			    &hd60pro_windows_stream_extra_commands_fops);
+	debugfs_create_file("stream_extra_command_send", 0400,
+			    hd->debugfs_dir, hd,
+			    &hd60pro_stream_extra_command_send_fops);
 	debugfs_create_file("firmware_load", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_firmware_load_fops);
 	debugfs_create_file("preinit_command1", 0400, hd->debugfs_dir, hd,
@@ -11469,12 +7285,6 @@ static void hd60pro_debugfs_init(struct hd60pro_dev *hd)
 			    &hd60pro_fw_status_command10_fops);
 	debugfs_create_file("windows_init_plan", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_windows_init_plan_fops);
-	debugfs_create_file("gpio17_line0", 0400, hd->debugfs_dir, hd,
-			    &hd60pro_gpio17_line0_fops);
-	debugfs_create_file("gpio17_generic_sequence", 0400, hd->debugfs_dir,
-			    hd, &hd60pro_gpio17_generic_sequence_fops);
-	debugfs_create_file("i2c1a_c0_dc_db", 0400, hd->debugfs_dir, hd,
-			    &hd60pro_i2c1a_c0_dc_db_fops);
 	debugfs_create_file("hdmi_probe", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_hdmi_probe_fops);
 	debugfs_create_file("mst3367_signal", 0400, hd->debugfs_dir, hd,
@@ -11503,86 +7313,6 @@ static void hd60pro_debugfs_init(struct hd60pro_dev *hd)
 			    &hd60pro_mst3367_hpd_on_fops);
 	debugfs_create_file("gpio_read", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_gpio_read_fops);
-	debugfs_create_file("gpio_pipeline_assert", 0400, hd->debugfs_dir, hd,
-			    &hd60pro_gpio_pipeline_assert_fops);
-	debugfs_create_file("logo_upload_plan", 0400, hd->debugfs_dir, hd,
-			    &hd60pro_logo_upload_plan_fops);
-	debugfs_create_file("logo_upload_selector100", 0400, hd->debugfs_dir,
-			    hd, &hd60pro_logo_upload_selector100_fops);
-	debugfs_create_file("logo_upload_all", 0400, hd->debugfs_dir, hd,
-			    &hd60pro_logo_upload_all_fops);
-	debugfs_create_file("pre_28548c_logo_uploads_local", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_pre_28548c_logo_uploads_local_fops);
-	debugfs_create_file("post_logo_plan", 0400, hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_plan_fops);
-	debugfs_create_file("post_logo_pipeline_28548c_min", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_pipeline_28548c_min_fops);
-	debugfs_create_file("post_logo_pipeline_24dc28_head_local", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_pipeline_24dc28_head_local_fops);
-	debugfs_create_file("post_logo_pipeline_24dc28_table1_local", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_pipeline_24dc28_table1_local_fops);
-	debugfs_create_file("post_logo_pipeline_24dc28_table2_local", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_pipeline_24dc28_table2_local_fops);
-	debugfs_create_file("post_logo_pipeline_24dc28_table3_local", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_pipeline_24dc28_table3_local_fops);
-	debugfs_create_file("post_logo_pipeline_24dc28_table4_local", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_pipeline_24dc28_table4_local_fops);
-	debugfs_create_file("post_logo_pipeline_24dc28_table5_local", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_pipeline_24dc28_table5_local_fops);
-	debugfs_create_file("post_logo_pipeline_24dc28_table6_local", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_pipeline_24dc28_table6_local_fops);
-	debugfs_create_file("post_logo_pipeline_24dc28_table7_local_default",
-			    0400, hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_pipeline_24dc28_table7_local_default_fops);
-	debugfs_create_file("post_logo_pipeline_28548c_after_24dc28_tail",
-			    0400, hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_pipeline_28548c_after_24dc28_tail_fops);
-	debugfs_create_file("post_logo_pipeline_286734_local_noop", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_pipeline_286734_local_noop_fops);
-	debugfs_create_file("post_logo_pipeline_28548c_local_prefix", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_pipeline_28548c_local_prefix_fops);
-	debugfs_create_file("post_logo_shadow_probe", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_shadow_probe_fops);
-	debugfs_create_file("post_logo_pipeline_287224_min", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_pipeline_287224_min_fops);
-	debugfs_create_file("post_logo_pipeline_24c894_coeffs", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_pipeline_24c894_coeffs_fops);
-	debugfs_create_file("post_logo_pipeline_28548c_tail_local", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_pipeline_28548c_tail_local_fops);
-	debugfs_create_file("post_logo_selector_shadow_probe", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_selector_shadow_probe_fops);
-	debugfs_create_file("post_logo_cmd1d_a2", 0400, hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_cmd1d_a2_fops);
-	debugfs_create_file("post_logo_cmd1d_variant_sweep", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_cmd1d_variant_sweep_fops);
-	debugfs_create_file("post_logo_challenge_a2", 0400, hd->debugfs_dir,
-			    hd, &hd60pro_post_logo_challenge_a2_fops);
-	debugfs_create_file("post_logo_challenge_wait_a2", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_challenge_wait_a2_fops);
-	debugfs_create_file("post_logo_challenge_sweep_a2", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_challenge_sweep_a2_fops);
-	debugfs_create_file("post_logo_selector1c_dump", 0400,
-			    hd->debugfs_dir, hd,
-			    &hd60pro_post_logo_selector1c_dump_fops);
 	debugfs_create_file("bar0_head", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_bar0_fops);
 	debugfs_create_file("bar5_head", 0400, hd->debugfs_dir, hd,
@@ -11591,6 +7321,8 @@ static void hd60pro_debugfs_init(struct hd60pro_dev *hd)
 			    &hd60pro_bar5_regs_fops);
 	debugfs_create_file("mailbox_regs", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_mailbox_regs_fops);
+	debugfs_create_file("windows_preinit_state", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_windows_preinit_state_fops);
 	debugfs_create_file("bar5_full", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_bar5_full_fops);
 	debugfs_create_file("bar0_region_probe", 0400, hd->debugfs_dir, hd,
@@ -11626,6 +7358,8 @@ static int hd60pro_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	INIT_LIST_HEAD(&hd->queued_bufs);
 	tasklet_init(&hd->frame_tasklet, hd60pro_frame_tasklet,
 		     (unsigned long)hd);
+	INIT_DELAYED_WORK(&hd->stream_timeout_work,
+			  hd60pro_stream_timeout_work);
 	pci_set_drvdata(pdev, hd);
 
 	if (mailbox_bar != HD60PRO_BAR0 && mailbox_bar != HD60PRO_BAR5)
@@ -11669,8 +7403,13 @@ static int hd60pro_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		pci_set_master(pdev);
 
 	if (request_irq_vector) {
-		ret = pci_alloc_irq_vectors(pdev, 1, 1,
-					    PCI_IRQ_MSI | PCI_IRQ_MSIX | PCI_IRQ_INTX);
+		int irq_flags = hd60pro_irq_flags();
+
+		if (irq_flags < 0)
+			return dev_err_probe(&pdev->dev, irq_flags,
+					     "invalid irq_mode=%s\n", irq_mode);
+
+		ret = pci_alloc_irq_vectors(pdev, 1, 1, irq_flags);
 		if (ret < 0)
 			return dev_err_probe(&pdev->dev, ret, "IRQ vector allocation failed\n");
 
@@ -11712,10 +7451,10 @@ static int hd60pro_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	}
 
 	dev_info(&pdev->dev,
-		 "bound %s: bar0=%pa len=%pa bar5=%pa len=%pa busmaster=%d irq=%d mmio_dump=%d\n",
+		 "bound %s: bar0=%pa len=%pa bar5=%pa len=%pa busmaster=%d irq=%d irq_mode=%s mmio_dump=%d\n",
 		 hd->board ? hd->board->name : "HD60 Pro diagnostics",
 		 &bar0_start, &hd->bar0_len, &bar5_start, &hd->bar5_len,
-		 enable_busmaster, hd->irq, mmio_dump);
+		 enable_busmaster, hd->irq, irq_mode, mmio_dump);
 
 	return 0;
 }
@@ -11724,6 +7463,7 @@ static void hd60pro_remove(struct pci_dev *pdev)
 {
 	struct hd60pro_dev *hd = pci_get_drvdata(pdev);
 
+	cancel_delayed_work_sync(&hd->stream_timeout_work);
 	hd->dma_capture_active = false;
 	tasklet_kill(&hd->frame_tasklet);
 

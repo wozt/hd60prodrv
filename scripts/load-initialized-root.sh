@@ -9,7 +9,8 @@ fi
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$ROOT"
 
-./scripts/test-post-logo-cmd1d-root.sh
+./scripts/test-after-cold-boot-root.sh
 
 echo
-echo "initialized: pipeline-ready driver is loaded and /dev/video0 is available in synthetic mode"
+echo "initialized: cold-boot mailbox probe completed"
+echo "If preinit succeeded, continue with firmware_load/stream_start_test diagnostics before VLC."

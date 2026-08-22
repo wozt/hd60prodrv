@@ -228,9 +228,10 @@ packet[5] = 0x00000001
 ```
 
 The three explicit post-logo calls target address `0xa2`, registers `0x11`,
-`0x12`, and `0x10`. Linux exposes these only behind `allow_cmd1d_write=1`.
-After the fuller local sequence through coefficients and GPIO tail, these
-writes completed and left the mailbox at `0x1d a2:10=0x5a`.
+`0x12`, and `0x10`. Historical Linux probes exposed these only behind the now
+removed `allow_cmd1d_write=1` path. After the fuller local sequence through
+coefficients and GPIO tail, these writes completed and left the mailbox at
+`0x1d a2:10=0x5a`.
 
 Next data needed:
 

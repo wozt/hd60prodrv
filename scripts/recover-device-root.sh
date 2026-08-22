@@ -15,6 +15,9 @@ fi
 
 reset_ok=0
 
+echo "warning: PCI reset can leave this 12ab:0380 card mailbox-deaf."
+echo "warning: prefer scripts/prepare-device-power-root.sh, then a full power cycle if the mailbox is still dead."
+
 if [ -w "$DEV/power/control" ]; then
 	sh -c "echo on > '$DEV/power/control'" 2>/dev/null || true
 fi

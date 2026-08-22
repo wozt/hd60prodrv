@@ -19,11 +19,17 @@ rmmod hd60prodrv 2>/dev/null || true
 
 DBG=/sys/kernel/debug/hd60prodrv/0000:22:00.0
 
+echo "== windows_preinit_state before =="
+cat "$DBG/windows_preinit_state"
+echo
 echo "== preinit_command1 =="
-timeout 10s cat "$DBG/preinit_command1"
+timeout 65s cat "$DBG/preinit_command1"
+echo
+echo "== windows_preinit_state after preinit =="
+cat "$DBG/windows_preinit_state"
 echo
 echo "== fw_status_command10 =="
-timeout 10s cat "$DBG/fw_status_command10"
+timeout 40s cat "$DBG/fw_status_command10"
 echo
 echo "== health =="
 cat "$DBG/health"

@@ -295,7 +295,8 @@ hardware before this pre-init/base-firmware state was understood. That test
 made PCI config and MMIO read back as `0xffffffff`, so visible firmware loading
 remains blocked in the Linux driver unless explicitly forced.
 
-Local Linux test result after reproducing the `0x01` pre-init:
+Historical local Linux test result after reproducing the `0x01` pre-init before
+the current reset-heavy test cycle:
 
 ```text
 packet: 0x00000800 0x00000001
@@ -308,6 +309,89 @@ BAR0+0x0c: 0x0000000b
 
 This is consistent with the async path waking by IRQ and with the already
 reported firmware version matching `MZ0380.FW.TXT` (`01.11`).
+
+Current local test result on 2026-08-22 after repeated PCI reset/recovery:
+
+```text
+attempts_requested: 100
+timeout_ms_per_attempt: 500
+packet: 0x00000800 0x00000001
+attempts_run: 100
+result: -110
+completion: 0xcc800000
+irq_delta: 0
+irq_count_after: 0
+mailbox_030_irq_status_after: 0x00000000
+```
+
+The same result happened with MSI/auto IRQ selection, forced legacy INTx, and
+bus mastering both disabled and enabled. Public VFIO reports for `12ab:0380`
+say this card is sensitive to bus/PM reset and commonly needs reset quirks such
+as disabling idle D3 and avoiding bus reset. Treat the current no-IRQ preinit
+failure as likely reset-state related until retested after a full host power
+cycle without running `scripts/recover-device-root.sh`.
+
+Additional Linux change/test:
+
+```text
+hd60pro_mailbox_send_async_locked now polls BAR0+0x30 for BIT(11) and runs the
+same ACK sequence as the IRQ handler if the mailbox-complete status bit appears.
+This emulates the Windows ISR event path even when Linux MSI/INTx delivery is
+wrong.
+```
+
+Retest result: command `0x01` still ran all 100 attempts with
+`result=-110`, `irq_delta=0`, `irq_count_after=0`, and
+`mailbox_030_irq_status_after=0`. So the current failure is not just missed
+Linux interrupt delivery; the endpoint is not raising the mailbox-complete
+status bit at all in the current hardware state.
+
+Linux now exposes a read-only debugfs snapshot:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_preinit_state
+```
+
+Current snapshot before/after command `0x01`:
+
+```text
+bar5_refs_match_windows_preinit: 1
+bar0_02c_completion: 0xcc800000
+bar0_030_irq_status: 0x00000000
+bar5_040_payload0: 0xfa000060
+bar5_048_payload2: 0xfa07085f
+bar5_054_outbound_a: 0xcc800000
+mailbox_irq_bit11_set: 0
+```
+
+The BAR5 preinit refs already match the Windows values, but the mailbox
+completion and IRQ status never move. BAR5 still contains stale payload/outbound
+state from earlier logo/DMA experiments.
+
+Direct `0x0a` test without a successful `0x01` also timed out:
+
+```text
+packet: 0x00000800 0x0000000a 0x00000000 0x00000000
+result: -110
+completion: 0xcc800000
+windows_marker_after_wait: 0xcc800000
+marker_wait_skipped_after_async_error: 1
+irq_delta: 0
+status_bar_bar0_0x08: 0x00000000
+status_bar_bar0_0x0c: 0x00000000
+status_bar_bar0_0x10: 0x00000000
+```
+
+So the current hardware state is not selectively ignoring command `0x01`; the
+early async mailbox path is silent for both `0x01` and `0x0a`.
+
+External reset-state references:
+
+```text
+https://forums.unraid.net/topic/44969-help-passing-through-capture-card/
+https://forum.level1techs.com/t/passing-through-elgato-capture-card/155610
+https://www.reddit.com/r/VFIO/comments/kxhwef/passthrough_elgato_hd60_pro_capture_card_to/
+```
 
 Local Linux test result after sending the next Windows command `0x0a`:
 
@@ -347,15 +431,16 @@ GPIO-like lines with command `0x17`, then read HDMI/I2C-style registers with
 command `0x1a`. These commands are not enabled in Linux yet; the driver exposes
 `windows_init_plan` to show the decoded plan without sending it.
 
-The first isolated Linux test for this region is limited to:
+Historical isolated Linux test for this region was limited to:
 
 ```text
 packet = [0x800, 0x17, 0x00000001, 0x00000001]
 ```
 
-This corresponds to `0x140287c80(line=0, value=1)`. The debugfs endpoint
-`gpio17_line0` refuses to run unless the preceding `0x0a` state is validated as
-`BAR0+0x2c == 0xaaaaaaaa` and firmware version `01.11`.
+This corresponds to `0x140287c80(line=0, value=1)`. The old `gpio17_line0`,
+`gpio17_generic_sequence`, and `i2c1a_c0_dc_db` debugfs endpoints/scripts are
+now removed from the active workflow because they belong to the pre-logo replay
+path, not the current firmware-owned DMAC path.
 
 Local result:
 
@@ -367,9 +452,8 @@ BAR0+0x08: 0x00000001
 BAR0+0x0c: 0x00000001
 ```
 
-The card stayed accessible. The next Linux test is `gpio17_generic_sequence`,
-which sends the eight decoded generic-branch `0x17` packets and stops at the
-first failure.
+The card stayed accessible. The old full generic `0x17` sequence sent the eight
+decoded generic-branch `0x17` packets and stopped at the first failure.
 
 Local result for the full generic `0x17` sequence:
 
@@ -388,8 +472,8 @@ read bus 0xc0, reg 0xdb
 condition: first == 0x05 and second == 0x32
 ```
 
-The Linux diagnostic endpoint `i2c1a_c0_dc_db` performs only these two reads
-with command `0x1a` after replaying the validated pre-init/status/GPIO path.
+Those two `0x1a` reads are retained here as historical evidence only. They are
+not part of the current Linux bring-up scripts.
 
 ## Async Wait / Recovery Path
 
@@ -576,18 +660,15 @@ so the Linux test now follows the Windows timing more directly: wait up to
 
 The raw payloads are not the complete external BMP files. `NO.SIGNAL.bmp` is a
 640x240x32 BMP of 614456 bytes, while the device payload is 153600 bytes. The
-helper script `scripts/extract-logo-payloads.py` extracts the observed raw
-blocks from `.data` in `e60MZ0380.X64.SYS`, and
-`scripts/install-logo-payloads-root.sh` installs the three selector payloads to
-`/lib/firmware/hd60prodrv/`.
-
-Linux currently exposes `logo_upload_plan` as a read-only debugfs file. It
-checks payload availability and prints the planned Windows packets, but it does
-not write the hardware. `logo_upload_selector100` uploads only the first logo
-for isolation, while `logo_upload_all` reproduces the observed Windows sequence
-for selectors `0x100`, `0x200`, and `0x300`.
+old logo extraction/install scripts and logo upload debugfs endpoints were
+removed from the active tree. This status-image replay path is now treated as
+historical because it does not explain host-visible frame DMA.
 
 ## Post-Logo Command 0x1d Writes
+
+This whole post-logo section is historical. The old Linux debugfs endpoints and
+scripts named here have been removed from the active workflow because this path
+did not lead to real host-visible frame DMA.
 
 Immediately after the three logo calls, `HwInitialize` calls three larger
 configuration helpers that are not fully reconstructed yet:
@@ -617,10 +698,9 @@ For local `edx=0`, this helper sends command `0x1b` packets:
 [0x800,0x1b,0x9c,0x18,0x00]
 ```
 
-Linux exposes this isolated reconstruction as
-`post_logo_pipeline_28548c_min`, gated behind
-`allow_post_logo_pipeline=1`. It must be run immediately after
-`logo_upload_all`, before the `0x1d` writes.
+The old Linux reconstruction exposed this as `post_logo_pipeline_28548c_min`,
+but that endpoint is no longer registered. The next implementation work should
+follow preinit/base-firmware/full-firmware/start-stream, not post-logo replay.
 
 Further decoding showed that this file is only the small `0x14028658c` block
 near the local setup code, not the whole true `0x14028548c` call-site path. For
@@ -954,14 +1034,13 @@ After correcting the `0x140287b54/0x140287bd8` packet order from
 the corrected Windows software hash `0x70121270`.
 The pre-`28548c` helpers at `0x140276624`, `0x140276a28`, and `0x140276dbc`
 were decoded as the same three selector `0x100/0x200/0x300` status-image
-uploads and are now replayed explicitly by `pre_28548c_logo_uploads_local`.
+uploads. They are now historical notes only.
 
 ## Current Linux Bring-Up State
 
-`scripts/test-post-logo-cmd1d-root.sh` now runs the reconstructed sequence
-through `post_logo_cmd1d_a2`, then runs `post_logo_challenge_a2` and requires
-`pipeline_ready: 1`. This gives the loaded driver a persistent in-memory
-pipeline-ready state for the next capture/DMA work.
+The old `scripts/test-post-logo-cmd1d-root.sh` path has been removed from the
+active tree. Current bring-up starts with `scripts/test-after-cold-boot-root.sh`
+and then the Windows-confirmed firmware mailbox sequence.
 
 The V4L2 node is registered as `/dev/video0` with fixed diagnostic timings:
 YUYV 1920x1080 at 60 fps, Rec. 709 limited range. Until the hardware DMA ring
@@ -1635,14 +1714,15 @@ write 0x88:16 = adjusted_phase & 0xff
 write 0x88:18 = adjusted_gain & 0xff
 ```
 
-Linux exposes the decoded plan and live source reads at:
+Historical note: Linux previously exposed the decoded plan and live source
+reads at the now-removed debugfs node:
 
 ```text
 /sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_88_update_plan
 ```
 
 The calibration property paths that feed `context+0x36c` and `context+0xa20`
-are now summarized at:
+were previously summarized at the now-removed debugfs node:
 
 ```text
 /sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_calibration_info
@@ -1674,8 +1754,8 @@ Windows stores a parent/controller context at `context+0x1f1a8` and a channel
 index at `context+0x1f1b0`. This is used by the `0x88` register update helpers,
 but the pointer itself is not a host DMA buffer.
 
-Linux summarizes the decoded attach paths and live read-only `0x60` status
-probe at:
+Historical note: Linux previously summarized the decoded attach paths and live
+read-only `0x60` status probe at the now-removed debugfs node:
 
 ```text
 /sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_bridge_attach_info
@@ -1699,7 +1779,8 @@ helper/GPIO lines `0x12` and `0x24` with long sleeps when the state resolves to
 
 ## Windows 0x88 Capture Presets
 
-Linux documents the write-only plan, without applying it, at:
+Historical note: Linux previously documented the write-only plan, without
+applying it, at the now-removed debugfs node:
 
 ```text
 /sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_capture_88_presets
@@ -1742,21 +1823,22 @@ There is also a special tail around `0x140272bc3` for a mode-byte-2 path and
 16=40 15=13 16=0a 17=00 18=19 19=d0 1a=25 1c=06 1d=7a
 ```
 
-Linux has an opt-in minimal applicator for the `0x2400` preset:
+Historical note: Linux previously had an opt-in minimal applicator for the
+`0x2400` preset at the now-removed debugfs node:
 
 ```text
 /sys/kernel/debug/hd60prodrv/0000:22:00.0/apply_capture_88_preset_2400_min
 ```
 
-It requires `allow_capture_88_writes=1` and deliberately skips the unknown
-`0x88:f5` mask-table write and the `0x15..0x1d` 1080p-like tail. On the local
-HD60 Pro test, every write returned mailbox completion `1`, but immediate
-`0x1a` reads of the same `0x88` registers still returned zero. Treat that as
-command acceptance only, not proof that the target register bank latched the
-values.
+It required the now-removed `allow_capture_88_writes=1` parameter and
+deliberately skipped the unknown `0x88:f5` mask-table write and the
+`0x15..0x1d` 1080p-like tail. On the local HD60 Pro test, every write returned
+mailbox completion `1`, but immediate `0x1a` reads of the same `0x88`
+registers still returned zero. Treat that as command acceptance only, not proof
+that the target register bank latched the values.
 
-Linux also exposes the post-preset dynamic `0x88` table decode without touching
-hardware:
+Historical note: Linux also previously exposed the post-preset dynamic `0x88`
+table decode without touching hardware at the now-removed debugfs node:
 
 ```text
 /sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_88_mask_tables
@@ -2221,3 +2303,304 @@ directly writing BAR5 outbound registers. Linux exposes this through:
 ```text
 /sys/kernel/debug/hd60prodrv/0000:22:00.0/firmware_dmac_outbound_path
 ```
+
+`libmassmemaccess.so.9` is the firmware userspace wrapper around
+`/dev/vpl_dmac`. It opens that node from `MassMemAccess_OpenDMAC`, and its
+`MassMemAccess_StartDMAC` routine builds the 0x3c-byte DMAC profile consumed by
+`VPL_DMAC_StartTail`:
+
+```text
+MassMemAccess_StartDMAC:
+  profile backing buffer: object+0x4c
+  copies/fills profile bytes 0x08..0x38
+  uses MemMgr_GetPhysAddr for source/destination buffers
+  calls MemMgr_CacheCopyBack(memmgr, profile, 0x3c)
+  loops on ioctl(fd, 0xde00) until it returns 0
+
+MassMemAccess_WaitDMAC:
+  loops on ioctl(fd, 0xde01)
+
+vpl_dmac.ko Ioctl:
+  0xde00 calls VPL_DMAC_StartHead, then VPL_DMAC_StartTail
+  0xde01 waits for channel completion
+  0x8004de03 reads/checks DMAC version
+  0x4004de02 writes/sets MMR mapping information
+```
+
+This makes the next implementation target more precise: host-side Linux should
+not keep guessing BAR5 writes. It needs to reproduce the event/config path that
+causes firmware `video_capture_mgr` plus `libmassmemaccess` to build this DMAC
+profile, or add a guarded diagnostic that mirrors the exact 0x3c profile layout
+once the profile fields are fully mapped.
+
+Additional `libmassmemaccess.so.9` decode:
+
+```text
+MassMemAccess_StartDMAC profile build:
+  object+0x4c -> profile pointer
+  profile+0x08 = control word assembled from object+0x20, +0x24, +0x14,
+    and mode object+0x1c
+  profile+0x10 = phys(object+0x58) or raw object+0x58 depending object+0x48
+  profile+0x14 = object+0x5c or phys(object+0x5c)
+  profile+0x18 = object+0x28
+  profile+0x1c = object+0x30
+  profile+0x20 = object+0x34
+  profile+0x24 = object+0x38
+  profile+0x28 = object+0x3c
+  profile+0x2c = object+0x40
+  profile+0x30 = phys(object+0x54), mode-dependent
+  profile+0x34 = object+0x44
+  profile+0x38..0x3b = bytes object+0x60..0x63
+
+VPL_DMAC_StartTail copies profile+0x08 and +0x10..+0x34 directly into the DMAC
+MMR window, optionally calls pcie_set_outbound(profile[0x38], profile[0x39],
+profile[0x3a]) when profile[0x3b] is non-zero, then starts DMA with
+MMR+0x08 = profile+0x08 | 6.
+```
+
+## Firmware VIC Start Path
+
+`video_capture_mgr` does not directly run the DMAC. On a SET_VIC event it
+selects a YUY2/YV12 sensor config and launches `tinyvenc7` or `tinyvenc5` with
+the captured geometry/color arguments. Those binaries use `libvideocap.so.13`.
+
+Decoded `libvideocap.so.13`:
+
+```text
+VideoCap_Start:
+  calls VideoCap_StartVIC
+
+VideoCap_StartVIC:
+  reads object+0x74 to select a VIC register slot
+  ORs control bits into the selected VIC MMR word:
+    +0x500 when object+0x24c == 1
+    +0xe8 always before start
+  loops ioctl(fd, 0x0000e313) until success
+
+VideoCap_GetBufVIC:
+  ioctl(fd, 0x8078e303) fills a 0x78-byte buffer/frame record
+```
+
+Decoded `vpl_vic.ko`:
+
+```text
+ioctl 0x0000e313:
+  waits/checks VIC state in the kernel-side VIC object; this is the actual
+  firmware VIC start/wait transition used by tinyvenc after SET_VIC.
+
+ioctl 0x8078e303:
+  copies a 0x78-byte buffer/frame record to userspace for VideoCap_GetBufVIC.
+```
+
+Implication: host commands `0x29/0x2a` only enqueue the endpoint/userland event.
+The real capture path is:
+
+```text
+host endpoint event 0x29 SET_VIC
+  -> video_capture_mgr
+  -> tinyvenc7/5
+  -> libvideocap VideoCap_StartVIC ioctl 0xe313
+  -> libvideocap VideoCap_GetBufVIC ioctl 0x8078e303
+  -> MassMemAccess / VPL_DMAC profile path for memory movement
+```
+
+The Linux host still needs the reliable endpoint event transport/hready state
+that makes `video_capture_mgr` launch tinyvenc. Direct host writes to VIC/DMAC
+MMRs are still not justified.
+
+## Windows Commands After 0x29/0x2a
+
+`/home/wozt/mz0380-decompiled/MZ0380_StartFirmware.c` shows an additional
+stream-start caveat. After command `0x29` sets bit `0x100` and command `0x2a`
+sets bit `0x200`, Windows can continue with:
+
+```text
+cmd 0x2d, length 0x0c dwords, format/scaler/timing payload
+cmd 0x31, length 0x07 dwords, final stream/timing payload
+```
+
+Linux currently sends only `0x29 + 0x2a + 0x02` in `stream_start_test` and in
+the V4L2 real-DMA startup path. Do not add `0x2d/0x31` blindly: the payloads are
+assembled from mode-table values in `MZ0380_StartFirmware.c`, not fixed obvious
+constants. If `preinit_command1` works again after a full power cycle but
+`stream_start_test` still produces no non-mailbox IRQs or buffer writes, the
+next static target is to decode the exact 1080p60 `0x2d` and `0x31` payloads
+and test them behind an explicit experimental module parameter.
+
+Linux now exposes this decode as a read-only debugfs node:
+
+```text
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_stream_extra_commands
+/sys/kernel/debug/hd60prodrv/0000:22:00.0/windows_stream_scale_table
+```
+
+That node documents the success-bit gates and packed packet shapes:
+
+```text
+0x29 success -> bit 0x0100
+0x2a success -> bit 0x0200
+primary 0x2d success -> bit 0x0400
+secondary 0x2d success -> bit 0x0800
+0x31 success -> bit 0x1000
+
+primary 0x2d:
+  [0x800, 0x2d, 0x3fff, w3..w11], length 0x0c dwords
+
+secondary 0x2d:
+  same shape, using the secondary/high-half table values
+
+0x31:
+  [0x800, 0x31, 0x3f, w3..w6], length 0x07 dwords
+```
+
+This is diagnostic only. V4L2 and `stream_start_test` still do not send these
+commands.
+
+The fixed data-table extraction is now reproducible:
+
+```sh
+./scripts/decode-mz0380-stream-tables.py
+./scripts/decode-mz0380-stream-tables.py --packet-model
+```
+
+It reads:
+
+```text
+LXV4L2D_MZ0380.ko .data+0x1ed8 scale_tb, size 240
+LXV4L2D_MZ0380.ko .data+0x15798 SC2CC_VIN_MAP, size 32
+LXV4L2D_MZ0380.ko .data+0x1fc8 TABLE_DEVICE_INPUT_TOPOLOGY, size 4208
+```
+
+Recovered `scale_tb` has `scale_tb[4] = 1920 x 1080` (`0x0780 x 0x0438`),
+which matches the target 1080p row. `SC2CC_VIN_MAP` is:
+
+```text
+0,2,1,3,4,6,5,7
+```
+
+Important negative result: these fixed symbols still do not provide complete
+sendable `0x2d/0x31` packets. The disassembly shows `MZ0380_StartFirmware`
+loads most `0x2d/0x31` words from runtime device/stream-state offsets and
+sanitized stack temporaries around `sp+0x140..0x240`. The next useful step is
+to recover or observe those runtime fields, not to hard-code the scale row as a
+complete packet.
+
+Exact ARM-context trace targets for those runtime fields:
+
+```text
+param_1+0x1818 stream_state:
+  +0x013 +0x020 +0x025 +0x02a +0x02f +0x034 +0x039 +0x044 +0x62d +0x639
+
+param_1+0x1944 window_table_a:
+  +0x000 +0x008 +0x020 +0x028 +0x040 +0x048 +0x060 +0x068 +0x080 +0x088
+
+param_1+0x14878 window_table_b:
+  +0x000 +0x008 +0x040 +0x160 +0x1a0 +0x1a8 +0x1c0 +0x1c8
+  +0x1e0 +0x1e8 +0x200 +0x208 +0x220 +0x228 +0x240 +0x248
+  +0x260 +0x268 +0x280 +0x288 +0x2a0 +0x2a8 +0x2c0 +0x2c8
+  +0x320 +0x328 +0x330 +0x338
+
+param_1+0x14000 board_state:
+  +0x08b +0x08c +0x08d +0x08e +0x08f +0x597 +0x598 +0x5b1
+  +0x5c4 +0x5c5 +0x5cf
+```
+
+These are word indexes from the decompiled ARM context, not PCI BAR offsets.
+
+The packet model was cross-checked with a fresh Ghidra 12.1.2 headless export
+from the existing `/home/wozt/ghidra-projects/MZ0380` project:
+
+```sh
+/home/wozt/logiciels/ghidra_12.1.2_PUBLIC/support/analyzeHeadless \
+  /home/wozt/ghidra-projects MZ0380 \
+  -process LXV4L2D_MZ0380.ko -noanalysis \
+  -scriptPath scripts/ghidra \
+  -postScript ExportMZ0380Stream.java /tmp/mz0380-ghidra-stream
+```
+
+Important correction from the fresh Ghidra export: packet dwords follow the
+stack order `local_38, uStack_34, local_30, local_2c, low(local_28),
+high(local_28), local_20, uStack_1c, local_18, uStack_14, local_10, uStack_c`.
+That means the derived/reduced scaler word in `0x2d` is packet `w7`, not `w5`
+or `w6`. Use `--packet-model` for the current mapping.
+
+## Windows Ghidra Export 2026-08-22
+
+The Windows SYS project was also exported through Ghidra headless with the
+address-based helper:
+
+```sh
+/home/wozt/logiciels/ghidra_12.1.2_PUBLIC/support/analyzeHeadless \
+  /home/wozt ElgatoHD60pro \
+  -process e60MZ0380.X64.SYS -noanalysis \
+  -scriptPath scripts/ghidra \
+  -postScript ExportFunctionsByAddress.java /tmp/hd60pro-ghidra-windows \
+    send_command=140285074 \
+    preinit_140278bb0=140278bb0 \
+    isr_140284380=140284380 \
+    base_fw_download=140275f64 \
+    full_fw_download=1402762d4 \
+    fw_version_query=140277c78
+```
+
+Export summary:
+
+```text
+send_command        0x140285074 FOUND
+preinit_140278bb0   0x140278bb0 FOUND
+isr_140284380       0x140284380 FOUND
+base_fw_download    0x140275f64 FOUND
+full_fw_download    0x1402762d4 FOUND
+fw_version_query    0x140277c78 FOUND
+```
+
+Two older notes used `0x140278f80` and `0x14028d8d1`; those did not resolve to
+functions in the current Ghidra project and should be treated as stale until
+re-found.
+
+Confirmed Windows mailbox facts from fresh Ghidra:
+
+```text
+send_command 0x140285074:
+  mmio base is device+0x108
+  synchronous path clears base+0x2c, writes packet[1..n-1], writes base+0 = 0x800,
+    then polls base+0x2c bit0 up to 50 iterations
+  async path initializes semaphore/event at device+0x69d0, writes packet, rings
+    base+0 = 0x800, then waits in 0x14028ce04
+
+preinit 0x140278bb0:
+  writes device+0x110+0xdc = 2
+  writes device+0x108+0x30 = 0
+  writes device+0x108+0x00 = 0x400
+  loops up to 100 times:
+    device+0x110+0x30 = device physical BAR0 + 4
+    device+0x110+0x38 = device physical BAR0 + 0x5f
+    async packet [0x800, 0x01], length 2
+
+ISR/thread 0x140284380:
+  reads device+0x108+0x30
+  ACKs with device+0x110+0xdc = 2, device+0x108+0x30 = 0,
+    device+0x108+0x00 = 0x400
+  if status bit 11 is set, releases device+0x69d0
+```
+
+Firmware download sequences:
+
+```text
+base firmware 0x140275f64:
+  [0x800, 0x0e, selector, file_size], async, timeout 0x02faf080
+  copy file bytes to device+0x108 + 0x60
+  [0x800, 0x0f, 1], async, timeout 0x6b49d200
+  sleep, success if read32(device+0x108 + 0x08) == 0
+
+full firmware 0x1402762d4:
+  [0x800, 0x0b, file_size], async, timeout 0x02faf080
+  copy file bytes to device+0x108 + 0x60
+  [0x800, 0x0c, 1], async, timeout 0x23c34600
+  sleep 100 ms, success if read32(device+0x108 + 0x08) == 0
+```
+
+This reinforces BAR0 as the firmware-copy aperture and BAR5 as the sideband/IRQ
+register block. After a good cold-boot `preinit_command1`, the next Linux code
+target is a guarded base/full firmware download diagnostic using these packet
+sequences, not the removed post-logo replay path.

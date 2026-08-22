@@ -9,7 +9,12 @@ fi
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$ROOT"
 
-./scripts/load-initialized-root.sh >/tmp/hd60prodrv-load-initialized.log
+rmmod hd60prodrv 2>/dev/null || true
+./scripts/load-safe.sh ./hd60prodrv.ko \
+	mmio_dump=1 \
+	enable_v4l2=1 \
+	synthetic_v4l2=1 \
+	mailbox_bar=0 >/tmp/hd60prodrv-load-scaffold.log
 
 DBG="/sys/kernel/debug/hd60prodrv/0000:22:00.0"
 
@@ -109,6 +114,10 @@ echo "== firmware_userland_flow =="
 cat "$DBG/firmware_userland_flow"
 
 echo
+echo "== firmware_audio_path =="
+cat "$DBG/firmware_audio_path"
+
+echo
 echo "== endpoint_bridge_regs =="
 cat "$DBG/endpoint_bridge_regs"
 
@@ -121,24 +130,16 @@ echo "== firmware_dmac_outbound_path =="
 cat "$DBG/firmware_dmac_outbound_path"
 
 echo
-echo "== windows_88_update_plan =="
-cat "$DBG/windows_88_update_plan"
+echo "== windows_stream_extra_commands =="
+cat "$DBG/windows_stream_extra_commands"
 
 echo
-echo "== windows_calibration_info =="
-cat "$DBG/windows_calibration_info"
+echo "== stream_extra_command_send =="
+cat "$DBG/stream_extra_command_send"
 
 echo
-echo "== windows_bridge_attach_info =="
-cat "$DBG/windows_bridge_attach_info"
-
-echo
-echo "== windows_capture_88_presets =="
-cat "$DBG/windows_capture_88_presets"
-
-echo
-echo "== windows_88_mask_tables =="
-cat "$DBG/windows_88_mask_tables"
+echo "== windows_stream_scale_table =="
+cat "$DBG/windows_stream_scale_table"
 
 if command -v v4l2-ctl >/dev/null 2>&1; then
 	echo

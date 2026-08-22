@@ -8,9 +8,11 @@ card seen as:
 YUAN High-Tech Development Co., Ltd. / Corsair-Elgato
 ```
 
-This is not a working capture driver yet. It is the first kernel-side probe and
-diagnostic layer needed before implementing V4L2, DMA, HDMI timing detection, and
-audio.
+Current status: the module registers a V4L2 capture node by default and VLC can
+open it. Until the HD60 Pro firmware DMA path is fully decoded, the driver emits
+black YUYV fallback frames instead of real HDMI frames when hardware DMA produces
+no frame. Low-level PCI, mailbox, and firmware diagnostics remain available
+through debugfs.
 
 ## Current Local Findings
 
@@ -96,6 +98,39 @@ If an old snapshot is stuck on a wide BAR0 debugfs read:
 sudo ./scripts/recover-stuck-snapshot-root.sh
 ```
 
+## Load And Open In VLC
+
+Default load registers `/dev/video*`:
+
+```sh
+sudo ./scripts/load-safe.sh ./hd60prodrv.ko
+v4l2-ctl --list-devices
+vlc v4l2:///dev/video0
+```
+
+If another camera already owns `/dev/video0`, use the node shown by
+`v4l2-ctl --list-devices`.
+
+The current fallback stream is intentionally black. Real HDMI capture still
+depends on completing the firmware DMAC reverse engineering described in
+`docs/claude-handoff-2026-08-22.md`.
+
+The explicit real-DMA VLC load path is:
+
+```sh
+sudo ./scripts/load-vlc-real-root.sh
+vlc v4l2:///dev/video0
+```
+
+By default this prepares power without PCI reset, runs `preinit_command1`, then
+runs base firmware load before exposing the V4L2 real-DMA path. Set
+`INIT_FIRST=0` only when the card is already initialized. This still falls back
+to black buffers when the firmware produces no frame, but it exercises the
+mailbox/DMA startup path instead of pure synthetic mode.
+
+Audio capture is not exposed as ALSA yet. The decoded firmware audio path is
+tracked in `docs/audio-driver-notes.md`.
+
 ## Load For Diagnostics
 
 Initial safe load:
@@ -148,15 +183,37 @@ sudo dmesg | grep hd60prodrv | tail -50
 This sends the Windows-observed mailbox packet `0x800, 0x1c, 0xa3` and reports
 the completion register plus the response dwords. Keep `enable_busmaster=0`.
 If BAR5 starts reading `0xffffffff` afterward, the device did not accept this
-command in its current state. Try a PCI reset:
+command in its current state. First pin the device out of runtime power saving
+without resetting it:
+
+```sh
+sudo ./scripts/prepare-device-power-root.sh
+```
+
+Avoid PCI reset as the normal recovery path for this card. Public VFIO reports
+for `12ab:0380` and the local pre-init tests both point to bus/PM reset causing
+a device that enumerates but no longer answers the firmware mailbox. The old
+reset helper is still present for last-resort recovery:
 
 ```sh
 sudo ./scripts/recover-device-root.sh
 ```
 
 If the kernel reports `Unable to change power state from D3cold to D0` or PCI
-config reads as `0xffff`, a full power cycle is required. Shut the machine down,
-switch off/disconnect PSU power for a few seconds, then boot again.
+config reads as `0xffff`, or if command `0x01` gets zero IRQs after a PCI reset,
+a full power cycle is required. Shut the machine down, switch off/disconnect PSU
+power for a few seconds, then boot again.
+
+After a full power cycle, do not run the PCI reset helper first. Run the focused
+mailbox bring-up probe:
+
+```sh
+sudo ./scripts/test-after-cold-boot-root.sh
+```
+
+This script pins power management without reset, records `windows_preinit_state`,
+runs the Windows-style `preinit_command1`, and sends `fw_status_command10` only
+if preinit completes.
 
 ## Development Plan
 

@@ -334,6 +334,10 @@ static uint real_dma_poll_ms = 16;
 module_param(real_dma_poll_ms, uint, 0644);
 MODULE_PARM_DESC(real_dma_poll_ms, "Poll coherent DMA frame headers while real-DMA streaming, in case frame IRQ delivery is missing; 0 disables");
 
+static bool allow_dma_headerless_frames;
+module_param(allow_dma_headerless_frames, bool, 0444);
+MODULE_PARM_DESC(allow_dma_headerless_frames, "Allow experimental delivery when DMA payload bytes are non-zero but the 4-byte payload header is zero");
+
 static uint real_dma_cmd_timeout_ms = 3000;
 module_param(real_dma_cmd_timeout_ms, uint, 0644);
 MODULE_PARM_DESC(real_dma_cmd_timeout_ms, "Per-mailbox-command timeout used by V4L2 real DMA stream start");
@@ -3579,6 +3583,8 @@ static int hd60pro_capture_info_show(struct seq_file *s, void *unused)
 	seq_printf(s, "dma_poll_count: %u\n", hd->dma_poll_count);
 	seq_printf(s, "dma_frame_irq_mask: 0x%08x\n", dma_frame_irq_mask);
 	seq_printf(s, "real_dma_poll_ms: %u\n", real_dma_poll_ms);
+	seq_printf(s, "allow_dma_headerless_frames: %d\n",
+		   allow_dma_headerless_frames);
 	seq_printf(s, "real_dma_timeout_ms: %u\n", real_dma_timeout_ms);
 	seq_printf(s, "real_dma_cmd_timeout_ms: %u\n",
 		   real_dma_cmd_timeout_ms);
@@ -5678,6 +5684,19 @@ static void hd60pro_complete_timeout_fallback_buffers(struct hd60pro_dev *hd)
 	hd60pro_complete_black_buffers(hd, 3);
 }
 
+static bool hd60pro_dma_payload_nonzero(const u8 *dma_buf)
+{
+	unsigned int i;
+
+	for (i = HD60PRO_DMA_HDR_SIZE;
+	     i < HD60PRO_DMA_HDR_SIZE + 256; i++) {
+		if (dma_buf[i])
+			return true;
+	}
+
+	return false;
+}
+
 static void hd60pro_return_queued_buffers(struct hd60pro_dev *hd,
 					  enum vb2_buffer_state state)
 {
@@ -5759,6 +5778,15 @@ static bool hd60pro_deliver_dma_frame(struct hd60pro_dev *hd, u32 buf_idx,
 	if (!dma_buf)
 		return false;
 	if (!dma_payload || dma_payload > frame_size) {
+		if (allow_dma_headerless_frames && !dma_payload &&
+		    hd60pro_dma_payload_nonzero(dma_buf)) {
+			payload_size = frame_size;
+			dev_info_ratelimited(&hd->pdev->dev,
+					     "frame event using headerless DMA payload: source=%s status=0x%08x buf_idx=%u payload=%u\n",
+					     from_poll ? "poll" : "irq",
+					     frame_status, buf_idx, payload_size);
+			goto deliver_frame;
+		}
 		if (!from_poll) {
 			iowrite8(0, base + HD60PRO_REG_DMA_ACK_BASE);
 			dev_info_ratelimited(&hd->pdev->dev,
@@ -5770,6 +5798,7 @@ static bool hd60pro_deliver_dma_frame(struct hd60pro_dev *hd, u32 buf_idx,
 	}
 	payload_size = dma_payload;
 
+deliver_frame:
 	/*
 	 * Per-channel ACK register: for single-channel HD60 Pro (channel 0),
 	 * the ACK byte is always at BAR0[0x50] (channel + 0x50 with channel=0).

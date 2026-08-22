@@ -494,6 +494,20 @@ This fixes an earlier ambiguity where the real-DMA timeout fallback could look
 like a real DMA frame in metadata. Validation confirmed synthetic mode reports
 `extra=1`, while a short real-DMA timeout run reports `extra=3`.
 
+Guarded headerless-DMA experiment:
+
+If `frame_buffer_peek` after streaming shows payload bytes at `+0x1000` are
+non-zero but `header_payload=0`, reload with:
+
+```sh
+EXTRA_ARGS='allow_dma_headerless_frames=1' \
+  sudo -E ./scripts/test-after-cold-boot-real-frame-root.sh
+```
+
+That mode is disabled by default. It treats non-zero payload bytes with a zero
+header dword as a full 1080p YUYV DMA frame, covering the possibility that the
+firmware does not populate the 4-byte payload header Linux currently expects.
+
 Also map the 0x3c-byte `MassMemAccess_StartDMAC` profile completely:
 
 - Which bytes/words at `profile+0x08..0x34` become DMAC MMR registers.

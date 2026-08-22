@@ -6202,7 +6202,8 @@ static int hd60pro_vidioc_querycap(struct file *file, void *priv,
 		sizeof(cap->card));
 	snprintf(cap->bus_info, sizeof(cap->bus_info), "PCI:%s",
 		 pci_name(hd->pdev));
-	cap->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_READWRITE |
+	cap->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_AUDIO |
+			   V4L2_CAP_READWRITE |
 			   V4L2_CAP_STREAMING | V4L2_CAP_EXT_PIX_FORMAT;
 	cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
 
@@ -6558,7 +6559,8 @@ static int hd60pro_register_v4l2(struct hd60pro_dev *hd)
 	vdev->release = video_device_release_empty;
 	vdev->queue = q;
 	vdev->lock = &hd->video_lock;
-	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_READWRITE |
+	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_AUDIO |
+			    V4L2_CAP_READWRITE |
 			    V4L2_CAP_STREAMING | V4L2_CAP_EXT_PIX_FORMAT;
 	video_set_drvdata(vdev, hd);
 

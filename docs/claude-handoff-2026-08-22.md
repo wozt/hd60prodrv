@@ -107,8 +107,8 @@
 - V4L2 input/audio probing was made less hostile to normal capture apps: HDMI
   no longer reports `NO_SIGNAL` by default, `report_input_no_signal=1` restores
   the old diagnostic behavior, and `VIDIOC_ENUMAUDIO/G_AUDIO/S_AUDIO` exposes a
-  single HDMI stereo audio input. ALSA/real decoded audio samples are still not
-  implemented.
+  single HDMI stereo audio input with `V4L2_CAP_AUDIO`. ALSA/real decoded audio
+  samples are still not implemented.
 - `scripts/test-after-cold-boot-real-frame-root.sh` now logs
   `v4l2-ctl --all` and `--list-ctrls` before and after the stream attempt, so
   the next cold-boot run records input status/control/audio-probe compatibility

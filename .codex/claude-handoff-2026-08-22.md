@@ -369,6 +369,25 @@ and BAR0+0x60..0x6c read back `0xffffffff`. This proves the new poller is
 running and not falsely accepting empty DMA buffers, but the firmware did not
 write host frame data in the current non-cold-boot state.
 
+New preinit failure classification:
+
+`preinit_command1` now reports aggregate attempt counters and a `classification`
+field:
+
+```text
+preinit_completed
+mailbox_or_mmio_dead
+interrupt_without_completion
+completion_changed_without_success
+mailbox_silent_timeout
+```
+
+`scripts/test-after-cold-boot-root.sh` prints those fields in a condensed
+`preinit summary`. A short non-cold-boot validation with
+`preinit_command1_attempts=3 preinit_command1_timeout_ms=100` returned
+`classification: mailbox_silent_timeout`, `timeout_count=3`,
+`total_irq_delta=0`, `first_completion_change_attempt=0`.
+
 Added offline extractor:
 
 ```sh

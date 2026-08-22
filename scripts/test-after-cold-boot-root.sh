@@ -37,6 +37,10 @@ echo "== preinit_command1 =="
 timeout 65s cat "$DBG/preinit_command1" | tee "$TMPDIR/preinit.txt"
 
 echo
+echo "== preinit summary =="
+grep -E '^(result|classification|attempts_run|success_count|timeout_count|enodev_count|total_irq_delta|max_irq_delta|first_irq_delta_attempt|first_nonzero_irq_status_attempt|first_nonzero_irq_status|first_completion_change_attempt|first_completion_change|final_doorbell_bar0_000|final_completion_bar0_02c|final_arg0_bar0_008|final_arg1_bar0_00c):' "$TMPDIR/preinit.txt" || true
+
+echo
 echo "== windows_preinit_state after preinit =="
 cat "$DBG/windows_preinit_state"
 

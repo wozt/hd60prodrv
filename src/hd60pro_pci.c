@@ -812,8 +812,17 @@ static int hd60pro_preinit_command1_show(struct seq_file *s, void *unused)
 	u32 final_completion = 0;
 	u32 final_arg0 = 0;
 	u32 final_arg1 = 0;
+	u32 final_doorbell = 0;
+	u32 total_irq_delta = 0;
+	u32 max_irq_delta = 0;
+	u32 timeout_count = 0;
+	u32 enodev_count = 0;
+	u32 success_count = 0;
 	unsigned int first_nonzero_irq_attempt = 0;
 	unsigned int first_completion_change_attempt = 0;
+	unsigned int first_irq_delta_attempt = 0;
+	unsigned int first_success_attempt = 0;
+	unsigned int first_enodev_attempt = 0;
 	unsigned int attempts = preinit_command1_attempts;
 	unsigned int timeout_ms = preinit_command1_timeout_ms;
 	unsigned int attempt;
@@ -873,6 +882,22 @@ static int hd60pro_preinit_command1_show(struct seq_file *s, void *unused)
 							timeout_ms, &completion,
 							&irq_delta);
 		attempts_run = attempt + 1;
+		total_irq_delta += irq_delta;
+		if (irq_delta > max_irq_delta)
+			max_irq_delta = irq_delta;
+		if (irq_delta && !first_irq_delta_attempt)
+			first_irq_delta_attempt = attempts_run;
+		if (ret == -ETIMEDOUT)
+			timeout_count++;
+		else if (ret == -ENODEV) {
+			enodev_count++;
+			if (!first_enodev_attempt)
+				first_enodev_attempt = attempts_run;
+		} else if (!ret) {
+			success_count++;
+			if (!first_success_attempt)
+				first_success_attempt = attempts_run;
+		}
 		mbox_irq_status = ioread32(base + HD60PRO_REG_IRQ_STATUS);
 		final_completion = ioread32(base + HD60PRO_REG_MBOX_COMPLETE);
 		if (!first_nonzero_irq_status && mbox_irq_status &&
@@ -890,6 +915,7 @@ static int hd60pro_preinit_command1_show(struct seq_file *s, void *unused)
 			break;
 	}
 	mbox_irq_status = ioread32(base + HD60PRO_REG_IRQ_STATUS);
+	final_doorbell = ioread32(base + HD60PRO_REG_DOORBELL);
 	final_completion = ioread32(base + HD60PRO_REG_MBOX_COMPLETE);
 	final_arg0 = ioread32(base + 0x008);
 	final_arg1 = ioread32(base + 0x00c);
@@ -898,7 +924,14 @@ static int hd60pro_preinit_command1_show(struct seq_file *s, void *unused)
 	seq_printf(s, "packet: 0x%08x 0x%08x\n", packet[0], packet[1]);
 	seq_printf(s, "attempts_run: %u\n", attempts_run);
 	seq_printf(s, "result: %d\n", ret);
+	seq_printf(s, "success_count: %u\n", success_count);
+	seq_printf(s, "timeout_count: %u\n", timeout_count);
+	seq_printf(s, "enodev_count: %u\n", enodev_count);
+	seq_printf(s, "first_success_attempt: %u\n", first_success_attempt);
+	seq_printf(s, "first_enodev_attempt: %u\n", first_enodev_attempt);
 	seq_printf(s, "completion: 0x%08x\n", completion);
+	seq_printf(s, "final_doorbell_bar0_000: 0x%08x\n",
+		   final_doorbell);
 	seq_printf(s, "final_completion_bar0_02c: 0x%08x\n",
 		   final_completion);
 	seq_printf(s, "final_arg0_bar0_008: 0x%08x\n", final_arg0);
@@ -912,9 +945,19 @@ static int hd60pro_preinit_command1_show(struct seq_file *s, void *unused)
 	seq_printf(s, "first_completion_change: 0x%08x\n",
 		   first_completion_change);
 	seq_printf(s, "irq_delta: %u\n", irq_delta);
+	seq_printf(s, "total_irq_delta: %u\n", total_irq_delta);
+	seq_printf(s, "max_irq_delta: %u\n", max_irq_delta);
+	seq_printf(s, "first_irq_delta_attempt: %u\n",
+		   first_irq_delta_attempt);
 	seq_printf(s, "irq_count_after: %u\n", hd->irq_count);
 	seq_printf(s, "mailbox_030_irq_status_after: 0x%08x\n",
 		   mbox_irq_status);
+	seq_printf(s, "classification: %s\n",
+		   success_count ? "preinit_completed" :
+		   enodev_count ? "mailbox_or_mmio_dead" :
+		   total_irq_delta ? "interrupt_without_completion" :
+		   first_completion_change ? "completion_changed_without_success" :
+		   "mailbox_silent_timeout");
 
 	return 0;
 }

@@ -515,6 +515,7 @@ PREINIT_TIMEOUT
 PREINIT_FAILED
 FIRMWARE_LOAD_TIMEOUT
 FIRMWARE_LOAD_FAILED
+V4L2_CAPTURE_TIMEOUT_OR_ERROR
 FALLBACK_ONLY
 HEADERLESS_DMA_CANDIDATE
 REAL_DMA_METADATA_ONLY
@@ -527,6 +528,11 @@ REAL_FRAME_CANDIDATE
 YUYV file. `REAL_DMA_METADATA_ONLY` means DMA metadata/counters moved, but the
 captured file still looked fallback-like; treat it as evidence to inspect, not
 as a working frame.
+
+`V4L2_CAPTURE_TIMEOUT_OR_ERROR` means the `v4l2-ctl --stream-mmap` process
+failed or exceeded `CAPTURE_TIMEOUT` (default `30s`). The verifier dumps
+`capture_info` and `frame_buffer_peek` before unloading so the cold-boot window
+still leaves useful evidence instead of hanging indefinitely.
 
 If that script reaches firmware success but reports `FALLBACK_ONLY`, inspect
 `capture_info` and then test exact Windows `0x2d` and `0x31` 1080p60 payloads

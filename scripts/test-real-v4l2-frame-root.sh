@@ -16,6 +16,7 @@ DEVICE="${DEVICE:-/dev/video0}"
 FRAMES="${FRAMES:-4}"
 OUT="${OUT:-/tmp/hd60prodrv-real-v4l2.yuyv}"
 FRAME_BYTES="${FRAME_BYTES:-4147200}"
+CAPTURE_TIMEOUT="${CAPTURE_TIMEOUT:-30s}"
 
 if ! command -v v4l2-ctl >/dev/null 2>&1; then
 	echo "v4l2-ctl is required" >&2
@@ -38,7 +39,23 @@ fi
 rm -f "$OUT"
 echo
 echo "== capture $FRAMES frame(s) from $DEVICE =="
-v4l2-ctl -d "$DEVICE" --stream-mmap=4 --stream-count="$FRAMES" --stream-to="$OUT"
+set +e
+timeout "$CAPTURE_TIMEOUT" v4l2-ctl -d "$DEVICE" \
+	--stream-mmap=4 --stream-count="$FRAMES" --stream-to="$OUT"
+CAPTURE_STATUS=$?
+set -e
+if [ "$CAPTURE_STATUS" -ne 0 ]; then
+	echo
+	echo "capture_status: $CAPTURE_STATUS"
+	echo "metadata_result: V4L2_CAPTURE_TIMEOUT_OR_ERROR"
+	if [ -r "$DBG/capture_info" ]; then
+		cat "$DBG/capture_info"
+	fi
+	if [ -r "$DBG/frame_buffer_peek" ]; then
+		cat "$DBG/frame_buffer_peek"
+	fi
+	exit 16
+fi
 
 echo
 echo "== analyze raw YUYV =="

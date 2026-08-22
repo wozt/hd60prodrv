@@ -18,6 +18,7 @@ OUT="${OUT:-/tmp/hd60prodrv-cold-real-v4l2.yuyv}"
 FRAME_BYTES="${FRAME_BYTES:-4147200}"
 PREINIT_TIMEOUT="${PREINIT_TIMEOUT:-230s}"
 FIRMWARE_LOAD_TIMEOUT="${FIRMWARE_LOAD_TIMEOUT:-220s}"
+CAPTURE_TIMEOUT="${CAPTURE_TIMEOUT:-30s}"
 MAILBOX_BAR="${MAILBOX_BAR:-0}"
 
 if [ "$MAILBOX_BAR" != "0" ] && [ "${ALLOW_UNSAFE_MAILBOX_BAR5:-0}" != "1" ]; then
@@ -153,7 +154,20 @@ cat "$DBG/capture_info"
 rm -f "$OUT"
 echo
 echo "== capture $FRAMES frame(s) from $DEVICE =="
-v4l2-ctl -d "$DEVICE" --stream-mmap=4 --stream-count="$FRAMES" --stream-to="$OUT"
+set +e
+timeout "$CAPTURE_TIMEOUT" v4l2-ctl -d "$DEVICE" \
+	--stream-mmap=4 --stream-count="$FRAMES" --stream-to="$OUT"
+CAPTURE_STATUS=$?
+set -e
+if [ "$CAPTURE_STATUS" -ne 0 ]; then
+	echo
+	echo "capture_status: $CAPTURE_STATUS"
+	echo "final_verdict: V4L2_CAPTURE_TIMEOUT_OR_ERROR"
+	cat "$DBG/capture_info" 2>/dev/null || true
+	cat "$DBG/frame_buffer_peek" 2>/dev/null || true
+	rmmod hd60prodrv
+	exit 16
+fi
 
 echo
 echo "== analyze raw YUYV =="

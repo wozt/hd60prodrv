@@ -316,18 +316,18 @@ video_capture_mgr SET_VIC
 if r0 == NULL:
   return -1
 
-object = r0
-massmem_object = *(u32 *)object
-request = object + 4
-object+0x3c = caller r1
-object+0x38 = caller r2
-object+0x18 = caller r3
+wrapper = r0
+massmem_object = *(u32 *)wrapper
+request = wrapper + 4
+wrapper+0x3c = request+0x38 = caller r1
+wrapper+0x38 = request+0x34 = caller r2
+wrapper+0x18 = request+0x14 = caller r3
 call MassMemAccess_StartOneFrame or MassMemAccess_ProcessOneFrame
 ```
 
 So tinyvenc controls at least three wrapper-level request fields directly via
-the `r1/r2/r3` arguments, while the rest of the request object starts at
-`mma_wrapper + 4`.
+the `r1/r2/r3` arguments. Because `MassMemAccess_*` receives `wrapper + 4` as
+the request pointer, those are request fields `+0x38`, `+0x34`, and `+0x14`.
 
 `VideoCap_GetBufVIC` issues `ioctl(fd, 0x8078e303)` into a stack record and
 copies it into the caller's 0x80-ish-byte output record. Important observed
@@ -349,6 +349,89 @@ Concrete next reverse task: disassemble tinyvenc7 around the calls to the PLT
 entries for `VideoCap_GetBufVIC`, `TK_MMA_StartOneFrame`, and
 `TK_MMA_ProcessOneFrame`, then map the tinyvenc frame record to the
 MassMemAccess request offsets listed above.
+
+## Tinyvenc7 MMA Call Sites
+
+`tinyvenc7` has eight MMA submission call sites in the current dump:
+
+```text
+fake_frame_process:
+  0x113a4 TK_MMA_SetOptions
+  0x113d0 TK_MMA_StartOneFrame
+  0x114a8 TK_MMA_SetOptions
+  0x114c8 TK_MMA_ProcessOneFrame
+  0x11dc8 TK_MMA_SetOptions
+  0x11df4 TK_MMA_StartOneFrame
+  0x12158 TK_MMA_SetOptions
+  0x1217c TK_MMA_ProcessOneFrame
+
+vcap_handler:
+  0x1258c TK_MMA_SetOptions
+  0x125b8 TK_MMA_StartOneFrame
+  0x126e4 TK_MMA_SetOptions
+  0x12704 TK_MMA_ProcessOneFrame
+  0x12984 TK_MMA_SetOptions
+  0x129b0 TK_MMA_StartOneFrame
+  0x12e6c TK_MMA_SetOptions
+  0x12ea4 TK_MMA_StartOneFrame
+  0x13078 TK_MMA_SetOptions
+  0x1309c TK_MMA_ProcessOneFrame
+```
+
+Each visible `TK_MMA_SetOptions` call uses option `0x50` from a 16-byte block:
+
+```text
+opt+0x00 = 0x50
+opt+0x04 = 0 or 1
+opt+0x08 = 0 or 1
+opt+0x0c = value from the current context
+```
+
+That means tinyvenc is directly selecting the outbound-control bytes that later
+become `profile+0x38..0x3b`.
+
+The descriptor-style `TK_MMA_StartOneFrame` calls have this common argument
+shape:
+
+```text
+r0 = mma wrapper pointer at video state +0xb4
+r1 = 0x90000000
+r2 = MemBroker_GetPhysAddr(descriptor/control buffer)
+r3 = 0x10 or a computed descriptor byte count
+```
+
+Through the wrapper this becomes:
+
+```text
+request+0x38 = 0x90000000
+request+0x34 = physical descriptor/control buffer
+request+0x14 = 0x10 or computed descriptor byte count
+```
+
+The payload/block `TK_MMA_ProcessOneFrame` calls have this common argument
+shape:
+
+```text
+r0 = mma wrapper pointer at video state +0xb8
+r1 = 0x90000000
+r2 = prepared broker/physical buffer pointer
+r3 = 0x1000 or h264_output_record+0x08 + 0x1000
+```
+
+Through the wrapper this becomes:
+
+```text
+request+0x38 = 0x90000000
+request+0x34 = prepared buffer pointer
+request+0x14 = 0x1000 or h264_output_record+0x08 + 0x1000
+```
+
+`vcap_handler` pulls normal-frame VIC buffer virtual pointers from the
+`VideoCap_GetBufVIC` output record at `+0x38/+0x3c/+0x40` before this MMA path.
+The current static evidence therefore points at `0x90000000` as the firmware
+PCI outbound aperture used by tinyvenc for host-visible frame/descriptor
+movement. The remaining unknown is exactly how the Linux host's advertised
+`cmd 0x02` buffers are bound to that aperture on the endpoint side.
 
 Do not add guessed DMAC MMR writes in Linux. Either:
 

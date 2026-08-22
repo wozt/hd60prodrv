@@ -247,9 +247,9 @@ TK_MMA_StartOneFrame/TK_MMA_ProcessOneFrame wrappers:
   if r0 == NULL: return -1
   massmem_object = *(u32 *)r0
   request = r0 + 4
-  r1 -> wrapper/request +0x3c
-  r2 -> wrapper/request +0x38
-  r3 -> wrapper/request +0x18
+  r1 -> wrapper+0x3c == request+0x38
+  r2 -> wrapper+0x38 == request+0x34
+  r3 -> wrapper+0x18 == request+0x14
   call MassMemAccess_StartOneFrame or MassMemAccess_ProcessOneFrame
 
 VideoCap_GetBufVIC:
@@ -263,6 +263,32 @@ This makes tinyvenc7's call sites for `VideoCap_GetBufVIC` and `TK_MMA_*` the
 highest-value static reverse target. It should reveal how VIC buffer records
 become MassMemAccess request fields and whether the host `cmd 0x02` addresses
 are consumed in that bridge.
+
+Decoded tinyvenc7 call-site pattern after that:
+
+```text
+Every visible TK_MMA_SetOptions call uses option 0x50:
+  opt+0x00 = 0x50
+  opt+0x04 = 0 or 1
+  opt+0x08 = 0 or 1
+  opt+0x0c = context value
+
+Descriptor/control TK_MMA_StartOneFrame calls:
+  r0 = video_state+0xb4 MMA wrapper
+  r1 = 0x90000000
+  r2 = MemBroker_GetPhysAddr(descriptor/control buffer)
+  r3 = 0x10 or computed descriptor byte count
+
+Payload/block TK_MMA_ProcessOneFrame calls:
+  r0 = video_state+0xb8 MMA wrapper
+  r1 = 0x90000000
+  r2 = prepared broker/physical buffer pointer
+  r3 = 0x1000 or h264_output_record+0x08 + 0x1000
+```
+
+So `0x90000000` is now the strongest decoded endpoint aperture constant in the
+tinyvenc video DMA path. The unsolved host-side question is how the advertised
+Linux `cmd 0x02` coherent buffers are bound to that firmware aperture.
 
 ## Reverse Engineering Notes
 

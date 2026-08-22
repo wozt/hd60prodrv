@@ -5231,9 +5231,11 @@ static int hd60pro_firmware_dmac_outbound_path_show(struct seq_file *s,
 	seq_puts(s, "  object+0x54 = object+0x50 + chunk * (request+0x20 << 8), then helper 0xa64 starts DMAC and helper 0x9d4 waits\n");
 	seq_puts(s, "tinyvenc_vic_to_mma_link:\n");
 	seq_puts(s, "  tinyvenc5/7/8 import VideoCap_GetBufVIC plus TK_MMA_StartOneFrame/TK_MMA_ProcessOneFrame\n");
-	seq_puts(s, "  TK_MMA_* wrappers set wrapper+0x3c=r1, wrapper+0x38=r2, wrapper+0x18=r3, then pass wrapper+4 as the MassMemAccess request\n");
+	seq_puts(s, "  TK_MMA_* wrappers set wrapper+0x3c=request+0x38=r1, wrapper+0x38=request+0x34=r2, wrapper+0x18=request+0x14=r3\n");
 	seq_puts(s, "  VideoCap_GetBufVIC ioctl 0x8078e303 maps returned phys fields stack+0x5c/+0x60/+0x64 through MemMgr_GetVirtAddr into record+0x38/+0x3c/+0x40\n");
 	seq_puts(s, "  VideoCap_GetBufVIC splits stack+0x90 into record+0x54 low 13 bits and record+0x50 bits 16..28\n");
+	seq_puts(s, "  tinyvenc7 StartOneFrame sites use r0=video_state+0xb4, r1=0x90000000, r2=phys descriptor/control buffer, r3=0x10 or computed descriptor size\n");
+	seq_puts(s, "  tinyvenc7 ProcessOneFrame sites use r0=video_state+0xb8, r1=0x90000000, r2=prepared buffer pointer, r3=0x1000 or h264_output_record+0x08+0x1000\n");
 	seq_puts(s, "vpl_dmac_ioctl_decode:\n");
 	seq_puts(s, "  0xde00 -> VPL_DMAC_StartHead, then VPL_DMAC_StartTail with selected profile pointer\n");
 	seq_puts(s, "  0xde01 -> wait for channel completion\n");
@@ -5241,7 +5243,7 @@ static int hd60pro_firmware_dmac_outbound_path_show(struct seq_file *s,
 	seq_puts(s, "  0x4004de02 -> MMR mapping/setup path\n");
 	seq_puts(s, "linux_next_step:\n");
 	seq_puts(s, "  disassemble tinyvenc7 around VideoCap_GetBufVIC and TK_MMA_* call sites to map VIC records into MassMemAccess requests\n");
-	seq_puts(s, "  prove whether cmd 0x02 feeds that bridge or is only a host address advertisement\n");
+	seq_puts(s, "  prove how cmd 0x02 advertised host buffers bind to tinyvenc's decoded 0x90000000 endpoint aperture\n");
 	seq_puts(s, "  then trigger that firmware path or mirror the exact 0x3c DMAC profile/MMR submission; do not guess BAR5 writes\n");
 	seq_puts(s, "linux_current_state:\n");
 	seq_printf(s, "  pipeline_ready: %d\n", hd->pipeline_ready);

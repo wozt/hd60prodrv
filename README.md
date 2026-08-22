@@ -133,6 +133,17 @@ buffer addresses. The real-DMA scripts therefore load with `force_32bit_dma=1`.
 If a future manual load omits that and coherent buffers land above 4 GiB, the
 driver refuses to send `cmd 0x02` instead of silently truncating DMA addresses.
 
+To test whether V4L2 is delivering real hardware data instead of the synthetic
+black fallback:
+
+```sh
+sudo ./scripts/test-real-v4l2-frame-root.sh
+```
+
+The script loads the real-DMA path, captures raw YUYV with `v4l2-ctl`, and
+returns success only when captured frame data differs from the exact fallback
+pattern.
+
 Audio capture is not exposed as ALSA yet. The decoded firmware audio path is
 tracked in `docs/audio-driver-notes.md`.
 

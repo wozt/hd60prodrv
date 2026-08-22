@@ -328,6 +328,19 @@ uses one shared builder for V4L2 real-DMA, `cmd02_dma_setup`, and
 refuses to send `cmd 0x02` and prints a `force_32bit_dma=1` hint. This avoids
 silent address truncation and makes no-frame results meaningful.
 
+New real-frame verifier:
+
+```sh
+sudo ./scripts/test-real-v4l2-frame-root.sh
+```
+
+This script runs `load-vlc-real-root.sh`, captures raw YUYV through `v4l2-ctl`,
+and compares the sample against the exact synthetic fallback pattern
+`16,128,16,128`. It exits 0 only for non-fallback frame data. A successful run
+is still not final image-quality proof, but it is much stronger than "VLC
+opened" because it distinguishes the fallback from actual hardware-produced
+bytes.
+
 Added offline extractor:
 
 ```sh

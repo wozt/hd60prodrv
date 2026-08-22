@@ -6271,6 +6271,40 @@ static int hd60pro_vidioc_enum_frameintervals(struct file *file, void *priv,
 	return 0;
 }
 
+static void hd60pro_fill_streamparm(struct v4l2_streamparm *parm)
+{
+	struct v4l2_captureparm *cap = &parm->parm.capture;
+
+	memset(cap, 0, sizeof(*cap));
+	cap->capability = V4L2_CAP_TIMEPERFRAME;
+	cap->timeperframe.numerator = 1;
+	cap->timeperframe.denominator = 60;
+}
+
+static int hd60pro_vidioc_g_parm(struct file *file, void *priv,
+				 struct v4l2_streamparm *parm)
+{
+	if (parm->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+		return -EINVAL;
+
+	hd60pro_fill_streamparm(parm);
+	return 0;
+}
+
+static int hd60pro_vidioc_s_parm(struct file *file, void *priv,
+				 struct v4l2_streamparm *parm)
+{
+	if (parm->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+		return -EINVAL;
+
+	/*
+	 * The HD60 Pro bring-up path is currently fixed at 1080p60. Accept
+	 * userspace's S_PARM probe but clamp it to the only mode we expose.
+	 */
+	hd60pro_fill_streamparm(parm);
+	return 0;
+}
+
 static void hd60pro_fill_dv_timings(struct v4l2_dv_timings *timings)
 {
 	*timings = (struct v4l2_dv_timings) {
@@ -6364,6 +6398,8 @@ static const struct v4l2_ioctl_ops hd60pro_ioctl_ops = {
 	.vidioc_s_fmt_vid_cap = hd60pro_vidioc_s_fmt_vid_cap,
 	.vidioc_enum_framesizes = hd60pro_vidioc_enum_framesizes,
 	.vidioc_enum_frameintervals = hd60pro_vidioc_enum_frameintervals,
+	.vidioc_g_parm = hd60pro_vidioc_g_parm,
+	.vidioc_s_parm = hd60pro_vidioc_s_parm,
 	.vidioc_query_dv_timings = hd60pro_vidioc_query_dv_timings,
 	.vidioc_g_dv_timings = hd60pro_vidioc_g_dv_timings,
 	.vidioc_s_dv_timings = hd60pro_vidioc_s_dv_timings,

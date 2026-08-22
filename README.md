@@ -155,6 +155,10 @@ pattern and is not just an empty zero buffer.
 Audio capture is not exposed as ALSA yet. The decoded firmware audio path is
 tracked in `docs/audio-driver-notes.md`.
 
+The local DVP Linux SDK for MZ0380 was also inventoried. It uses a normal V4L2
+userspace backend (`V4L2_GENERAL2`) with mmap streaming and `VIDIOC_S_PARM`; see
+`docs/qcap-sdk-notes.md`.
+
 ## Load For Diagnostics
 
 Initial safe load:

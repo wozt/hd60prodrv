@@ -53,6 +53,7 @@
 #define HD60PRO_REG_IRQ_ACK_SIDEBAND	0x0dc
 #define HD60PRO_REG_IRQ_ACK_DOORBELL	0x400
 #define HD60PRO_IRQ_MBOX_COMPLETE	BIT(11)
+#define HD60PRO_MBOX_ARG_WINDOW_DWORDS	12
 #define HD60PRO_IRQ_DMA_FRAME_LEGACY	BIT(0)
 #define HD60PRO_IRQ_DMA_FRAME_ARM	BIT(10)
 #define HD60PRO_IRQ_DMA_FRAME_DEFAULT	(HD60PRO_IRQ_DMA_FRAME_LEGACY | \
@@ -243,7 +244,7 @@ MODULE_PARM_DESC(allow_firmware_load, "Allow experimental firmware download sequ
 
 static char *firmware_load_mode = "full";
 module_param(firmware_load_mode, charp, 0444);
-MODULE_PARM_DESC(firmware_load_mode, "Firmware download mode for firmware_load: full uses Windows 0x0b/0x0c, base uses 0x0e/0x0f");
+MODULE_PARM_DESC(firmware_load_mode, "Firmware download mode for firmware_load: full uses Windows 0x0b/0x0c, base uses 0x0e/0x0f, base_full runs both phases without reload");
 
 static uint firmware_base_selector = 1;
 module_param(firmware_base_selector, uint, 0444);
@@ -299,11 +300,11 @@ MODULE_PARM_DESC(allow_dma_capture, "Enable experimental real DMA frame delivery
 
 static bool send_stream_start_cmd06;
 module_param(send_stream_start_cmd06, bool, 0444);
-MODULE_PARM_DESC(send_stream_start_cmd06, "Also send legacy/unknown mailbox cmd 0x06 after 0x29+0x2a+0x02 when real DMA capture starts");
+MODULE_PARM_DESC(send_stream_start_cmd06, "Also send legacy/unknown mailbox cmd 0x06 after the real-DMA start sequence");
 
-static bool send_stream_stop_cmd07 = true;
+static bool send_stream_stop_cmd07;
 module_param(send_stream_stop_cmd07, bool, 0444);
-MODULE_PARM_DESC(send_stream_stop_cmd07, "Send ARM/firmware STOP_STREAMING cmd 0x07 during real-DMA V4L2 streamoff");
+MODULE_PARM_DESC(send_stream_stop_cmd07, "Send ARM/firmware STOP_STREAMING cmd 0x07 during real-DMA V4L2 streamoff; disabled by default because reload-after-stop can leave BAR0 mailbox stale");
 
 static bool allow_stream_extra_commands;
 module_param(allow_stream_extra_commands, bool, 0444);
@@ -350,6 +351,10 @@ MODULE_PARM_DESC(allow_dma_headerless_frames, "Allow experimental delivery when 
 static uint real_dma_cmd_timeout_ms = 3000;
 module_param(real_dma_cmd_timeout_ms, uint, 0644);
 MODULE_PARM_DESC(real_dma_cmd_timeout_ms, "Per-mailbox-command timeout used by V4L2 real DMA stream start");
+
+static uint cmd02_advertised_bytes = 0x34bd00;
+module_param(cmd02_advertised_bytes, uint, 0444);
+MODULE_PARM_DESC(cmd02_advertised_bytes, "Bytes advertised in command 0x02; Windows MZ0380_HwInitialize uses 0x34bd00 for the local 1cfa:0006 family");
 
 static bool force_32bit_dma;
 module_param(force_32bit_dma, bool, 0444);
@@ -574,7 +579,8 @@ static int hd60pro_mailbox_send_locked(struct hd60pro_dev *hd,
 	if (hd60pro_mailbox_dead(base))
 		return -ENODEV;
 
-	iowrite32(0, base + HD60PRO_REG_MBOX_COMPLETE);
+	for (i = 1; i < HD60PRO_MBOX_ARG_WINDOW_DWORDS; i++)
+		iowrite32(0, base + i * sizeof(u32));
 	for (i = 1; i < dwords; i++)
 		iowrite32(packet[i], base + i * sizeof(u32));
 	iowrite32(packet[0], base + HD60PRO_REG_DOORBELL);
@@ -632,6 +638,8 @@ static int hd60pro_mailbox_send_async_locked(struct hd60pro_dev *hd,
 	if (hd60pro_mailbox_dead(base))
 		return -ENODEV;
 
+	for (i = 1; i < HD60PRO_MBOX_ARG_WINDOW_DWORDS; i++)
+		iowrite32(0, base + i * sizeof(u32));
 	for (i = 1; i < dwords; i++)
 		iowrite32(packet[i], base + i * sizeof(u32));
 	iowrite32(packet[0], base + HD60PRO_REG_DOORBELL);
@@ -4003,7 +4011,7 @@ static int hd60pro_windows_stream_extra_commands_show(struct seq_file *s,
 {
 	seq_puts(s, "windows_stream_extra_commands: decoded Windows post-SET_VIC command gates; no hardware writes\n");
 	seq_puts(s, "source: /home/wozt/mz0380-decompiled/MZ0380_StartFirmware.c lines 1072..1313\n");
-	seq_puts(s, "current_linux_stream_start_test: sends cmd 0x29, cmd 0x2a, cmd 0x02 only\n");
+	seq_puts(s, "current_linux_stream_start_test: sends cmd 0x02 before cmd 0x29/0x2a; optional 0x2d/0x31 replay is still parameter-gated\n");
 	seq_puts(s, "important_caveat: Windows may send cmd 0x2d and cmd 0x31 after 0x29/0x2a, but only after success bits are set\n");
 	seq_puts(s, "success_bits:\n");
 	seq_puts(s, "  bit_0x0100: set when cmd 0x29 completes\n");
@@ -5236,6 +5244,7 @@ static int hd60pro_firmware_dmac_outbound_path_show(struct seq_file *s,
 	seq_puts(s, "  VideoCap_GetBufVIC splits stack+0x90 into record+0x54 low 13 bits and record+0x50 bits 16..28\n");
 	seq_puts(s, "  tinyvenc7 StartOneFrame sites use r0=video_state+0xb4, r1=0x90000000, r2=phys descriptor/control buffer, r3=0x10 or computed descriptor size\n");
 	seq_puts(s, "  tinyvenc7 ProcessOneFrame sites use r0=video_state+0xb8, r1=0x90000000, r2=prepared buffer pointer, r3=0x1000 or h264_output_record+0x08+0x1000\n");
+	seq_puts(s, "  observed option 0x50 outbound args are descriptor/control (0,0,context) and payload (1,0,context), with one payload branch carrying arg1 from runtime state\n");
 	seq_puts(s, "vpl_dmac_ioctl_decode:\n");
 	seq_puts(s, "  0xde00 -> VPL_DMAC_StartHead, then VPL_DMAC_StartTail with selected profile pointer\n");
 	seq_puts(s, "  0xde01 -> wait for channel completion\n");
@@ -5341,46 +5350,113 @@ static int hd60pro_firmware_info_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(hd60pro_firmware_info);
 
+static int hd60pro_firmware_load_phase(struct seq_file *s,
+				       struct hd60pro_dev *hd,
+				       const struct firmware *fw,
+				       void __iomem *base,
+				       bool base_phase,
+				       const char *phase)
+{
+	u32 prepare_packet[4] = { HD60PRO_MBOX_DOORBELL };
+	u32 commit_packet[3] = { HD60PRO_MBOX_DOORBELL };
+	u32 prepare_completion = 0;
+	u32 commit_completion = 0;
+	u32 prepare_irq_delta = 0;
+	u32 commit_irq_delta = 0;
+	size_t prepare_dwords;
+	unsigned int commit_timeout_ms;
+	int ret;
+
+	if (base_phase) {
+		prepare_packet[1] = HD60PRO_MBOX_CMD_DOWNLOAD_BASE_FW_PREPARE;
+		prepare_packet[2] = firmware_base_selector;
+		prepare_packet[3] = fw->size;
+		prepare_dwords = 4;
+		commit_packet[1] = HD60PRO_MBOX_CMD_DOWNLOAD_BASE_FW_COMMIT;
+		commit_timeout_ms = HD60PRO_BASE_FW_COMMIT_TIMEOUT_MS;
+	} else {
+		prepare_packet[1] = HD60PRO_MBOX_CMD_DOWNLOAD_FW_PREPARE;
+		prepare_packet[2] = fw->size;
+		prepare_dwords = 3;
+		commit_packet[1] = HD60PRO_MBOX_CMD_DOWNLOAD_FW_COMMIT;
+		commit_timeout_ms = HD60PRO_VISIBLE_FW_COMMIT_TIMEOUT_MS;
+	}
+	commit_packet[2] = 1;
+
+	ret = hd60pro_mailbox_send_async_locked(hd, prepare_packet,
+						prepare_dwords,
+						HD60PRO_MBOX_ASYNC_TIMEOUT_MS,
+						&prepare_completion,
+						&prepare_irq_delta);
+	if (base_phase)
+		seq_printf(s, "%s_prepare_command: 0x%08x 0x%08x 0x%08x 0x%08x\n",
+			   phase, prepare_packet[0], prepare_packet[1],
+			   prepare_packet[2], prepare_packet[3]);
+	else
+		seq_printf(s, "%s_prepare_command: 0x%08x 0x%08x 0x%08x\n",
+			   phase, prepare_packet[0], prepare_packet[1],
+			   prepare_packet[2]);
+	seq_printf(s, "%s_prepare_result: %d\n", phase, ret);
+	seq_printf(s, "%s_prepare_completion: 0x%08x\n", phase,
+		   prepare_completion);
+	seq_printf(s, "%s_prepare_irq_delta: %u\n", phase, prepare_irq_delta);
+	if (ret)
+		return ret;
+
+	memcpy_toio(base + HD60PRO_FW_WINDOW_OFFSET, fw->data, fw->size);
+	wmb();
+	seq_printf(s, "%s_copied_bytes: %zu\n", phase, fw->size);
+
+	ret = hd60pro_mailbox_send_async_locked(hd, commit_packet,
+						ARRAY_SIZE(commit_packet),
+						commit_timeout_ms,
+						&commit_completion,
+						&commit_irq_delta);
+	seq_printf(s, "%s_commit_command: 0x%08x 0x%08x 0x%08x\n",
+		   phase, commit_packet[0], commit_packet[1], commit_packet[2]);
+	seq_printf(s, "%s_commit_result: %d\n", phase, ret);
+	seq_printf(s, "%s_commit_completion: 0x%08x\n", phase,
+		   commit_completion);
+	seq_printf(s, "%s_commit_irq_delta: %u\n", phase, commit_irq_delta);
+	msleep(100);
+
+	return ret;
+}
+
 static int hd60pro_firmware_load_show(struct seq_file *s, void *unused)
 {
 	struct hd60pro_dev *hd = s->private;
 	const struct firmware *fw;
 	void __iomem *base = hd60pro_mailbox_base(hd);
 	resource_size_t len = hd60pro_mailbox_len(hd);
-	u32 prepare_completion = 0;
-	u32 commit_completion = 0;
 	u32 status0;
 	u32 status1;
 	u32 status2;
-	u32 prepare_packet[4];
-	u32 commit_packet[3];
-	u32 prepare_irq_delta = 0;
-	u32 commit_irq_delta = 0;
-	size_t prepare_dwords;
-	unsigned int commit_timeout_ms;
 	const char *classification = "not_started";
 	bool base_mode;
 	bool full_mode;
+	bool base_full_mode;
 	int ret;
 
 	if (!allow_firmware_load) {
 		seq_puts(s, "disabled; reload with allow_firmware_load=1 allow_mailbox_writes=1 to run Windows firmware download sequence\n");
-		seq_puts(s, "modes: firmware_load_mode=base uses 0x0e/0x0f, firmware_load_mode=full uses 0x0b/0x0c\n");
+		seq_puts(s, "modes: firmware_load_mode=base uses 0x0e/0x0f, full uses 0x0b/0x0c, base_full runs both phases without reload\n");
 		return 0;
 	}
 
 	base_mode = sysfs_streq(firmware_load_mode, "base");
 	full_mode = sysfs_streq(firmware_load_mode, "full");
-	if (!base_mode && !full_mode) {
+	base_full_mode = sysfs_streq(firmware_load_mode, "base_full");
+	if (!base_mode && !full_mode && !base_full_mode) {
 		seq_printf(s, "blocked: unknown firmware_load_mode=%s\n",
 			   firmware_load_mode);
-		seq_puts(s, "valid modes: base, full\n");
+		seq_puts(s, "valid modes: base, full, base_full\n");
 		return 0;
 	}
 
-	if (full_mode && !allow_unsafe_visible_fw_prepare) {
+	if ((full_mode || base_full_mode) && !allow_unsafe_visible_fw_prepare) {
 		seq_puts(s, "blocked: command 0x0b on cold hardware was observed to make PCI config and MMIO read 0xffffffff\n");
-		seq_puts(s, "reload with allow_unsafe_visible_fw_prepare=1 only after preinit/base-firmware state is validated\n");
+		seq_puts(s, "reload with allow_unsafe_visible_fw_prepare=1 only for a deliberate full/base_full firmware test after preinit is validated\n");
 		return 0;
 	}
 
@@ -5406,12 +5482,12 @@ static int hd60pro_firmware_load_show(struct seq_file *s, void *unused)
 	}
 
 	seq_printf(s, "firmware_name: %s\n", firmware_name);
-	seq_printf(s, "firmware_load_mode: %s\n", base_mode ? "base" : "full");
+	seq_printf(s, "firmware_load_mode: %s\n", firmware_load_mode);
 	seq_printf(s, "firmware_size: %zu\n", fw->size);
 	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
 	seq_printf(s, "mailbox_len: %pa\n", &len);
 	seq_printf(s, "copy_offset: 0x%x\n", HD60PRO_FW_WINDOW_OFFSET);
-	if (base_mode)
+	if (base_mode || base_full_mode)
 		seq_printf(s, "firmware_base_selector: 0x%08x\n",
 			   firmware_base_selector);
 
@@ -5423,74 +5499,24 @@ static int hd60pro_firmware_load_show(struct seq_file *s, void *unused)
 		return 0;
 	}
 
-	prepare_packet[0] = HD60PRO_MBOX_DOORBELL;
-	if (base_mode) {
-		prepare_packet[1] = HD60PRO_MBOX_CMD_DOWNLOAD_BASE_FW_PREPARE;
-		prepare_packet[2] = firmware_base_selector;
-		prepare_packet[3] = fw->size;
-		prepare_dwords = 4;
-	} else {
-		prepare_packet[1] = HD60PRO_MBOX_CMD_DOWNLOAD_FW_PREPARE;
-		prepare_packet[2] = fw->size;
-		prepare_packet[3] = 0;
-		prepare_dwords = 3;
-	}
-	commit_packet[0] = HD60PRO_MBOX_DOORBELL;
-	commit_packet[1] = base_mode ?
-		HD60PRO_MBOX_CMD_DOWNLOAD_BASE_FW_COMMIT :
-		HD60PRO_MBOX_CMD_DOWNLOAD_FW_COMMIT;
-	commit_packet[2] = 1;
-	commit_timeout_ms = base_mode ?
-		HD60PRO_BASE_FW_COMMIT_TIMEOUT_MS :
-		HD60PRO_VISIBLE_FW_COMMIT_TIMEOUT_MS;
-
 	mutex_lock(&hd->mailbox_lock);
-	ret = hd60pro_mailbox_send_async_locked(hd, prepare_packet,
-						prepare_dwords,
-						HD60PRO_MBOX_ASYNC_TIMEOUT_MS,
-						&prepare_completion,
-						&prepare_irq_delta);
-	if (base_mode)
-		seq_printf(s, "prepare_command: 0x%08x 0x%08x 0x%08x 0x%08x\n",
-			   prepare_packet[0], prepare_packet[1],
-			   prepare_packet[2], prepare_packet[3]);
-	else
-		seq_printf(s, "prepare_command: 0x%08x 0x%08x 0x%08x\n",
-			   prepare_packet[0], prepare_packet[1],
-			   prepare_packet[2]);
-	seq_printf(s, "prepare_result: %d\n", ret);
-	seq_printf(s, "prepare_completion: 0x%08x\n", prepare_completion);
-	seq_printf(s, "prepare_irq_delta: %u\n", prepare_irq_delta);
+	if (base_full_mode) {
+		ret = hd60pro_firmware_load_phase(s, hd, fw, base, true, "base");
+		if (!ret)
+			ret = hd60pro_firmware_load_phase(s, hd, fw, base,
+							  false, "full");
+	} else {
+		ret = hd60pro_firmware_load_phase(s, hd, fw, base, base_mode,
+						  base_mode ? "base" : "full");
+	}
 	if (ret) {
-		classification = ret == -ETIMEDOUT ? "prepare_timeout" :
-				 ret == -ENODEV ? "prepare_mailbox_or_mmio_dead" :
-				 "prepare_error";
-		goto out_unlock;
+		classification = ret == -ETIMEDOUT ? "firmware_phase_timeout" :
+				 ret == -ENODEV ? "firmware_phase_mailbox_or_mmio_dead" :
+				 "firmware_phase_error";
+	} else {
+		classification = "firmware_load_completed";
 	}
 
-	memcpy_toio(base + HD60PRO_FW_WINDOW_OFFSET, fw->data, fw->size);
-	wmb();
-	seq_printf(s, "copied_bytes: %zu\n", fw->size);
-
-	ret = hd60pro_mailbox_send_async_locked(hd, commit_packet,
-						ARRAY_SIZE(commit_packet),
-						commit_timeout_ms,
-						&commit_completion,
-						&commit_irq_delta);
-	seq_printf(s, "commit_command: 0x%08x 0x%08x 0x%08x\n",
-		   commit_packet[0], commit_packet[1], commit_packet[2]);
-	seq_printf(s, "commit_result: %d\n", ret);
-	seq_printf(s, "commit_completion: 0x%08x\n", commit_completion);
-	seq_printf(s, "commit_irq_delta: %u\n", commit_irq_delta);
-	if (ret)
-		classification = ret == -ETIMEDOUT ? "commit_timeout" :
-				 ret == -ENODEV ? "commit_mailbox_or_mmio_dead" :
-				 "commit_error";
-	else
-		classification = "firmware_load_completed";
-	msleep(100);
-
-out_unlock:
 	status0 = ioread32(base + 0x008);
 	status1 = ioread32(base + 0x00c);
 	status2 = ioread32(base + 0x010);
@@ -5548,7 +5574,8 @@ static void hd60pro_schedule_dma_poll(struct hd60pro_dev *hd);
 static int hd60pro_build_cmd02_packet(struct hd60pro_dev *hd, u32 packet[12],
 				      struct seq_file *s)
 {
-	u32 frame_size = hd60pro_frame_size();
+	u32 frame_size = cmd02_advertised_bytes ? cmd02_advertised_bytes :
+			 hd60pro_frame_size();
 	unsigned int i;
 
 	for (i = 0; i < HD60PRO_DMA_BUF_COUNT; i++) {
@@ -6028,7 +6055,33 @@ static int hd60pro_start_streaming(struct vb2_queue *q, unsigned int count)
 
 		mutex_lock(&hd->mailbox_lock);
 
-		/* Step 1: cmd 0x29 SET_VIC — tell firmware video format */
+		/*
+		 * Step 1: cmd 0x02 advertises host memory before SET_VIC.
+		 * Windows MZ0380_HwInitialize sends cmd 2/3/4 after firmware
+		 * download and before MZ0380_StartFirmware builds 0x29/0x2a.
+		 */
+		if (hd->dma_frame_dma[0]) {
+			u32 pkt02[12];
+
+			ret = hd60pro_build_cmd02_packet(hd, pkt02, NULL);
+			if (ret)
+				goto unlock_streaming;
+
+			ret = hd60pro_mailbox_send_async_locked(hd, pkt02,
+								ARRAY_SIZE(pkt02),
+								real_dma_cmd_timeout_ms,
+								&completion, &irq_delta);
+			if (ret && ret != -ETIMEDOUT)
+				goto unlock_streaming;
+			dev_info(&hd->pdev->dev,
+				 "start_streaming: cmd 0x02 ret=%d irq_delta=%u completion_sample=0x%08x advertised_bytes=0x%08x\n",
+				 ret, irq_delta, completion,
+				 cmd02_advertised_bytes ? cmd02_advertised_bytes :
+				 hd60pro_frame_size());
+			ret = 0;
+		}
+
+		/* Step 2: cmd 0x29 SET_VIC — tell firmware video format */
 		{
 			const u32 setvic[] = {
 				HD60PRO_MBOX_DOORBELL,
@@ -6057,7 +6110,7 @@ static int hd60pro_start_streaming(struct vb2_queue *q, unsigned int count)
 			ret = 0;
 		}
 
-		/* Step 2: cmd 0x2a stream notify */
+		/* Step 3: cmd 0x2a stream notify */
 		{
 			const u32 notify[] = {
 				HD60PRO_MBOX_DOORBELL,
@@ -6085,27 +6138,6 @@ static int hd60pro_start_streaming(struct vb2_queue *q, unsigned int count)
 			ret = hd60pro_send_stream_extra_packets_locked(hd, NULL);
 			if (ret)
 				goto unlock_streaming;
-		}
-
-		/* Step 3: cmd 0x02 — advertise 4 DMA buffer addresses */
-		if (hd->dma_frame_dma[0]) {
-			u32 pkt02[12];
-
-			ret = hd60pro_build_cmd02_packet(hd, pkt02, NULL);
-			if (ret)
-				goto unlock_streaming;
-
-			iowrite32(0, base + HD60PRO_REG_MBOX_COMPLETE);
-			ret = hd60pro_mailbox_send_async_locked(hd, pkt02,
-								ARRAY_SIZE(pkt02),
-								real_dma_cmd_timeout_ms,
-								&completion, &irq_delta);
-			if (ret && ret != -ETIMEDOUT)
-				goto unlock_streaming;
-			dev_info(&hd->pdev->dev,
-				 "start_streaming: cmd 0x02 ret=%d irq_delta=%u completion=0x%08x\n",
-				 ret, irq_delta, completion);
-			ret = 0;
 		}
 
 		/* Step 4: optional legacy/unknown cmd 0x06 stream start */
@@ -6778,17 +6810,49 @@ static int hd60pro_bar5_full_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(hd60pro_bar5_full);
 
+static int hd60pro_cmd02_packet_preview_show(struct seq_file *s, void *unused)
+{
+	struct hd60pro_dev *hd = s->private;
+	u32 packet[12];
+	int ret;
+	unsigned int i;
+
+	seq_puts(s, "cmd02_packet_preview: read-only; no mailbox write\n");
+	seq_printf(s, "cmd02_advertised_bytes: 0x%08x\n",
+		   cmd02_advertised_bytes ? cmd02_advertised_bytes :
+		   hd60pro_frame_size());
+	seq_puts(s, "model: Windows MZ0380_HwInitialize sends cmd 0x02 as host memory map before StartFirmware/SET_VIC\n");
+	seq_puts(s, "model_gap: Windows also sends cmd 0x03/0x04 memory-map families; Linux still only models cmd 0x02\n");
+
+	ret = hd60pro_build_cmd02_packet(hd, packet, s);
+	if (ret) {
+		seq_printf(s, "cmd02_packet_preview: unavailable ret=%d\n", ret);
+		return 0;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(packet); i++)
+		seq_printf(s, "packet[%02u]=0x%08x\n", i, packet[i]);
+
+	for (i = 0; i < HD60PRO_DMA_BUF_COUNT; i++)
+		seq_printf(s, "buffer[%u]: dma=0x%016llx packet_dword=%u\n",
+			   i, (unsigned long long)hd->dma_frame_dma[i],
+			   5 + i * 2);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(hd60pro_cmd02_packet_preview);
+
 /*
  * cmd02_dma_setup: send command 0x02 (12 dwords) to advertise host DMA
  * buffer addresses to the firmware.
  *
- * From the decoded MZ0380 stream path, for our current single-channel
- * 1080p60 test shape:
+ * From Windows MZ0380_HwInitialize, the local 1cfa:0006 path uses this as a
+ * host memory-map command before MZ0380_StartFirmware sends SET_VIC:
  *
  *   packet[0]  = 0x800         (doorbell)
  *   packet[1]  = 0x02          (command ID)
  *   packet[2]  = 0             (channel index)
- *   packet[3]  = frame_size    (per-frame stride/size in bytes)
+ *   packet[3]  = advertised bytes (0x34bd00 default for this family)
  *   packet[4]  = 0
  *   packet[5]  = buf0_phys     (32-bit host physical address, buffer 0)
  *   packet[6]  = 0
@@ -6798,13 +6862,16 @@ DEFINE_SHOW_ATTRIBUTE(hd60pro_bar5_full);
  *   packet[10] = 0
  *   packet[11] = buf3_phys     (buffer 3)
  *
- * Newer ARM firmware reverse engineering shows these dwords do not map
+ * ARM firmware reverse engineering shows these dwords do not map
  * directly to VPL_DMAC profile+0x38.  profile+0x38..0x3b are byte-sized
  * pcie_set_outbound controls produced by MassMemAccess option 0x50.  The
  * tinyvenc7 video path instead submits MassMemAccess requests with
  * request+0x38 = 0x90000000 and request+0x34 = a firmware-side descriptor or
  * payload buffer pointer.  The unresolved binding is how these host buffer
  * addresses become visible behind that 0x90000000 endpoint aperture.
+ *
+ * Linux currently models only the command-0x02 family.  Windows also emits
+ * related command-0x03 and command-0x04 memory-map families in HwInitialize.
  *
  * All four slots use their own dedicated DMA buffer (4-buffer mode).
  * Also clears BAR0[0x50..0x5c] (per-buffer DMA ack registers) before sending.
@@ -7055,7 +7122,7 @@ DEFINE_SHOW_ATTRIBUTE(hd60pro_setvic_inject);
 /*
  * stream_start_test: full hardware capture sequence without V4L2 buffers.
  *
- * Sends the current best-known start sequence (cmds 0x29 + 0x2a + 0x02),
+ * Sends the current best-known start sequence (cmd 0x02 before 0x29 + 0x2a),
  * enables dma_capture_active so the IRQ handler recognises DMA-frame
  * interrupts, then polls for 30 s watching irq_count vs mailbox_irq_count.
  * Frame IRQs plus non-zero frame_buffer_peek data mean the firmware produced
@@ -7124,6 +7191,33 @@ static int hd60pro_stream_start_test_show(struct seq_file *s, void *unused)
 	irq_before      = hd->irq_count;
 	frame_irq_before = irq_before - hd->mailbox_irq_count; /* proxy: total - mbox = frame */
 
+	/* ── cmd 0x02 host memory map ─────────────────────────────────────── */
+	{
+		u32 pkt02[12];
+
+		ret = hd60pro_build_cmd02_packet(hd, pkt02, s);
+		if (ret) {
+			seq_printf(s, "cmd_0x02: blocked ret=%d\n", ret);
+			return 0;
+		}
+
+		seq_printf(s, "cmd_0x02: advertised_bytes=0x%08x buf[0]=0x%08x buf[1]=0x%08x\n",
+			   cmd02_advertised_bytes ? cmd02_advertised_bytes :
+			   hd60pro_frame_size(), pkt02[5], pkt02[7]);
+		mutex_lock(&hd->mailbox_lock);
+		ret = hd60pro_mailbox_send_async_locked(hd, pkt02, ARRAY_SIZE(pkt02),
+							15000, &completion, &irq_delta);
+		mutex_unlock(&hd->mailbox_lock);
+		seq_printf(s, "cmd_0x02: ret=%d irq_delta=%u completion_sample=0x%08x\n",
+			   ret, irq_delta, completion);
+		if (ret == -ENODEV) {
+			seq_puts(s, "stream_start_test: device dead after cmd 0x02\n");
+			return 0;
+		}
+	}
+
+	msleep(100);
+
 	/* ── cmd 0x29 SET_VIC ─────────────────────────────────────────────── */
 	{
 		const u32 setvic[] = {
@@ -7189,30 +7283,6 @@ static int hd60pro_stream_start_test_show(struct seq_file *s, void *unused)
 		msleep(100);
 	}
 
-	/* ── cmd 0x02 DMA buffer advertise ───────────────────────────────── */
-	{
-		u32 frame_size = hd60pro_frame_size();
-		u32 pkt02[12];
-
-		ret = hd60pro_build_cmd02_packet(hd, pkt02, s);
-		if (ret) {
-			seq_printf(s, "cmd_0x02: blocked ret=%d\n", ret);
-			return 0;
-		}
-
-		seq_printf(s, "cmd_0x02: frame_size=0x%x buf[0]=0x%08x buf[1]=0x%08x\n",
-			   frame_size, pkt02[5], pkt02[7]);
-		mutex_lock(&hd->mailbox_lock);
-		iowrite32(0, base + HD60PRO_REG_MBOX_COMPLETE);
-		ret = hd60pro_mailbox_send_async_locked(hd, pkt02, ARRAY_SIZE(pkt02),
-							15000, &completion, &irq_delta);
-		mutex_unlock(&hd->mailbox_lock);
-		seq_printf(s, "cmd_0x02: ret=%d irq_delta=%u completion=0x%08x\n",
-			   ret, irq_delta, completion);
-	}
-
-	msleep(100);
-
 	/*
 	 * NOTE: cmd 0x06 is NOT sent here.
 	 *
@@ -7224,8 +7294,8 @@ static int hd60pro_stream_start_test_show(struct seq_file *s, void *unused)
 	 * but those payloads are table-derived and are not proven here yet.
 	 * Sending an unknown cmd 0x06 may have been cancelling the capture.
 	 */
-	seq_puts(s, "stream_start_test: 3 cmds sent (0x29+0x2a+0x02); skipping cmd 0x06\n");
-	seq_printf(s, "  bar0_02c_after_cmd02=0x%08x (expect last buf addr)\n",
+	seq_puts(s, "stream_start_test: sent cmd 0x02 before 0x29+0x2a; skipping cmd 0x06\n");
+	seq_printf(s, "  bar0_02c_after_stream_cmds=0x%08x\n",
 		   ioread32(base + HD60PRO_REG_MBOX_COMPLETE));
 
 	/*
@@ -7752,6 +7822,8 @@ static void hd60pro_debugfs_init(struct hd60pro_dev *hd)
 			    &hd60pro_firmware_audio_path_fops);
 	debugfs_create_file("endpoint_bridge_regs", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_endpoint_bridge_regs_fops);
+	debugfs_create_file("cmd02_packet_preview", 0400, hd->debugfs_dir, hd,
+			    &hd60pro_cmd02_packet_preview_fops);
 	debugfs_create_file("cmd02_dma_setup", 0400, hd->debugfs_dir, hd,
 			    &hd60pro_cmd02_dma_setup_fops);
 	debugfs_create_file("frame_buffer_peek", 0400, hd->debugfs_dir, hd,

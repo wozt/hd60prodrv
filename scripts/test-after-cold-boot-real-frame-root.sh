@@ -114,7 +114,7 @@ if grep -q '^result: 0$' "$TMPDIR/preinit.txt"; then
 
 	echo
 	echo "== firmware_load summary =="
-	grep -E '^(firmware_name|firmware_load_mode|firmware_size|prepare_command|prepare_result|prepare_completion|prepare_irq_delta|copied_bytes|commit_command|commit_result|commit_completion|commit_irq_delta|windows_success_condition_bar_.*_0x08_eq_0|classification|result):' "$TMPDIR/firmware-load.txt" || true
+	grep -E '^(firmware_name|firmware_load_mode|firmware_size|firmware_base_selector|base_|full_|prepare_command|prepare_result|prepare_completion|prepare_irq_delta|copied_bytes|commit_command|commit_result|commit_completion|commit_irq_delta|windows_success_condition_bar_.*_0x08_eq_0|classification|result):' "$TMPDIR/firmware-load.txt" || true
 else
 	echo
 	echo "firmware_load skipped: preinit_command1 did not complete"

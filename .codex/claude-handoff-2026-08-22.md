@@ -7,6 +7,48 @@
 - VLC/v4l2 can open the node without special parameters, but the current output
   is black fallback YUYV unless real firmware DMA starts producing frames.
 - Real hardware frames are still not flowing to V4L2/VLC.
+- Latest post-reboot result: the first guarded
+  `sudo ./scripts/test-after-cold-boot-real-frame-root.sh` run after the user
+  rebooted reached the farthest point so far. `preinit_command1` completed on
+  attempt 1 (`result=0`, `irq_delta=1`), base `firmware_load` completed
+  (`0x0e` prepare + `0x0f` commit, `result=0`), and V4L2 reported the expected
+  `/dev/video0` 1080p60 YUYV surface. Real frame capture still failed:
+  stream-start commands `0x29`, `0x2a`, and `0x02` all timed out, no DMA IRQ or
+  frame arrived, and the script ended `final_verdict: FALLBACK_ONLY`.
+- Do not repeat multiple full cold-boot real-frame tests in the same boot
+  without a new hypothesis. A second reload/retry with longer stream command
+  timeouts failed earlier at `preinit_command1` (`attempts_run=100`,
+  `result=-110`, `irq_delta=0`, `final_doorbell_bar0_000=0xffffffff`,
+  `classification=doorbell_all_ones_without_irq`). PCI config still passed
+  preflight afterward, but the mailbox was no longer accepting the early
+  command path.
+- Later normal reboot attempt did not enumerate the card at all:
+  `/sys/bus/pci/devices/0000:22:00.0` was absent, `lspci -nn` showed no
+  `12ab:0380`/YUAN/Elgato device, and a non-reset PCI bus rescan did not bring
+  it back. This is not a mailbox timeout state; the OS cannot see the endpoint.
+  Ask for a full PSU/off-at-wall cold boot before any more driver tests.
+- `cmd 0x02` is a 12-dword packet in the current decoded model, so its last
+  DMA address is written at BAR0+0x2c, the same offset Linux also samples as
+  `MBOX_COMPLETE`. A log like `completion=0xcbc00000` after `cmd 0x02` timeout
+  is therefore not proof of firmware completion; it can simply be packet dword
+  11. The mailbox sender now clears the argument window before each packet to
+  avoid stale dwords from shorter commands.
+- `send_stream_stop_cmd07` is now disabled by default. Although the ARM
+  `MZ0380_StopFirmware` path sends `[0x800, 0x07, 0xffffffff]`, local retry
+  evidence showed STOP/reload leaves stale BAR0 state and hurts the next
+  preinit. Re-enable only for a deliberate stop-command experiment.
+- Added `firmware_load_mode=base_full` as the next guarded cold-boot
+  hypothesis. It runs Windows base firmware (`0x0e/0x0f`) and then visible/full
+  firmware (`0x0b/0x0c`) without unloading the module or rerunning preinit.
+  Because cold `0x0b` was historically dangerous, it still requires the
+  explicit opt-in `allow_unsafe_visible_fw_prepare=1`.
+- Renewed Windows reverse engineering found that `cmd 0x02` is a host memory-map
+  command from `MZ0380_HwInitialize`, not a `MZ0380_StartFirmware` stream
+  command. Windows sends memory-map families `cmd 0x02/0x03/0x04` after
+  firmware download and before `StartFirmware` sends `0x29/0x2a/0x2d/0x31`.
+  Linux now sends `cmd 0x02` before `0x29`, and `cmd02_advertised_bytes`
+  defaults to Windows' local-family size `0x34bd00` instead of YUYV
+  `sizeimage`. Linux still does not model `cmd 0x03/0x04`.
 - Do not use PCI reset as the normal recovery path anymore. Public VFIO reports
   for `12ab:0380` and today's local tests both indicate bus/PM reset can leave
   the card enumerated but mailbox-deaf.
@@ -19,15 +61,22 @@
   `https://forums.unraid.net/topic/44969-help-passing-through-capture-card/`,
   `https://forum.level1techs.com/t/passing-through-elgato-capture-card/155610`,
   `https://www.reddit.com/r/VFIO/comments/kxhwef/passthrough_elgato_hd60_pro_capture_card_to/`.
+- Web search note: no public complete Linux HD60 Pro `12ab:0380` driver was
+  found. YUAN's public Capture I/O pages say their capture-card product line
+  has cross-platform driver/SDK support including Linux/macOS/Jetson, and their
+  driver download page lists SC-series packages. Advantech has a public MZ0380
+  Windows-driver entry for DVP hardware whose snippet says the firmware install
+  needs two reboots; this matches the local observation that MZ0380 state
+  across reboot/reload is fragile.
 - `/dev/video0` is the current expected V4L2 node in scripts.
 - V4L2 real-DMA mode now has a timeout watchdog. When the firmware produces no
   frame, it logs a real-DMA timeout and delivers black fallback YUYV buffers so
   `v4l2-ctl`/VLC can keep moving while the DMAC path is still being decoded.
 - V4L2 real-DMA mailbox startup uses `real_dma_cmd_timeout_ms` instead of fixed
   15 s command waits. Default is 3000 ms per command.
-- `stop_streaming()` now sends ARM-confirmed STOP_STREAMING `cmd 0x07` by
-  default when real DMA capture was active. Disable with
-  `send_stream_stop_cmd07=0` only for diagnostics.
+- `stop_streaming()` skips ARM-confirmed STOP_STREAMING `cmd 0x07` by default
+  after the latest same-boot retry result. Set `send_stream_stop_cmd07=1` only
+  when specifically testing the stop path.
 - Added `scripts/load-vlc-source-root.sh` for the current user-facing load path.
 - Added `scripts/load-vlc-real-root.sh` for the explicit real-DMA VLC load path
   (`synthetic_v4l2=0`, DMA buffers, IRQ, bus master, mailbox writes). It
@@ -123,9 +172,12 @@
   bytes from a previous attempt from becoming a false `HEADERLESS_DMA_CANDIDATE`
   or a stale frame in VLC after retrying.
 - `stream_start_test` now performs the same DMA frame buffer/counter/metadata
-  reset before sending `0x29 + 0x2a + 0x02`, so its no-V4L2 result is also
+  reset before sending `0x02 -> 0x29 -> 0x2a`, so its no-V4L2 result is also
   fresh-run evidence instead of possibly reflecting bytes from an earlier
   attempt.
+- V4L2 real-DMA stream start now sends `cmd 0x02` before `0x29/0x2a`, matching
+  the Windows split between `MZ0380_HwInitialize` host memory-map setup and
+  `MZ0380_StartFirmware` stream events.
 - V4L2 real-DMA stream-start hard errors now clean up correctly: queued VB2
   buffers are returned with `VB2_BUF_STATE_ERROR`, delayed works are cancelled,
   DMA capture and streaming state are disabled, and PCI bus mastering is
@@ -150,6 +202,10 @@
   - `full` sends Windows `0x0b`, copies to BAR0+0x60, then sends `0x0c` commit
     with a 60 s timeout. It still requires `allow_unsafe_visible_fw_prepare=1`
     because cold `0x0b` previously made the card read as `0xffffffff`.
+  - `base_full` runs both phases in one `firmware_load` debugfs read, keeping
+    the same initialized hardware state. This is the preferred next test after
+    the first post-reboot run proved base-only reaches V4L2 but stream commands
+    still time out.
 - Replaced the old `FINDINGS.md` with a historical pointer because it still
   claimed `/dev/video1`, direct BAR5 DMA programming, and default `cmd 0x06`.
 - Kept useful debugfs tools:
@@ -399,7 +455,7 @@ Additional Windows stream-start caveat:
 `/home/wozt/mz0380-decompiled/MZ0380_StartFirmware.c` shows that Windows can
 continue after `cmd 0x29` and `cmd 0x2a` with format/scaler commands `0x2d`
 and `0x31` when the earlier command-success bits are set. Linux currently
-sends only `0x29 + 0x2a + 0x02` in `stream_start_test`/V4L2 real-DMA mode.
+sends `0x02 -> 0x29 -> 0x2a` in `stream_start_test`/V4L2 real-DMA mode, with optional raw `0x2d/0x31` replay behind explicit parameters.
 Do not blindly add `0x2d/0x31` to the normal path: their payloads are assembled
 from several mode-table variables. Decode the exact 1080p60 values first or
 add them behind an explicit experimental module parameter.

@@ -2435,13 +2435,37 @@ cmd 0x2d, length 0x0c dwords, format/scaler/timing payload
 cmd 0x31, length 0x07 dwords, final stream/timing payload
 ```
 
-Linux currently sends only `0x29 + 0x2a + 0x02` in `stream_start_test` and in
-the V4L2 real-DMA startup path. Do not add `0x2d/0x31` blindly: the payloads are
+Older Linux revisions sent only `0x29 + 0x2a + 0x02` in `stream_start_test` and
+in the V4L2 real-DMA startup path. Do not add `0x2d/0x31` blindly: the payloads are
 assembled from mode-table values in `MZ0380_StartFirmware.c`, not fixed obvious
 constants. If `preinit_command1` works again after a full power cycle but
 `stream_start_test` still produces no non-mailbox IRQs or buffer writes, the
 next static target is to decode the exact 1080p60 `0x2d` and `0x31` payloads
 and test them behind an explicit experimental module parameter.
+
+2026-08-22 correction from renewed Windows reverse engineering:
+
+- `cmd 0x02` is not part of `MZ0380_StartFirmware`. It belongs to
+  `MZ0380_HwInitialize` after firmware download and before the normal
+  `StartFirmware` stream sequence.
+- `MZ0380_HwInitialize` sends host memory-map families:
+
+```text
+cmd 0x02 length 0x0c: [0x800,2,index,size,0,base0,0,base1,0,base2,0,base3]
+cmd 0x03 length 0x0c: [0x800,3,index,size,0,base0,0,base1,0,base2,0,base3]
+cmd 0x04 length 0x0c: [0x800,4,index,size,0,base0,0,base1,0,base2,0,base3]
+```
+
+- For the local `1cfa:0006`/subsystem-byte `0xfa` family, the observed
+  `cmd 0x02` size path is `0x34bd00` unless the neighboring-board special case
+  selects `0x400000`.
+- Linux now advertises `cmd 0x02` before `0x29/0x2a`, and the advertised byte
+  count is controlled by module parameter `cmd02_advertised_bytes`, defaulting
+  to `0x34bd00`.
+- Linux still does not model/send Windows `cmd 0x03` and `cmd 0x04`, so if
+  `base_full + cmd02-before-SET_VIC` makes progress but does not produce DMA,
+  those two memory-map families are the next highest-value implementation
+  target.
 
 Linux now exposes this decode as a read-only debugfs node:
 
@@ -2469,8 +2493,8 @@ secondary 0x2d:
   [0x800, 0x31, 0x3f, w3..w6], length 0x07 dwords
 ```
 
-This is diagnostic only. V4L2 and `stream_start_test` still do not send these
-commands.
+This is diagnostic only unless `allow_stream_extra_commands=1` and
+`send_stream_extra_commands=1` are used with explicit raw packet parameters.
 
 The fixed data-table extraction is now reproducible:
 

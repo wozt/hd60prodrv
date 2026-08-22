@@ -3196,6 +3196,7 @@ static int hd60pro_health_show(struct seq_file *s, void *unused)
 
 	seq_printf(s, "pci_command: 0x%04x\n", command);
 	seq_printf(s, "pci_status: 0x%04x\n", status);
+	seq_printf(s, "pci_current_state: %d\n", pdev->current_state);
 	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
 	seq_printf(s, "pipeline_ready: %d\n", hd->pipeline_ready);
 	seq_printf(s, "streaming: %d\n", hd->streaming);
@@ -7193,6 +7194,7 @@ static int hd60pro_windows_preinit_state_show(struct seq_file *s, void *unused)
 	seq_printf(s, "mailbox_bar: %s\n", hd60pro_mailbox_bar_name());
 	seq_printf(s, "pci_command: 0x%04x\n", pci_command);
 	seq_printf(s, "pci_status: 0x%04x\n", pci_status);
+	seq_printf(s, "pci_current_state: %d\n", hd->pdev->current_state);
 	seq_printf(s, "bar0_phys_low32: 0x%08x\n", bar0_phys);
 	seq_printf(s, "expected_bar5_030: 0x%08x\n", expected_low);
 	seq_printf(s, "expected_bar5_038: 0x%08x\n", expected_high);

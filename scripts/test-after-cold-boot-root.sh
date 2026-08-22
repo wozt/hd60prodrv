@@ -27,6 +27,16 @@ rmmod hd60prodrv 2>/dev/null || true
 	enable_v4l2=0
 
 DBG="/sys/kernel/debug/hd60prodrv/0000:22:00.0"
+SYS="/sys/bus/pci/devices/0000:22:00.0"
+
+echo
+echo "== pci power state =="
+for f in power/control power/runtime_status power/runtime_suspended_time power/runtime_active_time d3cold_allowed; do
+	if [ -r "$SYS/$f" ]; then
+		printf "%s: " "$f"
+		cat "$SYS/$f"
+	fi
+done
 
 echo
 echo "== windows_preinit_state before =="

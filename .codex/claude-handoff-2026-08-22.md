@@ -394,6 +394,14 @@ Short validation with two 50 ms attempts confirmed
 `final_windows_ack_sequence: 1` and still classified the current state as
 `mailbox_silent_timeout`.
 
+Power-state observability:
+
+`health` and `windows_preinit_state` now print `pci_current_state` from the
+kernel PCI device. `test-after-cold-boot-root.sh` also prints sysfs
+`power/control`, `power/runtime_status`, runtime active/suspended counters, and
+`d3cold_allowed` before the preinit attempt. Read-only validation showed
+`pci_current_state: 0` in the current boot state.
+
 Added offline extractor:
 
 ```sh

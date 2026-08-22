@@ -511,6 +511,7 @@ The helper now prints this list:
 ```sh
 ./scripts/decode-mz0380-stream-tables.py
 ./scripts/decode-mz0380-stream-tables.py --packet-model
+./scripts/decode-mz0380-stream-tables.py --module-args-template
 ```
 
 The debugfs node `windows_stream_extra_commands` also prints the trace targets.
@@ -528,6 +529,10 @@ Fresh Ghidra headless export was validated with:
 The fresh export corrected a packet-order risk: the `0x2d` reduced scaler word
 is packet `w7`; `w6` is the row/timing/misc word. Trust
 `decode-mz0380-stream-tables.py --packet-model` over older hand notes.
+The `--module-args-template` option prints the guarded module-parameter shape
+for `stream_extra_primary_2d`, `stream_extra_secondary_2d`, and
+`stream_extra_final_31`. It deliberately uses placeholders so guessed values do
+not get mistaken for trace data.
 
 ## Test Commands
 

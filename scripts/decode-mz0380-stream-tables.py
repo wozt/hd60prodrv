@@ -155,6 +155,33 @@ def print_packet_models():
             print(f"        {note}")
 
 
+def print_module_args_template():
+    print("# Template only. Replace PLACEHOLDER_* with exact Windows-traced dwords.")
+    print("# Do not use guessed values; the driver validates only length/cmd, not semantics.")
+    print("allow_stream_extra_commands=1")
+    print("send_stream_extra_commands=1")
+    print(
+        "stream_extra_primary_2d="
+        "0x800,0x2d,0x3fff,"
+        "PLACEHOLDER_P_W3,PLACEHOLDER_P_W4,PLACEHOLDER_P_W5,"
+        "PLACEHOLDER_P_W6,PLACEHOLDER_P_W7,PLACEHOLDER_P_W8,"
+        "PLACEHOLDER_P_W9,PLACEHOLDER_P_W10,PLACEHOLDER_P_W11"
+    )
+    print(
+        "stream_extra_secondary_2d="
+        "0x800,0x2d,0x3fff,"
+        "PLACEHOLDER_S_W3,PLACEHOLDER_S_W4,PLACEHOLDER_S_W5,"
+        "PLACEHOLDER_S_W6,PLACEHOLDER_S_W7,PLACEHOLDER_S_W8,"
+        "PLACEHOLDER_S_W9,PLACEHOLDER_S_W10,PLACEHOLDER_S_W11"
+    )
+    print(
+        "stream_extra_final_31="
+        "0x800,0x31,0x3f,"
+        "PLACEHOLDER_F_W3,PLACEHOLDER_F_W4,PLACEHOLDER_F_W5,"
+        "PLACEHOLDER_F_W6"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Decode fixed stream tables from LXV4L2D_MZ0380.ko"
@@ -169,7 +196,16 @@ def main():
         action="store_true",
         help="Print only the stream command packet formulas and trace targets",
     )
+    parser.add_argument(
+        "--module-args-template",
+        action="store_true",
+        help="Print an EXTRA_ARGS template for guarded 0x2d/0x31 replay",
+    )
     args = parser.parse_args()
+
+    if args.module_args_template:
+        print_module_args_template()
+        return
 
     if args.packet_model:
         print_packet_models()

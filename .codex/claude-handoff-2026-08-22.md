@@ -96,8 +96,9 @@
 - Inventoried the local DVP Linux SDK zip. `libqcap.x64.so` is a non-stripped
   userspace V4L2/QCAP library, not a kernel driver. It confirms mmap V4L2 as the
   correct Linux surface and shows `VIDIOC_S_PARM`; the driver now implements
-  `VIDIOC_G_PARM/S_PARM` for fixed 1080p60. Notes are in
-  `docs/qcap-sdk-notes.md`, with a reproducible helper at
+  `VIDIOC_G_PARM/S_PARM` for fixed 1080p60 plus standard stored no-op V4L2
+  controls for brightness/contrast/saturation/hue/audio volume/audio mute.
+  Notes are in `docs/qcap-sdk-notes.md`, with a reproducible helper at
   `scripts/analyze-qcap-sdk.sh`.
 
 ## What Changed In This Pass

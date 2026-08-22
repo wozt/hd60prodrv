@@ -22,6 +22,7 @@
 #include <linux/workqueue.h>
 #include <linux/videodev2.h>
 #include <media/v4l2-device.h>
+#include <media/v4l2-ctrls.h>
 #include <media/v4l2-fh.h>
 #include <media/v4l2-ioctl.h>
 #include <media/videobuf2-v4l2.h>
@@ -368,6 +369,7 @@ struct hd60pro_dev {
 	struct pci_dev *pdev;
 	const struct hd60pro_board *board;
 	struct v4l2_device v4l2_dev;
+	struct v4l2_ctrl_handler ctrl_handler;
 	struct video_device vdev;
 	struct vb2_queue vb2q;
 	struct mutex video_lock;
@@ -6415,6 +6417,43 @@ static const struct v4l2_ioctl_ops hd60pro_ioctl_ops = {
 	.vidioc_streamoff = hd60pro_vidioc_streamoff,
 };
 
+static int hd60pro_s_ctrl(struct v4l2_ctrl *ctrl)
+{
+	return 0;
+}
+
+static const struct v4l2_ctrl_ops hd60pro_ctrl_ops = {
+	.s_ctrl = hd60pro_s_ctrl,
+};
+
+static int hd60pro_init_v4l2_controls(struct hd60pro_dev *hd)
+{
+	struct v4l2_ctrl_handler *hdl = &hd->ctrl_handler;
+
+	v4l2_ctrl_handler_init(hdl, 6);
+	v4l2_ctrl_new_std(hdl, &hd60pro_ctrl_ops,
+			  V4L2_CID_BRIGHTNESS, 0, 255, 1, 128);
+	v4l2_ctrl_new_std(hdl, &hd60pro_ctrl_ops,
+			  V4L2_CID_CONTRAST, 0, 255, 1, 128);
+	v4l2_ctrl_new_std(hdl, &hd60pro_ctrl_ops,
+			  V4L2_CID_SATURATION, 0, 255, 1, 128);
+	v4l2_ctrl_new_std(hdl, &hd60pro_ctrl_ops,
+			  V4L2_CID_HUE, -128, 127, 1, 0);
+	v4l2_ctrl_new_std(hdl, &hd60pro_ctrl_ops,
+			  V4L2_CID_AUDIO_VOLUME, 0, 100, 1, 100);
+	v4l2_ctrl_new_std(hdl, &hd60pro_ctrl_ops,
+			  V4L2_CID_AUDIO_MUTE, 0, 1, 1, 0);
+
+	if (hdl->error) {
+		int ret = hdl->error;
+
+		v4l2_ctrl_handler_free(hdl);
+		return ret;
+	}
+
+	return 0;
+}
+
 static int hd60pro_register_v4l2(struct hd60pro_dev *hd)
 {
 	struct video_device *vdev = &hd->vdev;
@@ -6443,8 +6482,16 @@ static int hd60pro_register_v4l2(struct hd60pro_dev *hd)
 		return dev_err_probe(&hd->pdev->dev, ret,
 				     "v4l2_device_register failed\n");
 
+	ret = hd60pro_init_v4l2_controls(hd);
+	if (ret) {
+		v4l2_device_unregister(&hd->v4l2_dev);
+		return dev_err_probe(&hd->pdev->dev, ret,
+				     "v4l2 controls init failed\n");
+	}
+
 	strscpy(vdev->name, KBUILD_MODNAME, sizeof(vdev->name));
 	vdev->v4l2_dev = &hd->v4l2_dev;
+	vdev->ctrl_handler = &hd->ctrl_handler;
 	vdev->fops = &hd60pro_fops;
 	vdev->ioctl_ops = &hd60pro_ioctl_ops;
 	vdev->release = video_device_release_empty;
@@ -6456,6 +6503,7 @@ static int hd60pro_register_v4l2(struct hd60pro_dev *hd)
 
 	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
 	if (ret) {
+		v4l2_ctrl_handler_free(&hd->ctrl_handler);
 		v4l2_device_unregister(&hd->v4l2_dev);
 		return dev_err_probe(&hd->pdev->dev, ret,
 				     "video_register_device failed\n");
@@ -6472,6 +6520,7 @@ static void hd60pro_unregister_v4l2(struct hd60pro_dev *hd)
 		return;
 
 	video_unregister_device(&hd->vdev);
+	v4l2_ctrl_handler_free(&hd->ctrl_handler);
 	v4l2_device_unregister(&hd->v4l2_dev);
 }
 

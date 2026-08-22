@@ -27,6 +27,10 @@ Important current findings:
 - The format path uses standard `VIDIOC_G_FMT`, `VIDIOC_S_FMT`, and
   `VIDIOC_S_PARM` calls. The driver now implements `VIDIOC_G_PARM/S_PARM` and
   clamps the only exposed mode to 1080p60.
+- The driver now exposes standard no-op V4L2 controls for brightness, contrast,
+  saturation, hue, audio volume, and audio mute. They satisfy ordinary
+  `VIDIOC_QUERYCTRL/G_CTRL/S_CTRL` probes from VLC/QCAP-style userspace while
+  hardware-side tuning remains unknown.
 - The SDK also sends private control IDs around `0x0099....` through
   `VIDIOC_S_CTRL`/`VIDIOC_S_EXT_CTRLS` for encoder/device-specific settings.
   These are userspace-library settings, not proof of a missing kernel mailbox

@@ -181,6 +181,10 @@ echo
 echo "== capture_info after stream =="
 cat "$DBG/capture_info"
 
+echo
+echo "== frame_buffer_peek after stream =="
+cat "$DBG/frame_buffer_peek"
+
 if [ "$ANALYZE_STATUS" -eq 0 ]; then
 	echo
 	echo "final_verdict: REAL_FRAME_CANDIDATE"

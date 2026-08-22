@@ -5100,41 +5100,68 @@ static int hd60pro_firmware_pcie_outbound_regs_show(struct seq_file *s,
 DEFINE_SHOW_ATTRIBUTE(hd60pro_firmware_pcie_outbound_regs);
 
 /*
- * frame_buffer_peek: dump first 256 bytes of the DMA frame buffer via
- * CPU virtual address. If the firmware DMA'd anything, it shows here.
- * All zeros = firmware hasn't written yet; non-zero = DMA is working.
+ * frame_buffer_peek: dump DMA frame buffers through CPU virtual addresses.
+ * Firmware may write any of the four cmd-0x02 advertised buffers. Header dword
+ * 0 is expected to hold payload bytes; pixels start at +0x1000.
  */
 static int hd60pro_frame_buffer_peek_show(struct seq_file *s, void *unused)
 {
 	struct hd60pro_dev *hd = s->private;
 	const u8 *buf;
-	unsigned int i;
-	bool any_nonzero = false;
+	unsigned int b;
 
 	if (!hd->dma_frame_cpu[0]) {
 		seq_puts(s, "frame_buffer_peek: no DMA frame buffer\n");
 		return 0;
 	}
 
-	buf = (const u8 *)hd->dma_frame_cpu[0];
-	seq_printf(s, "frame_buffer_peek: dma_frame_dma[0]=0x%016llx size=%zu\n",
-		   (unsigned long long)hd->dma_frame_dma[0], hd->dma_frame_size);
+	seq_printf(s, "frame_buffer_peek: frame_size=%zu header_size=0x%x buffers=%u\n",
+		   hd->dma_frame_size, HD60PRO_DMA_HDR_SIZE,
+		   HD60PRO_DMA_BUF_COUNT);
 
-	for (i = 0; i < 256; i++) {
-		if (buf[i])
-			any_nonzero = true;
-	}
-	seq_printf(s, "frame_buffer_peek: first 256 bytes %s\n",
-		   any_nonzero ? "have non-zero content (DMA working!)" : "are all zero (no DMA yet)");
+	for (b = 0; b < HD60PRO_DMA_BUF_COUNT; b++) {
+		unsigned int i;
+		u32 header_payload = 0;
+		bool header_nonzero = false;
+		bool payload_nonzero = false;
 
-	for (i = 0; i < 256; i += 16) {
-		seq_printf(s, "%04x: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
-			   i,
-			   buf[i+ 0], buf[i+ 1], buf[i+ 2], buf[i+ 3],
-			   buf[i+ 4], buf[i+ 5], buf[i+ 6], buf[i+ 7],
-			   buf[i+ 8], buf[i+ 9], buf[i+10], buf[i+11],
-			   buf[i+12], buf[i+13], buf[i+14], buf[i+15]);
+		if (!hd->dma_frame_cpu[b]) {
+			seq_printf(s, "buf[%u]: not allocated\n", b);
+			continue;
+		}
+
+		buf = (const u8 *)hd->dma_frame_cpu[b];
+		header_payload = get_unaligned_le32(buf);
+		for (i = 0; i < 256; i++) {
+			if (buf[i])
+				header_nonzero = true;
+		}
+		for (i = HD60PRO_DMA_HDR_SIZE;
+		     i < HD60PRO_DMA_HDR_SIZE + 256; i++) {
+			if (buf[i])
+				payload_nonzero = true;
+		}
+
+		seq_printf(s, "buf[%u]: dma=0x%016llx header_payload=0x%08x header_0_255=%s payload_1000_10ff=%s\n",
+			   b, (unsigned long long)hd->dma_frame_dma[b],
+			   header_payload,
+			   header_nonzero ? "NONZERO" : "zero",
+			   payload_nonzero ? "NONZERO" : "zero");
 	}
+
+	if (hd->dma_frame_cpu[0]) {
+		buf = (const u8 *)hd->dma_frame_cpu[0];
+		seq_puts(s, "buf[0] header dump:\n");
+		for (b = 0; b < 64; b += 16) {
+			seq_printf(s, "%04x: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x\n",
+				   b,
+				   buf[b+ 0], buf[b+ 1], buf[b+ 2], buf[b+ 3],
+				   buf[b+ 4], buf[b+ 5], buf[b+ 6], buf[b+ 7],
+				   buf[b+ 8], buf[b+ 9], buf[b+10], buf[b+11],
+				   buf[b+12], buf[b+13], buf[b+14], buf[b+15]);
+		}
+	}
+
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(hd60pro_frame_buffer_peek);

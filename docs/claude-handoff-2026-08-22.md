@@ -474,6 +474,12 @@ mode-table values feeding `MZ0380_StartFirmware.c` lines 1176..1311. Static
 `scale_tb[4]` only proves the 1920x1080 row; the remaining fields must come
 from runtime stream state or a Windows trace.
 
+`frame_buffer_peek` now reports all four coherent DMA buffers, including header
+dword 0 and whether header bytes or payload bytes at `+0x1000` are non-zero.
+The cold-boot real-frame script prints this after streaming so a `FALLBACK_ONLY`
+result can distinguish "no DMA wrote any buffer" from "DMA wrote a buffer but
+V4L2 did not classify it as a frame".
+
 Also map the 0x3c-byte `MassMemAccess_StartDMAC` profile completely:
 
 - Which bytes/words at `profile+0x08..0x34` become DMAC MMR registers.

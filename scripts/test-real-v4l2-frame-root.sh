@@ -92,10 +92,15 @@ if [ -r "$DBG/capture_info" ]; then
 	cat "$DBG/capture_info" | tee "$TMPDIR/capture-after.txt"
 	LAST_EXTRA="$(sed -n 's/^last_frame_extra: //p' "$TMPDIR/capture-after.txt" | tail -1)"
 	DMA_FRAMES="$(sed -n 's/^dma_frame_count: //p' "$TMPDIR/capture-after.txt" | tail -1)"
-	if [ "$LAST_EXTRA" = "0x00000000" ] && [ "${DMA_FRAMES:-0}" != "0" ]; then
+	if [ "$LAST_EXTRA" = "0x00000000" ] && [ "${DMA_FRAMES:-0}" != "0" ] && [ "$ANALYZE_STATUS" -eq 0 ]; then
 		echo
-		echo "metadata_result: REAL_DMA_FRAME_METADATA"
+		echo "metadata_result: REAL_DMA_FRAME_VERIFIED"
 		exit 0
+	elif [ "$LAST_EXTRA" = "0x00000000" ] && [ "${DMA_FRAMES:-0}" != "0" ]; then
+		echo
+		echo "metadata_result: REAL_DMA_METADATA_ONLY"
+		echo "note: DMA metadata advanced, but captured YUYV still looked fallback-like"
+		exit 15
 	fi
 fi
 

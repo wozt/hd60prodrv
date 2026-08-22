@@ -517,9 +517,16 @@ FIRMWARE_LOAD_TIMEOUT
 FIRMWARE_LOAD_FAILED
 FALLBACK_ONLY
 HEADERLESS_DMA_CANDIDATE
-REAL_DMA_FRAME_METADATA
+REAL_DMA_METADATA_ONLY
+REAL_DMA_FRAME_VERIFIED
 REAL_FRAME_CANDIDATE
 ```
+
+`REAL_DMA_FRAME_VERIFIED` requires both real-DMA metadata
+(`last_frame_extra=0`, `dma_frame_count>0`) and non-fallback bytes in the saved
+YUYV file. `REAL_DMA_METADATA_ONLY` means DMA metadata/counters moved, but the
+captured file still looked fallback-like; treat it as evidence to inspect, not
+as a working frame.
 
 If that script reaches firmware success but reports `FALLBACK_ONLY`, inspect
 `capture_info` and then test exact Windows `0x2d` and `0x31` 1080p60 payloads

@@ -212,11 +212,17 @@ echo
 echo "== frame_buffer_peek after stream =="
 cat "$DBG/frame_buffer_peek" | tee "$TMPDIR/frame-buffer-peek.txt"
 
-if [ "$LAST_EXTRA" = "0x00000000" ] && [ "${DMA_FRAMES:-0}" != "0" ]; then
+if [ "$LAST_EXTRA" = "0x00000000" ] && [ "${DMA_FRAMES:-0}" != "0" ] && [ "$ANALYZE_STATUS" -eq 0 ]; then
 	echo
-	echo "final_verdict: REAL_DMA_FRAME_METADATA"
+	echo "final_verdict: REAL_DMA_FRAME_VERIFIED"
 	rmmod hd60prodrv
 	exit 0
+elif [ "$LAST_EXTRA" = "0x00000000" ] && [ "${DMA_FRAMES:-0}" != "0" ]; then
+	echo
+	echo "final_verdict: REAL_DMA_METADATA_ONLY"
+	echo "note: DMA metadata advanced, but captured YUYV still looked fallback-like"
+	rmmod hd60prodrv
+	exit 15
 elif [ "$ANALYZE_STATUS" -eq 0 ]; then
 	echo
 	echo "final_verdict: REAL_FRAME_CANDIDATE"

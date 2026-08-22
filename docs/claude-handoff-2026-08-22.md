@@ -126,6 +126,11 @@
   reset before sending `0x29 + 0x2a + 0x02`, so its no-V4L2 result is also
   fresh-run evidence instead of possibly reflecting bytes from an earlier
   attempt.
+- V4L2 real-DMA stream-start hard errors now clean up correctly: queued VB2
+  buffers are returned with `VB2_BUF_STATE_ERROR`, delayed works are cancelled,
+  DMA capture and streaming state are disabled, and PCI bus mastering is
+  cleared before returning the error to userspace. This avoids VLC/v4l2-ctl
+  hanging on buffers owned by a failed start path.
 
 ## What Changed In This Pass
 

@@ -6122,6 +6122,15 @@ static int hd60pro_start_streaming(struct vb2_queue *q, unsigned int count)
 
 unlock_streaming:
 		mutex_unlock(&hd->mailbox_lock);
+		if (ret) {
+			cancel_delayed_work_sync(&hd->stream_timeout_work);
+			cancel_delayed_work_sync(&hd->dma_poll_work);
+			hd->dma_capture_active = false;
+			hd->streaming = false;
+			pci_clear_master(hd->pdev);
+			hd60pro_return_queued_buffers(hd, VB2_BUF_STATE_ERROR);
+			return ret;
+		}
 		if (synthetic_v4l2)
 			hd60pro_complete_synthetic_buffers(hd);
 		else {

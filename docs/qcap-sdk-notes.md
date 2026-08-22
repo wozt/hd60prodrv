@@ -31,6 +31,12 @@ Important current findings:
   saturation, hue, audio volume, and audio mute. They satisfy ordinary
   `VIDIOC_QUERYCTRL/G_CTRL/S_CTRL` probes from VLC/QCAP-style userspace while
   hardware-side tuning remains unknown.
+- The V4L2 input now reports HDMI as a present input by default instead of
+  hardcoding `V4L2_IN_ST_NO_SIGNAL`; the old status can be reproduced with
+  `report_input_no_signal=1`. The driver also implements legacy
+  `VIDIOC_ENUMAUDIO/G_AUDIO/S_AUDIO` for one HDMI stereo audio input so
+  userspace audio-input probes do not fail with `ENOTTY`. This does not replace
+  the still-missing ALSA or decoded audio sample path.
 - The SDK also sends private control IDs around `0x0099....` through
   `VIDIOC_S_CTRL`/`VIDIOC_S_EXT_CTRLS` for encoder/device-specific settings.
   These are userspace-library settings, not proof of a missing kernel mailbox

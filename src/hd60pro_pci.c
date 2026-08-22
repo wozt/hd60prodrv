@@ -289,6 +289,10 @@ static bool synthetic_v4l2 = true;
 module_param(synthetic_v4l2, bool, 0444);
 MODULE_PARM_DESC(synthetic_v4l2, "Complete V4L2 buffers with black YUYV frames until real capture DMA is decoded");
 
+static bool report_input_no_signal;
+module_param(report_input_no_signal, bool, 0644);
+MODULE_PARM_DESC(report_input_no_signal, "Report HDMI input status as V4L2_IN_ST_NO_SIGNAL for diagnostics");
+
 static bool allow_dma_capture;
 module_param(allow_dma_capture, bool, 0444);
 MODULE_PARM_DESC(allow_dma_capture, "Enable experimental real DMA frame delivery from firmware IRQs");
@@ -6195,7 +6199,7 @@ static int hd60pro_vidioc_enum_input(struct file *file, void *priv,
 	strscpy(input->name, "HDMI", sizeof(input->name));
 	input->type = V4L2_INPUT_TYPE_CAMERA;
 	input->capabilities = V4L2_IN_CAP_DV_TIMINGS;
-	input->status = V4L2_IN_ST_NO_SIGNAL;
+	input->status = report_input_no_signal ? V4L2_IN_ST_NO_SIGNAL : 0;
 
 	return 0;
 }
@@ -6211,6 +6215,37 @@ static int hd60pro_vidioc_s_input(struct file *file, void *priv,
 				  unsigned int input)
 {
 	return input ? -EINVAL : 0;
+}
+
+static void hd60pro_fill_audio_input(struct v4l2_audio *audio)
+{
+	audio->index = 0;
+	strscpy(audio->name, "HDMI", sizeof(audio->name));
+	audio->capability = V4L2_AUDCAP_STEREO;
+	audio->mode = 0;
+}
+
+static int hd60pro_vidioc_enumaudio(struct file *file, void *priv,
+				    struct v4l2_audio *audio)
+{
+	if (audio->index)
+		return -EINVAL;
+
+	hd60pro_fill_audio_input(audio);
+	return 0;
+}
+
+static int hd60pro_vidioc_g_audio(struct file *file, void *priv,
+				  struct v4l2_audio *audio)
+{
+	hd60pro_fill_audio_input(audio);
+	return 0;
+}
+
+static int hd60pro_vidioc_s_audio(struct file *file, void *priv,
+				  const struct v4l2_audio *audio)
+{
+	return audio->index ? -EINVAL : 0;
 }
 
 static int hd60pro_vidioc_enum_fmt_vid_cap(struct file *file, void *priv,
@@ -6398,6 +6433,9 @@ static const struct v4l2_ioctl_ops hd60pro_ioctl_ops = {
 	.vidioc_enum_input = hd60pro_vidioc_enum_input,
 	.vidioc_g_input = hd60pro_vidioc_g_input,
 	.vidioc_s_input = hd60pro_vidioc_s_input,
+	.vidioc_enumaudio = hd60pro_vidioc_enumaudio,
+	.vidioc_g_audio = hd60pro_vidioc_g_audio,
+	.vidioc_s_audio = hd60pro_vidioc_s_audio,
 	.vidioc_enum_fmt_vid_cap = hd60pro_vidioc_enum_fmt_vid_cap,
 	.vidioc_g_fmt_vid_cap = hd60pro_vidioc_g_fmt_vid_cap,
 	.vidioc_try_fmt_vid_cap = hd60pro_vidioc_try_fmt_vid_cap,

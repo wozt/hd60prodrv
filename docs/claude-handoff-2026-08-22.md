@@ -104,6 +104,11 @@
   `MZ0380_StopFirmware` sends `[0x800, 0x07, 0xffffffff]` with the same
   `200000000` 100 ns timeout model as stream-start commands. Linux stream-off
   now mirrors that instead of tying `cmd 0x07` to experimental `cmd 0x06`.
+- V4L2 input/audio probing was made less hostile to normal capture apps: HDMI
+  no longer reports `NO_SIGNAL` by default, `report_input_no_signal=1` restores
+  the old diagnostic behavior, and `VIDIOC_ENUMAUDIO/G_AUDIO/S_AUDIO` exposes a
+  single HDMI stereo audio input. ALSA/real decoded audio samples are still not
+  implemented.
 
 ## What Changed In This Pass
 

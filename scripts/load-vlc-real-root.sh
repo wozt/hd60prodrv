@@ -15,6 +15,8 @@ trap 'rm -rf "$TMPDIR"' EXIT
 if [ "${INIT_FIRST:-1}" != "0" ]; then
 	echo "== prepare power, no PCI reset =="
 	./scripts/prepare-device-power-root.sh
+else
+	./scripts/pci-preflight-root.sh "${BDF:-0000:22:00.0}"
 fi
 
 rmmod hd60prodrv 2>/dev/null || true

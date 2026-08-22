@@ -13,6 +13,11 @@ if [ ! -r "$MODULE" ]; then
 	exit 1
 fi
 
+SCRIPT_DIR="$(dirname -- "$0")"
+if [ -x "$SCRIPT_DIR/pci-preflight-root.sh" ]; then
+	"$SCRIPT_DIR/pci-preflight-root.sh" "${BDF:-0000:22:00.0}"
+fi
+
 if command -v modinfo >/dev/null 2>&1; then
 	VERMAGIC="$(modinfo -F vermagic "$MODULE" 2>/dev/null | awk '{print $1}')"
 	RUNNING="$(uname -r)"

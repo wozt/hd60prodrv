@@ -29,9 +29,7 @@ IOMMU group:      13
 Kernel:           6.12.94+deb13-amd64
 ```
 
-The running kernel currently has no build tree at
-`/lib/modules/$(uname -r)/build`, so the module cannot be compiled until the
-matching Debian kernel headers are installed.
+The current local build uses kernel headers for `6.12.94+deb13-amd64`.
 
 ## Public Research Summary
 
@@ -107,6 +105,10 @@ sudo ./scripts/load-safe.sh ./hd60prodrv.ko
 v4l2-ctl --list-devices
 vlc v4l2:///dev/video0
 ```
+
+`load-safe.sh` runs `scripts/pci-preflight-root.sh` before `insmod`. If PCI
+config reads all `0xff` or header type `0x7f/0xff`, stop and do a full PSU cold
+boot before running mailbox, firmware, V4L2, or VLC tests.
 
 If another camera already owns `/dev/video0`, use the node shown by
 `v4l2-ctl --list-devices`.
@@ -225,6 +227,10 @@ If the kernel reports `Unable to change power state from D3cold to D0` or PCI
 config reads as `0xffff`, or if command `0x01` gets zero IRQs after a PCI reset,
 a full power cycle is required. Shut the machine down, switch off/disconnect PSU
 power for a few seconds, then boot again.
+
+If `scripts/pci-preflight-root.sh` reports all-`0xff` config space or unusable
+header type `0x7f`, do the same full PSU cold boot. Do not keep reloading the
+module in that state.
 
 After a full power cycle, do not run the PCI reset helper first. Run the focused
 mailbox bring-up probe:

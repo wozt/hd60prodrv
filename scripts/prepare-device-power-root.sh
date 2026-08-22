@@ -14,6 +14,8 @@ if [ ! -d "$DEV" ]; then
 	exit 1
 fi
 
+"$(dirname -- "$0")/pci-preflight-root.sh" "$BDF"
+
 if [ -w "$DEV/power/control" ]; then
 	echo on >"$DEV/power/control"
 fi

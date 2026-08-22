@@ -85,6 +85,9 @@
   mailbox alternative: it changed PCI config and both BAR windows to
   `0xffffffff`; `lspci` then reported `Unknown header type 7f`. The script now
   blocks `MAILBOX_BAR=5` unless `ALLOW_UNSAFE_MAILBOX_BAR5=1` is set.
+- Added `scripts/pci-preflight-root.sh` and wired it into power prep and module
+  load paths. If PCI config reads all `0xff` or header type is `0x7f/0xff`, the
+  scripts now stop before `insmod` and ask for a full PSU cold boot.
 
 ## What Changed In This Pass
 

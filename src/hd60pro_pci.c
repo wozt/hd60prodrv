@@ -7081,6 +7081,13 @@ static int hd60pro_stream_start_test_show(struct seq_file *s, void *unused)
 		   ioread32(hd->bar5 + 0x074),
 		   ioread32(hd->bar5 + 0x07c));
 
+	hd->dma_frame_count = 0;
+	hd->dma_poll_count = 0;
+	hd->pending_frame_status = 0;
+	memset(&hd->last_frame_meta, 0, sizeof(hd->last_frame_meta));
+	hd60pro_clear_dma_frame_buffers(hd);
+	seq_puts(s, "stream_start_test: cleared DMA frame buffers and counters\n");
+
 	irq_before      = hd->irq_count;
 	frame_irq_before = irq_before - hd->mailbox_irq_count; /* proxy: total - mbox = frame */
 

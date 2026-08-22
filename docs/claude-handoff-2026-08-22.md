@@ -122,6 +122,10 @@
   resets `last_frame_meta` before enabling capture. This prevents stale payload
   bytes from a previous attempt from becoming a false `HEADERLESS_DMA_CANDIDATE`
   or a stale frame in VLC after retrying.
+- `stream_start_test` now performs the same DMA frame buffer/counter/metadata
+  reset before sending `0x29 + 0x2a + 0x02`, so its no-V4L2 result is also
+  fresh-run evidence instead of possibly reflecting bytes from an earlier
+  attempt.
 
 ## What Changed In This Pass
 
@@ -580,6 +584,8 @@ accepted headerless buffers when an IRQ reached `hd60pro_deliver_dma_frame()`.
 The DMA buffers are cleared on each V4L2 stream start, so any nonzero
 `frame_buffer_peek` payload after the next cold-boot run should be fresh data
 from that run.
+`stream_start_test` also clears the same buffers before its mailbox-only start
+sequence.
 
 Also map the 0x3c-byte `MassMemAccess_StartDMAC` profile completely:
 

@@ -355,6 +355,20 @@ This prevents a false "real frame" where an IRQ causes a stale zero buffer to
 be copied to V4L2. `capture_info` now reports `real_dma_poll_ms` and
 `dma_poll_count`.
 
+Live test result after adding the poller:
+
+```sh
+PREINIT_TIMEOUT=25s FIRMWARE_LOAD_TIMEOUT=70s FRAMES=2 \
+  sudo -E ./scripts/test-real-v4l2-frame-root.sh
+```
+
+Result was still fallback (`exit 2`). `preinit_command1` did not complete, so
+`firmware_load` was skipped. V4L2 captured two fallback frames; after capture:
+`pipeline_ready=0`, `irq_count=0`, `dma_frame_count=0`, `dma_poll_count=93`,
+and BAR0+0x60..0x6c read back `0xffffffff`. This proves the new poller is
+running and not falsely accepting empty DMA buffers, but the firmware did not
+write host frame data in the current non-cold-boot state.
+
 Added offline extractor:
 
 ```sh

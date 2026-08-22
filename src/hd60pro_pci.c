@@ -5909,7 +5909,10 @@ static void hd60pro_dma_poll_work(struct work_struct *work)
 		if (!dma_buf)
 			continue;
 		payload = get_unaligned_le32(dma_buf);
-		if (!payload || payload > hd60pro_frame_size())
+		if (payload > hd60pro_frame_size())
+			continue;
+		if (!payload && (!allow_dma_headerless_frames ||
+				 !hd60pro_dma_payload_nonzero(dma_buf)))
 			continue;
 
 		hd60pro_deliver_dma_frame(hd, i, BIT(31) | i, true);

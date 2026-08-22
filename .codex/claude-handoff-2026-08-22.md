@@ -113,6 +113,11 @@
   `v4l2-ctl --all` and `--list-ctrls` before and after the stream attempt, so
   the next cold-boot run records input status/control/audio-probe compatibility
   together with the real-frame verdict.
+- Fixed the guarded headerless-DMA retry path: `allow_dma_headerless_frames=1`
+  now makes the DMA poll worker call the existing headerless delivery logic when
+  payload bytes at `+0x1000` are nonzero but the 4-byte payload header is zero.
+  Before this, the poll worker skipped those buffers before
+  `hd60pro_deliver_dma_frame()` could accept them.
 
 ## What Changed In This Pass
 
@@ -553,6 +558,8 @@ EXTRA_ARGS='allow_dma_headerless_frames=1' \
 That mode is disabled by default. It treats non-zero payload bytes with a zero
 header dword as a full 1080p YUYV DMA frame, covering the possibility that the
 firmware does not populate the 4-byte payload header Linux currently expects.
+It now works through both IRQ and poll delivery paths; older builds only
+accepted headerless buffers when an IRQ reached `hd60pro_deliver_dma_frame()`.
 
 Also map the 0x3c-byte `MassMemAccess_StartDMAC` profile completely:
 

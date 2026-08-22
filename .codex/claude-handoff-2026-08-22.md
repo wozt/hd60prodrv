@@ -388,6 +388,12 @@ mailbox_silent_timeout
 `classification: mailbox_silent_timeout`, `timeout_count=3`,
 `total_irq_delta=0`, `first_completion_change_attempt=0`.
 
+Preinit now also mirrors the Windows post-loop ACK sequence after the retry
+loop: `BAR5+0xdc=2`, mailbox `+0x30=0`, mailbox doorbell `+0x00=0x400`.
+Short validation with two 50 ms attempts confirmed
+`final_windows_ack_sequence: 1` and still classified the current state as
+`mailbox_silent_timeout`.
+
 Added offline extractor:
 
 ```sh

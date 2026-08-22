@@ -914,6 +914,10 @@ static int hd60pro_preinit_command1_show(struct seq_file *s, void *unused)
 		if (!ret)
 			break;
 	}
+	iowrite32(2, hd->bar5 + HD60PRO_REG_IRQ_ACK_SIDEBAND);
+	iowrite32(0, base + HD60PRO_REG_IRQ_STATUS);
+	iowrite32(HD60PRO_REG_IRQ_ACK_DOORBELL,
+		  base + HD60PRO_REG_DOORBELL);
 	mbox_irq_status = ioread32(base + HD60PRO_REG_IRQ_STATUS);
 	final_doorbell = ioread32(base + HD60PRO_REG_DOORBELL);
 	final_completion = ioread32(base + HD60PRO_REG_MBOX_COMPLETE);
@@ -929,6 +933,7 @@ static int hd60pro_preinit_command1_show(struct seq_file *s, void *unused)
 	seq_printf(s, "enodev_count: %u\n", enodev_count);
 	seq_printf(s, "first_success_attempt: %u\n", first_success_attempt);
 	seq_printf(s, "first_enodev_attempt: %u\n", first_enodev_attempt);
+	seq_puts(s, "final_windows_ack_sequence: 1\n");
 	seq_printf(s, "completion: 0x%08x\n", completion);
 	seq_printf(s, "final_doorbell_bar0_000: 0x%08x\n",
 		   final_doorbell);

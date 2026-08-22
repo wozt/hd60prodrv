@@ -3567,6 +3567,9 @@ static int hd60pro_capture_info_show(struct seq_file *s, void *unused)
 		   hd->last_frame_meta.payload_bytes);
 	seq_printf(s, "last_frame_flags: 0x%08x\n",
 		   hd->last_frame_meta.flags);
+	seq_printf(s, "last_frame_extra: 0x%08x\n",
+		   hd->last_frame_meta.extra);
+	seq_puts(s, "last_frame_extra_meaning: 0=real_dma 1=synthetic_black 2=dma_without_vb2_queue 3=real_dma_timeout_black\n");
 	seq_printf(s, "pci_bus_master_enabled: %d\n",
 		   !!(command & PCI_COMMAND_MASTER));
 	seq_printf(s, "irq_requested: %d\n", hd->irq >= 0);
@@ -5502,6 +5505,7 @@ struct hd60pro_buffer {
 };
 
 static void hd60pro_complete_synthetic_buffers(struct hd60pro_dev *hd);
+static void hd60pro_complete_timeout_fallback_buffers(struct hd60pro_dev *hd);
 static void hd60pro_schedule_stream_timeout(struct hd60pro_dev *hd);
 static void hd60pro_schedule_dma_poll(struct hd60pro_dev *hd);
 
@@ -5624,7 +5628,7 @@ static void hd60pro_fill_synthetic_frame(void *vaddr, size_t size)
 	}
 }
 
-static void hd60pro_complete_synthetic_buffers(struct hd60pro_dev *hd)
+static void hd60pro_complete_black_buffers(struct hd60pro_dev *hd, u32 extra)
 {
 	unsigned int size = hd60pro_frame_size();
 	unsigned long flags;
@@ -5651,7 +5655,7 @@ static void hd60pro_complete_synthetic_buffers(struct hd60pro_dev *hd)
 		hd->last_frame_meta.duration_ns = HD60PRO_DEFAULT_FRAME_PERIOD_NS;
 		hd->last_frame_meta.payload_bytes = size;
 		hd->last_frame_meta.flags = 0x00000100;
-		hd->last_frame_meta.extra = synthetic_v4l2 ? 1 : 0;
+		hd->last_frame_meta.extra = extra;
 		hd->last_frame_meta.sequence = sequence;
 		hd->direct_memory_blob[0] = sequence;
 		hd->direct_memory_blob[1] = size;
@@ -5662,6 +5666,16 @@ static void hd60pro_complete_synthetic_buffers(struct hd60pro_dev *hd)
 		spin_lock_irqsave(&hd->queued_lock, flags);
 	}
 	spin_unlock_irqrestore(&hd->queued_lock, flags);
+}
+
+static void hd60pro_complete_synthetic_buffers(struct hd60pro_dev *hd)
+{
+	hd60pro_complete_black_buffers(hd, 1);
+}
+
+static void hd60pro_complete_timeout_fallback_buffers(struct hd60pro_dev *hd)
+{
+	hd60pro_complete_black_buffers(hd, 3);
 }
 
 static void hd60pro_return_queued_buffers(struct hd60pro_dev *hd,
@@ -5706,7 +5720,7 @@ static void hd60pro_stream_timeout_work(struct work_struct *work)
 			     "real DMA timeout after %u ms: delivering black fallback V4L2 buffers (irq=%u dma_frames=%u status=0x%08x)\n",
 			     real_dma_timeout_ms, hd->irq_count,
 			     hd->dma_frame_count, hd->cum_irq_status);
-	hd60pro_complete_synthetic_buffers(hd);
+	hd60pro_complete_timeout_fallback_buffers(hd);
 }
 
 static void hd60pro_schedule_stream_timeout(struct hd60pro_dev *hd)

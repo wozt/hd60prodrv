@@ -480,6 +480,19 @@ The cold-boot real-frame script prints this after streaming so a `FALLBACK_ONLY`
 result can distinguish "no DMA wrote any buffer" from "DMA wrote a buffer but
 V4L2 did not classify it as a frame".
 
+`capture_info` now prints `last_frame_extra` with a legend:
+
+```text
+0 = real_dma
+1 = synthetic_black
+2 = dma_without_vb2_queue
+3 = real_dma_timeout_black
+```
+
+This fixes an earlier ambiguity where the real-DMA timeout fallback could look
+like a real DMA frame in metadata. Validation confirmed synthetic mode reports
+`extra=1`, while a short real-DMA timeout run reports `extra=3`.
+
 Also map the 0x3c-byte `MassMemAccess_StartDMAC` profile completely:
 
 - Which bytes/words at `profile+0x08..0x34` become DMAC MMR registers.
